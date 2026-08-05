@@ -1,0 +1,52 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---------------------------------------------------------------------------
+# Model checkpoints  (instanovo_v1.1.0.ckpt, SAE checkpoint.pt)
+# ---------------------------------------------------------------------------
+*.ckpt
+*.pt
+*.pth
+
+# ---------------------------------------------------------------------------
+# Pipeline artefacts -- NEVER commit these.
+# Extraction alone is ~67.5M tokens x 768 dims x 4 layers.
+# Directory names match run_pipeline.sh: $OUTPUT_ROOT/{extract,annotation,sae}
+# ---------------------------------------------------------------------------
+outputs/
+output/
+extract/
+annotation/
+sae/
+chunks/
+*.parquet
+*.arrow
+*.ipc
+manifest.json
+
+# Logs and pipeline sentinels
+*.log
+*.marker
+pipeline_stdout.log
+
+# ---------------------------------------------------------------------------
+# Secrets / local config
+# ---------------------------------------------------------------------------
+.env
+*.json.key
+service-account*.json
+
+# ---------------------------------------------------------------------------
+# OS / editor
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

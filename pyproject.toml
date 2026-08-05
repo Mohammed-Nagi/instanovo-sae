@@ -1,0 +1,60 @@
+[project]
+name = "instanovo-sae"
+version = "1.0.0"
+description = "Sparse autoencoders for interpretability of InstaNovo"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = "Apache-2.0"
+authors = [
+    { name = "Mohammed Esameldin Adam Nagi" },
+]
+keywords = [
+    "mechanistic interpretability",
+    "sparse autoencoder",
+    "mass spectrometry",
+    "de novo peptide sequencing",
+    "proteomics",
+]
+
+dependencies = [
+    "instanovo>=1.1.0",       # InstaNovo model, SpectrumDataFrame, LEGACY_PTM_TO_UNIMOD
+    "numpy>=2.0",
+    "scipy>=1.11",            # scipy.stats.chi2            (evaluate.py)
+    "spectrum-utils>=0.4.2",  # theoretical fragment ions   (annotate.py)
+    "datasets>=3.5.0",        # nine-species split merge    (run_pipeline.sh)
+]
+
+# torch is exposed through mutually exclusive extras so a CPU install does not
+# pull CUDA wheels. Mirrors the pattern used by the upstream InstaNovo project.
+[project.optional-dependencies]
+cpu   = ["torch>=2.5,<2.9"]
+cu126 = ["torch>=2.5,<2.9"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2.0",
+    "ruff>=0.6.0",
+]
+
+[tool.uv]
+conflicts = [[{ extra = "cpu" }, { extra = "cu126" }]]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu",   extra = "cpu",   marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-cu126", extra = "cu126", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

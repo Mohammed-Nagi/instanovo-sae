@@ -685,6 +685,42 @@ Tokens to predict:
 
 # --- Model calls --------------------------------------------------------------
 
+def load_dotenv(path: Path) -> int:
+    """Load KEY=value pairs from a .env file into os.environ. Returns the count.
+
+    Variables already set in the environment WIN over the file, so an explicitly
+    exported key overrides it and CI secrets are never shadowed by a stray local
+    file.
+
+    Read as utf-8-sig because PowerShell's Set-Content and Notepad both write a
+    byte-order mark by default, which would otherwise make the first key parse
+    as "\\ufeffOPENAI_API_KEY" and silently fail to match.
+
+    Written here rather than taking a python-dotenv dependency: the format is
+    one KEY=value per line, with # comments, blank lines, an optional `export`
+    prefix, and optional quotes around the value.
+    """
+    if not path.exists():
+        return 0
+
+    loaded = 0
+    for raw in path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+            loaded += 1
+    return loaded
+
+
 def _make_client():
     """OpenAI client, or None when the SDK or key is unavailable."""
     try:
@@ -693,7 +729,10 @@ def _make_client():
         LOG.error("The 'openai' package is required. Install with: uv add openai")
         return None
     if not os.environ.get("OPENAI_API_KEY"):
-        LOG.error("OPENAI_API_KEY is not set.")
+        LOG.error(
+            "OPENAI_API_KEY is not set. Put it in a .env file beside this script "
+            "(see .env.example), export it, or pass --env-file."
+        )
         return None
     return OpenAI()
 
@@ -916,6 +955,10 @@ def parse_args() -> argparse.Namespace:
                         "any chemistry it names is inferred from the spectra alone.")
 
     p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--env-file", type=Path, default=None,
+                   help="File of KEY=value pairs holding OPENAI_API_KEY. Defaults to "
+                        "'.env' beside this script. Existing environment variables "
+                        "take precedence over the file.")
     p.add_argument("--max-tokens", type=int, default=2048)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda")
@@ -981,9 +1024,15 @@ def main() -> int:
     )
     activations, records = _collect_activations(stream, feature_ids, config.n_sample_chunks)
 
-    client = None if config.dry_run else _make_client()
-    if client is None and not config.dry_run:
-        return 1
+    client = None
+    if not config.dry_run:
+        env_file = args.env_file or Path(__file__).parent / ".env"
+        n_loaded = load_dotenv(env_file)
+        if n_loaded:
+            LOG.info("Loaded %d variable(s) from %s", n_loaded, env_file)
+        client = _make_client()
+        if client is None:
+            return 1
 
     results: list[dict] = []
     skipped = 0

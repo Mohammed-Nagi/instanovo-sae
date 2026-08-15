@@ -1,4 +1,4 @@
-"""extract.py -- multi-layer activation extraction for InstaNovo (schema v4).
+"""Multi-layer activation extraction for InstaNovo.
 
 Runs InstaNovo once over a spectrum dataset and caches the encoder activations
 needed to train and evaluate sparse autoencoders, so the expensive forward pass
@@ -40,6 +40,7 @@ import argparse
 import dataclasses
 import json
 import logging
+import re
 import sys
 import time
 from pathlib import Path
@@ -53,14 +54,24 @@ from torch.utils.hooks import RemovableHandle
 # (or with the repo on PYTHONPATH) so both `instanovo` and `instanovo_io` import.
 import instanovo_io
 from instanovo.transformer.model import InstaNovo
+from schema import EXTRACT_SCHEMA_VERSION
 
-SCHEMA_VERSION = 4  # v4: per-layer activation files + separate meta file (was v3 bundled)
 LOG = logging.getLogger("extract")
 
+# Metadata fields the DataLoader is asked to carry alongside each batch, used to
+# cross-check that loader order matches dataset order (see _cross_check_row).
+METADATA_COLUMNS = (
+    "spectrum_id",
+    "sequence",
+    "modified_sequence",
+    "precursor_mz",
+    "precursor_charge",
+)
 
-# -----------------------------------------------------------------------------
-# Configuration
-# -----------------------------------------------------------------------------
+# Tolerance for comparing a loader-reported precursor m/z against the dataset's.
+MZ_MATCH_TOLERANCE = 1e-5
+
+
 @dataclasses.dataclass
 class ExtractionConfig:
     """All knobs for an extraction run. Persisted alongside the chunks in the manifest."""
@@ -73,6 +84,11 @@ class ExtractionConfig:
     chunk_size: int = 1024              # number of spectra written per .pt file
     batch_size: int = 32                # forward-pass batch size
     num_workers: int = 4                # DataLoader workers
+    # Peaks kept per spectrum. Recorded here so it reaches the manifest: it sets
+    # how many peak tokens each spectrum contributes, so every later consumer
+    # (annotation labels, SAE activations, the Phase 7/8 re-run loader) must use
+    # the same value or the per-token join silently misaligns.
+    n_peaks: int = instanovo_io.DEFAULT_N_PEAKS
     device: str = "cuda"
     dtype: torch.dtype = torch.float32  # activation storage dtype
     save_baseline: bool = True          # cache top-1 + per-position CE
@@ -89,10 +105,32 @@ class ExtractionConfig:
         out["dtype"] = str(self.dtype).replace("torch.", "")
         return out
 
+    def validate(self) -> None:
+        """Reject configurations that would break chunk/dataset index alignment.
 
-# -----------------------------------------------------------------------------
-# Chunk metadata schema (activations live in separate per-layer files)
-# -----------------------------------------------------------------------------
+        Chunk boundaries align with dataset indices only if every non-final
+        chunk holds exactly chunk_size spectra, which requires chunk_size to be
+        a whole number of batches. _collect_metadata looks spectra up by global
+        index, so drift here silently pairs the wrong metadata with a chunk.
+        """
+        if self.chunk_size % self.batch_size != 0:
+            raise ValueError(
+                f"chunk_size ({self.chunk_size}) must be a multiple of "
+                f"batch_size ({self.batch_size}) so chunk boundaries align "
+                "with dataset indices used for metadata lookup."
+            )
+        if self.max_spectra is None:
+            return
+        if self.max_spectra <= 0:
+            raise ValueError("max_spectra must be positive when set.")
+        if self.max_spectra % self.batch_size != 0:
+            raise ValueError(
+                f"max_spectra ({self.max_spectra}) must be a multiple of "
+                f"batch_size ({self.batch_size}); extraction processes "
+                "whole DataLoader batches."
+            )
+
+
 @dataclasses.dataclass
 class ChunkMeta:
     """Per-chunk metadata -- everything except the layer activations themselves.
@@ -139,10 +177,10 @@ class ChunkMeta:
         return cls(**torch.load(path, map_location="cpu", weights_only=False))
 
 
-# -----------------------------------------------------------------------------
-# On-disk layout helpers (the single definition of the v4 file naming, imported
-# by the train / annotate / evaluate consumers so the contract lives in one place)
-# -----------------------------------------------------------------------------
+# --- On-disk layout -----------------------------------------------------------
+# The single definition of the file naming, imported by the train / annotate /
+# evaluate consumers so the contract lives in one place.
+
 def chunk_meta_path(chunks_dir: Path, chunk_idx: int) -> Path:
     return chunks_dir / f"meta_{chunk_idx:05d}.pt"
 
@@ -158,7 +196,7 @@ def save_layer_activations(
     a tiny header so consumers can validate chunk/layer/token-count alignment."""
     torch.save(
         {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": EXTRACT_SCHEMA_VERSION,
             "chunk_idx": chunk_idx,
             "layer": layer,
             "total_tokens": int(acts.size(0)),
@@ -174,9 +212,6 @@ def load_layer_activations(path: Path) -> torch.Tensor:
     return obj["activations"]
 
 
-# -----------------------------------------------------------------------------
-# Forward-hook capture for multi-layer activations in one pass
-# -----------------------------------------------------------------------------
 class MultiLayerCapture:
     """Register forward hooks on multiple encoder layers and capture their outputs.
 
@@ -223,9 +258,8 @@ class MultiLayerCapture:
         return self._captured
 
 
-# -----------------------------------------------------------------------------
-# Per-batch processing helpers
-# -----------------------------------------------------------------------------
+# --- Per-batch tensor helpers -------------------------------------------------
+
 def build_valid_mask(spectra_mask_padding: torch.Tensor) -> torch.Tensor:
     """Convert InstaNovo's True-where-padding attention mask into a usable
     True-where-valid mask of length seq_len+1, with a True column prepended
@@ -277,6 +311,21 @@ def flatten_per_token(
     return flat, token_to_spectrum, token_to_position
 
 
+def pad_and_concat(tensors: list[torch.Tensor], pad_value, target_len: int) -> torch.Tensor:
+    """Right-pad each [N, L_i] tensor along dim 1 to target_len, then concatenate
+    along dim 0. Used for masks and baselines, whose dim-1 length varies across
+    batches because the collator pads to each batch's own maximum.
+    """
+    padded = []
+    for t in tensors:
+        if t.size(1) < target_len:
+            pad_shape = (t.size(0), target_len - t.size(1))
+            pad = torch.full(pad_shape, pad_value, dtype=t.dtype, device=t.device)
+            t = torch.cat([t, pad], dim=1)
+        padded.append(t)
+    return torch.cat(padded, dim=0)
+
+
 def compute_baseline(
     model: InstaNovo,
     batch: dict,
@@ -288,12 +337,12 @@ def compute_baseline(
     the ablated forward, not the baseline. This full forward also fires the
     encoder hooks, but the captures are owned by the hook-driven extraction in
     the same pass, not read here.
+
+    Logits have T+1 positions because add_bos=True. The CE / top-1 alignment
+    with the peptide targets (drop last position, ignore PAD) lives in
+    instanovo_io, the single place that mirrors InstaNovo's training loss.
     """
     with torch.no_grad():
-        # Full InstaNovo forward (kwargs x/p/y/x_mask/y_mask); logits have T+1
-        # positions because add_bos=True. The CE / top-1 alignment with the
-        # peptide targets (drop last position, ignore PAD) lives in instanovo_io,
-        # which is the single place that mirrors InstaNovo's training loss.
         logits = instanovo_io.model_forward_logits(model, batch, device)
         ce, top1, targets, valid = instanovo_io.per_token_ce_and_top1(
             logits, batch["peptides"], pad_index=instanovo_io.PAD_INDEX,
@@ -306,6 +355,13 @@ def compute_baseline(
     }
 
 
+# --- ProForma helpers ---------------------------------------------------------
+
+_BRACKET_TAG = re.compile(r"\[([^\]]+)\]")
+_UNIMOD_TAG = re.compile(r"UNIMOD:(\d+)", re.IGNORECASE)
+_DELTA_MASS_PAREN = re.compile(r"\(([+-])(\d*\.?\d+)\)")
+
+
 def parse_proforma_modifications(proforma: str) -> list[dict]:
     """Extract modifications from a ProForma string in square-bracket form.
 
@@ -316,11 +372,8 @@ def parse_proforma_modifications(proforma: str) -> list[dict]:
     mod_name is the raw bracket content and unimod_id is parsed from a
     "UNIMOD:<n>" tag when present, else -1 (delta-mass mods carry no UNIMOD id).
     """
-    import re
-
     modifications: list[dict] = []
     bare_position = 0
-    pattern = re.compile(r"\[([^\]]+)\]")
 
     # Walk the string character by character so bare-sequence positions are
     # tracked correctly even with multiple modifications and N/C-terminal tags.
@@ -328,10 +381,10 @@ def parse_proforma_modifications(proforma: str) -> list[dict]:
     while i < len(proforma):
         ch = proforma[i]
         if ch == "[":
-            match = pattern.match(proforma, i)
+            match = _BRACKET_TAG.match(proforma, i)
             if match:
                 tag = match.group(1)
-                unimod_match = re.search(r"UNIMOD:(\d+)", tag, re.IGNORECASE)
+                unimod_match = _UNIMOD_TAG.search(tag)
                 modifications.append({
                     "position": bare_position,
                     "mod_name": tag,
@@ -351,9 +404,7 @@ def _bare_sequence(proforma: str) -> str:
     """Bare residue sequence from a ProForma string: drop bracketed modification
     tags and keep only residue letters (used for cleavage-site geometry, which
     indexes the unmodified sequence)."""
-    import re
-
-    no_mods = re.sub(r"\[[^\]]*\]", "", proforma)
+    no_mods = _BRACKET_TAG.sub("", proforma)
     return "".join(c for c in no_mods if c.isalpha())
 
 
@@ -367,50 +418,146 @@ def _to_proforma(modified_sequence: str) -> str:
     a leading zero on bare-dot masses, e.g. 'YGPHTM[+15.99]AGDDPTK' and
     'DTFNTSSTSN[+0.98]STSSSSSNSK'. Anything already in bracket form is left as is.
     """
-    import re
-
-    def repl(m: "re.Match") -> str:
+    def repl(m: re.Match) -> str:
         sign, num = m.group(1), m.group(2)
         if num.startswith("."):
             num = "0" + num
         return f"[{sign}{num}]"
 
-    return re.sub(r"\(([+-])(\d*\.?\d+)\)", repl, modified_sequence)
+    return _DELTA_MASS_PAREN.sub(repl, modified_sequence)
 
 
-# -----------------------------------------------------------------------------
-# Main extractor
-# -----------------------------------------------------------------------------
+# --- Loader/dataset cross-checking -------------------------------------------
+
+def _gather_loader_metadata(accumulated: list[dict], n_spectra: int) -> dict[str, list]:
+    """Collect the metadata columns the DataLoader reported for this chunk.
+
+    Returns only fields that are present and populated for every spectrum; those
+    are the ones _cross_check_row can meaningfully compare against the dataset.
+    A field absent from the loader is skipped silently, but a field that is
+    partially present indicates the batches do not line up and is an error.
+    """
+    observed: dict[str, list] = {}
+    if not accumulated:
+        return observed
+
+    for key in METADATA_COLUMNS:
+        values = []
+        for a in accumulated:
+            batch_meta = a.get("batch_metadata", {})
+            if key not in batch_meta:
+                values = []
+                break
+            values.extend(batch_meta[key])
+
+        if not values or all(v is None for v in values):
+            continue
+        if any(v is None for v in values):
+            raise RuntimeError(
+                f"Loader metadata field {key!r} is missing for some "
+                "spectra. Cannot verify chunk alignment."
+            )
+        if len(values) != n_spectra:
+            raise RuntimeError(
+                f"Loader metadata field {key!r} has {len(values)} values for "
+                f"{n_spectra} spectra. Cannot verify chunk alignment."
+            )
+        observed[key] = values
+
+    return observed
+
+
+# Extra diagnosis appended to specific mismatch messages. A spectrum_id
+# disagreement is the signature of loader/dataset ordering drift, which is the
+# root cause worth naming; the other fields disagree for more varied reasons.
+_MISMATCH_HINT = {
+    "spectrum_id": " The loader is not yielding spectra in dataset order.",
+}
+
+
+def _cross_check_row(
+    observed: dict[str, list],
+    local_idx: int,
+    global_row: int,
+    dataset_values: dict,
+) -> None:
+    """Raise if the loader's metadata for a spectrum disagrees with the dataset's.
+
+    Guards the assumption that the DataLoader yields spectra in dataset order,
+    which is what makes index-based metadata lookup valid. A mismatch means
+    activations would be paired with another spectrum's peptide.
+    """
+    for key, dataset_value in dataset_values.items():
+        if key not in observed:
+            continue
+        loader_value = observed[key][local_idx]
+
+        if key == "precursor_mz":
+            matches = abs(float(loader_value) - float(dataset_value)) <= MZ_MATCH_TOLERANCE
+        elif key == "precursor_charge":
+            matches = int(loader_value) == int(dataset_value)
+        else:
+            matches = str(loader_value) == str(dataset_value)
+
+        if not matches:
+            raise RuntimeError(
+                f"DataLoader/dataset {key} mismatch at global row {global_row}: "
+                f"loader={loader_value!r}, dataset={dataset_value!r}."
+                + _MISMATCH_HINT.get(key, "")
+            )
+
+
+def _read_dataset_row(entry: dict, global_row: int) -> tuple[dict, dict]:
+    """Normalise one dataset row, returning (checkable, derived).
+
+    `sequence` is the bare peptide and `modified_sequence` carries the mods;
+    both fall back to other common column names.
+
+    The two dicts are separate because the loader cross-check must compare the
+    RAW column values (what the loader also saw), while ChunkMeta stores the
+    derived ones. In particular `peptide` falls back to deriving the bare
+    sequence from the ProForma label when the `sequence` column is empty --
+    cross-checking against that derived value instead of the raw one would
+    weaken the guard, since a loader/dataset disagreement could be masked by
+    the fallback producing a matching string.
+    """
+    raw_bare = entry.get("sequence") or entry.get("peptide") or ""
+    modseq = entry.get("modified_sequence") or entry.get("proforma") or raw_bare
+    proforma = _to_proforma(str(modseq))
+
+    checkable = {
+        "spectrum_id": str(entry.get("spectrum_id", f"row_{global_row}")),
+        "sequence": str(raw_bare),
+        "modified_sequence": str(modseq),
+        "precursor_charge": int(entry.get("precursor_charge", 0)),
+        "precursor_mz": float(entry.get("precursor_mz", 0.0)),
+    }
+    derived = {
+        "peptide": str(raw_bare) if raw_bare else _bare_sequence(proforma),
+        "proforma": proforma,
+    }
+    return checkable, derived
+
+
 class ActivationExtractor:
     """Drives a full extraction run. Iterable for streaming consumption,
     or call extract_all() to write every chunk to disk.
     """
 
     def __init__(self, config: ExtractionConfig):
+        config.validate()
         self.config = config
         self.output_dir = config.output_dir
         self.chunks_dir = self.output_dir / "chunks"
         self.manifest_path = self.output_dir / "manifest.json"
         self.chunks_dir.mkdir(parents=True, exist_ok=True)
 
-        # Chunk boundaries align with spectrum indices only if every non-final
-        # chunk holds exactly chunk_size spectra, which requires this.
-        if config.chunk_size % config.batch_size != 0:
-            raise ValueError(
-                f"chunk_size ({config.chunk_size}) must be a multiple of "
-                f"batch_size ({config.batch_size}) so chunk boundaries align "
-                "with dataset indices used for metadata lookup."
-            )
-        if config.max_spectra is not None:
-            if config.max_spectra <= 0:
-                raise ValueError("max_spectra must be positive when set.")
-            if config.max_spectra % config.batch_size != 0:
-                raise ValueError(
-                    f"max_spectra ({config.max_spectra}) must be a multiple of "
-                    f"batch_size ({config.batch_size}); extraction processes "
-                    "whole DataLoader batches."
-                )
+        self._load_model()
+        self._load_data()
 
+    def _load_model(self) -> None:
+        """Load InstaNovo and reject checkpoints the capture hooks cannot read."""
+        config = self.config
         LOG.info("Loading model from %s", config.model_path)
         # InstaNovo.load returns (model, config); residue_set lives on the model.
         self.model, self._model_config, self.residue_set = instanovo_io.load_instanovo(
@@ -420,13 +567,16 @@ class ActivationExtractor:
         # Hook-based capture reads model.encoder.layers[N] outputs; the
         # flash-attention path does not run that standard encoder stack, so the
         # hooks would never fire. Require a standard-attention checkpoint.
-        if getattr(self.model, "use_flash_attention", False):
+        if instanovo_io.uses_flash_attention(self.model):
             raise RuntimeError(
                 "Activation extraction hooks the standard nn.TransformerEncoder "
                 "layers, but this checkpoint uses flash attention. Load a "
                 "non-flash InstaNovo checkpoint for SAE extraction."
             )
 
+    def _load_data(self) -> None:
+        """Open the dataset and build the DataLoader used for the forward pass."""
+        config = self.config
         LOG.info("Loading dataset from %s", config.dataset_path)
         # SpectrumDataFrame supports both index access (for per-spectrum
         # metadata at fixed chunk boundaries) and to_dataset() (for the loader).
@@ -438,16 +588,12 @@ class ActivationExtractor:
             self.residue_set,
             batch_size=config.batch_size,
             num_workers=config.num_workers,
-            metadata_columns=[
-                "spectrum_id",
-                "sequence",
-                "modified_sequence",
-                "precursor_mz",
-                "precursor_charge",
-            ],
+            n_peaks=config.n_peaks,
+            metadata_columns=list(METADATA_COLUMNS),
         )
 
-    # ─── chunk files & resume ────────────────────────────────────────────────
+    # --- chunk files & resume -------------------------------------------------
+
     def _chunk_files(self, chunk_idx: int) -> list[Path]:
         """All files that make up a complete chunk: the meta file plus one
         activation file per target layer."""
@@ -461,63 +607,61 @@ class ActivationExtractor:
     def _is_chunk_done(self, chunk_idx: int) -> bool:
         return self.config.resume and all(p.exists() for p in self._chunk_files(chunk_idx))
 
-    # ─── per-batch processing ───────────────────────────────────────────────
-    def _process_batch(
-        self,
-        batch: dict,
-        capture: MultiLayerCapture,
-    ) -> dict:
-        """Run one forward pass (captures + optional baseline) and return
-        per-token flattened activations plus the per-spectrum PROCESSED peaks
-        that align one-to-one with the peak tokens.
+    # --- per-batch processing -------------------------------------------------
+
+    def _run_forward(self, batch: dict) -> dict | None:
+        """Run the forward pass that fires the capture hooks.
+
+        With save_baseline we run the full model (encoder + decoder) and keep the
+        logits-derived top-1/CE; otherwise the encoder alone is enough.
         """
-        device = self.config.device
-
-        # A forward pass through InstaNovo fires the encoder-layer hooks. With
-        # save_baseline we run the full model (encoder + decoder) and keep the
-        # logits-derived top-1/CE; otherwise we run the encoder only.
         if self.config.save_baseline:
-            baseline = compute_baseline(self.model, batch, device)
-        else:
-            with torch.no_grad():
-                # InstaNovo._encoder embeds the peaks, prepends the latent token
-                # and runs self.encoder (firing the layer hooks). Calling
-                # self.model.encoder directly would bypass the peak embedding and
-                # latent prepend and feed raw [B, P, 2] into the transformer.
-                self.model._encoder(
-                    x=batch["spectra"].to(device),
-                    p=batch["precursors"].to(device),
-                    x_mask=batch["spectra_mask"].to(device),
-                )
-            baseline = None
-        captured = capture.get_captured()
+            return compute_baseline(self.model, batch, self.config.device)
 
-        spectra_mask_padding = batch["spectra_mask"]  # True-where-padding, [B, n_peaks]
-        valid_mask = build_valid_mask(spectra_mask_padding.to(device))
+        device = self.config.device
+        with torch.no_grad():
+            # InstaNovo._encoder embeds the peaks, prepends the latent token
+            # and runs self.encoder (firing the layer hooks). Calling
+            # self.model.encoder directly would bypass the peak embedding and
+            # latent prepend and feed raw [B, P, 2] into the transformer.
+            self.model._encoder(
+                x=batch["spectra"].to(device),
+                p=batch["precursors"].to(device),
+                x_mask=batch["spectra_mask"].to(device),
+            )
+        return None
 
-        flat_acts, token_to_spectrum, token_to_position = flatten_per_token(
-            captured, valid_mask, dtype=self.config.dtype,
-        )
+    @staticmethod
+    def _split_processed_peaks(
+        batch: dict, spectra_mask_padding: torch.Tensor
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Per-spectrum processed m/z and intensity arrays, taken from the model's
+        own input tensor so they align exactly with the peak tokens.
 
-        # Per-spectrum PROCESSED peaks, taken from the model's own input tensor so
-        # they align exactly with the peak tokens. batch["spectra"] is [B, P, 2]
-        # with column 0 = m/z and column 1 = intensity, already filtered, capped
-        # at n_peaks, precursor-removed and rescaled by the data processor. Peak
-        # token (j+1) of a spectrum is its j-th valid (non-padded) row here.
-        spectra = batch["spectra"]                     # CPU, [B, P, 2]
-        peak_valid = ~spectra_mask_padding             # CPU, [B, P] True-where-valid
+        batch["spectra"] is [B, P, 2] with column 0 = m/z and column 1 =
+        intensity, already filtered, capped at n_peaks, precursor-removed and
+        rescaled by the data processor. Peak token (j+1) of a spectrum is its
+        j-th valid (non-padded) row here.
+        """
+        spectra = batch["spectra"]          # CPU, [B, P, 2]
+        peak_valid = ~spectra_mask_padding  # CPU, [B, P] True-where-valid
+
         mz_per_spectrum, intensity_per_spectrum = [], []
         for b in range(spectra.size(0)):
             pv = peak_valid[b]
             mz_per_spectrum.append(spectra[b, pv, 0].clone().float())
             intensity_per_spectrum.append(spectra[b, pv, 1].clone().float())
+        return mz_per_spectrum, intensity_per_spectrum
 
-        # Consistency guard: the captured activations must have one row per token.
-        # This catches a hook capturing the wrong sequence length (e.g. if it
-        # ever saw the post-precursor-prepend tensor of length n_peaks+2 instead
-        # of the latent+peaks tensor of length n_peaks+1), which would silently
-        # desync activations from token_to_position downstream.
-        n_tokens = int(token_to_spectrum.size(0))
+    @staticmethod
+    def _assert_token_alignment(flat_acts: dict[int, torch.Tensor], n_tokens: int) -> None:
+        """Verify every layer contributed exactly one activation row per token.
+
+        Catches a hook capturing the wrong sequence length (e.g. if it ever saw
+        the post-precursor-prepend tensor of length n_peaks+2 instead of the
+        latent+peaks tensor of length n_peaks+1), which would silently desync
+        activations from token_to_position downstream.
+        """
         for layer_idx, act in flat_acts.items():
             if act.size(0) != n_tokens:
                 raise RuntimeError(
@@ -526,6 +670,26 @@ class ActivationExtractor:
                     "captured encoder sequence length disagrees with the spectra "
                     "mask (expected latent + n_peaks)."
                 )
+
+    def _process_batch(self, batch: dict, capture: MultiLayerCapture) -> dict:
+        """Run one forward pass (captures + optional baseline) and return
+        per-token flattened activations plus the per-spectrum PROCESSED peaks
+        that align one-to-one with the peak tokens.
+        """
+        baseline = self._run_forward(batch)
+        captured = capture.get_captured()
+
+        spectra_mask_padding = batch["spectra_mask"]  # True-where-padding, [B, n_peaks]
+        valid_mask = build_valid_mask(spectra_mask_padding.to(self.config.device))
+
+        flat_acts, token_to_spectrum, token_to_position = flatten_per_token(
+            captured, valid_mask, dtype=self.config.dtype,
+        )
+
+        mz_per_spectrum, intensity_per_spectrum = self._split_processed_peaks(
+            batch, spectra_mask_padding,
+        )
+        self._assert_token_alignment(flat_acts, int(token_to_spectrum.size(0)))
 
         return {
             "flat_acts": flat_acts,
@@ -536,11 +700,45 @@ class ActivationExtractor:
             "mz_per_spectrum": mz_per_spectrum,
             "intensity_per_spectrum": intensity_per_spectrum,
             "batch_metadata": {
-                key: batch[key]
-                for key in ("spectrum_id", "sequence", "modified_sequence", "precursor_mz", "precursor_charge")
-                if key in batch
+                key: batch[key] for key in METADATA_COLUMNS if key in batch
             },
         }
+
+    # --- chunk assembly -------------------------------------------------------
+
+    @staticmethod
+    def _concat_token_maps(accumulated: list[dict]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Concatenate the per-batch token maps, re-basing spectrum indices so
+        they are global within the chunk rather than local to their batch."""
+        spectrum_parts, position_parts = [], []
+        offset = 0
+        for a in accumulated:
+            spectrum_parts.append(a["token_to_spectrum"] + offset)
+            position_parts.append(a["token_to_position"])
+            offset += a["valid_mask"].size(0)
+        return torch.cat(spectrum_parts, dim=0), torch.cat(position_parts, dim=0)
+
+    @staticmethod
+    def _concat_spectra_masks(accumulated: list[dict]) -> torch.Tensor:
+        """Concatenate the per-batch validity masks, padding to a common S+1
+        length since it varies across batches."""
+        masks = [a["valid_mask"] for a in accumulated]
+        max_seq_len = max(m.size(1) for m in masks)
+        return pad_and_concat(masks, False, max_seq_len)
+
+    @staticmethod
+    def _concat_baselines(
+        accumulated: list[dict],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Concatenate cached baselines along the spectrum dimension, padding the
+        decoder length since InstaNovo's collator pads to each batch's own
+        maximum target length."""
+        max_dec_len = max(a["baseline"]["top1"].size(1) for a in accumulated)
+        fields = {"top1": 0, "ce": 0.0, "decoder_mask": False}
+        return tuple(
+            pad_and_concat([a["baseline"][name] for a in accumulated], pad, max_dec_len)
+            for name, pad in fields.items()
+        )
 
     def _build_chunk(
         self,
@@ -551,69 +749,31 @@ class ActivationExtractor:
         """Combine per-batch accumulator outputs into a ChunkMeta plus the
         per-layer activation tensors (written to separate files by _save_chunk).
         """
-        # Per-layer concatenation along the token dimension.
-        layer_acts = {L: torch.cat([a["flat_acts"][L] for a in accumulated], dim=0)
-                      for L in self.config.target_layers}
+        layer_acts = {
+            L: torch.cat([a["flat_acts"][L] for a in accumulated], dim=0)
+            for L in self.config.target_layers
+        }
 
-        token_to_spectrum_parts = []
-        token_to_position_parts = []
-        running_spectrum_offset = 0
-        for a in accumulated:
-            # Re-base spectrum indices so they're global within the chunk.
-            token_to_spectrum_parts.append(a["token_to_spectrum"] + running_spectrum_offset)
-            token_to_position_parts.append(a["token_to_position"])
-            running_spectrum_offset += a["valid_mask"].size(0)
+        token_to_spectrum, token_to_position = self._concat_token_maps(accumulated)
+        spectra_mask = self._concat_spectra_masks(accumulated)
 
-        token_to_spectrum = torch.cat(token_to_spectrum_parts, dim=0)
-        token_to_position = torch.cat(token_to_position_parts, dim=0)
-
-        # Spectra masks vary in S+1 length across batches; pad to a common
-        # length for storage.
-        max_seq_len = max(a["valid_mask"].size(1) for a in accumulated)
-        padded_masks = []
-        for a in accumulated:
-            m = a["valid_mask"]
-            if m.size(1) < max_seq_len:
-                pad = torch.zeros(m.size(0), max_seq_len - m.size(1), dtype=torch.bool)
-                m = torch.cat([m, pad], dim=1)
-            padded_masks.append(m)
-        spectra_mask = torch.cat(padded_masks, dim=0)
-
-        # Baseline: concatenate along spectrum dim if present in every batch.
-        # Dynamically pad the decoder length (dim=1) across batches since
-        # InstaNovo's DataLoader collator pads to the batch's max target length.
         if self.config.save_baseline:
-            max_dec_len = max(a["baseline"]["top1"].size(1) for a in accumulated)
-
-            def pad_dec(tensors, pad_value):
-                padded = []
-                for t in tensors:
-                    if t.size(1) < max_dec_len:
-                        pad_shape = (t.size(0), max_dec_len - t.size(1))
-                        pad_tensor = torch.full(pad_shape, pad_value, dtype=t.dtype, device=t.device)
-                        t = torch.cat([t, pad_tensor], dim=1)
-                    padded.append(t)
-                return torch.cat(padded, dim=0)
-
-            baseline_top1 = pad_dec([a["baseline"]["top1"] for a in accumulated], 0)
-            baseline_ce = pad_dec([a["baseline"]["ce"] for a in accumulated], 0.0)
-            baseline_decoder_mask = pad_dec([a["baseline"]["decoder_mask"] for a in accumulated], False)
+            baseline_top1, baseline_ce, baseline_decoder_mask = self._concat_baselines(
+                accumulated,
+            )
         else:
             baseline_top1 = baseline_ce = baseline_decoder_mask = None
 
-        # Per-spectrum PROCESSED peaks, gathered from the batches in order so
-        # they align one-to-one with the peak tokens (NOT re-read from the raw
-        # dataset, which would give a different peak set and break the join).
+        # Gathered from the batches in order so they align one-to-one with the
+        # peak tokens (NOT re-read from the raw dataset, which would give a
+        # different peak set and break the join).
         mz_arrays = [m for a in accumulated for m in a["mz_per_spectrum"]]
         intensity_arrays = [it for a in accumulated for it in a["intensity_per_spectrum"]]
 
-        # Textual + precursor metadata from the dataset for this chunk's range.
         n_spectra = spectra_mask.size(0)
+        total_tokens = int(token_to_spectrum.size(0))
         meta_fields = self._collect_metadata(spectrum_start, n_spectra, accumulated)
 
-        total_tokens = int(token_to_spectrum.size(0))
-
-        # One processed-peak array per spectrum; every layer aligns with tokens.
         assert len(mz_arrays) == n_spectra, (
             f"peak-array count {len(mz_arrays)} != n_spectra {n_spectra}"
         )
@@ -623,7 +783,7 @@ class ActivationExtractor:
             )
 
         meta = ChunkMeta(
-            schema_version=SCHEMA_VERSION,
+            schema_version=EXTRACT_SCHEMA_VERSION,
             chunk_idx=chunk_idx,
             n_spectra=n_spectra,
             total_tokens=total_tokens,
@@ -683,7 +843,7 @@ class ActivationExtractor:
         they align with the tokens. Spectrum order is deterministic (DataLoader
         shuffle=False, process_dataset preserves row order), so global index i
         is the i-th spectrum the loader yielded; this requires chunk_size to be a
-        multiple of batch_size (enforced in __init__).
+        multiple of batch_size (enforced by ExtractionConfig.validate).
         """
         end = start + n_spectra
         dataset_len = len(self.dataset)
@@ -693,81 +853,21 @@ class ActivationExtractor:
                 f"{dataset_len}. This indicates resume/chunk accounting drift."
             )
 
+        observed = _gather_loader_metadata(accumulated or [], n_spectra)
+
         spectrum_ids, peptides, proforma_strings = [], [], []
-        modifications = []
-        precursor_charges, precursor_mzs = [], []
-        observed: dict[str, list] = {}
-        if accumulated:
-            for key in ("spectrum_id", "sequence", "modified_sequence", "precursor_mz", "precursor_charge"):
-                vals = []
-                for a in accumulated:
-                    batch_meta = a.get("batch_metadata", {})
-                    if key not in batch_meta:
-                        vals = []
-                        break
-                    vals.extend(batch_meta[key])
-                if vals:
-                    if all(v is None for v in vals):
-                        continue
-                    if any(v is None for v in vals):
-                        raise RuntimeError(
-                            f"Loader metadata field {key!r} is missing for some "
-                            "spectra. Cannot verify chunk alignment."
-                        )
-                    if len(vals) != n_spectra:
-                        raise RuntimeError(
-                            f"Loader metadata field {key!r} has {len(vals)} values for "
-                            f"{n_spectra} spectra. Cannot verify chunk alignment."
-                        )
-                    observed[key] = vals
+        modifications, precursor_charges, precursor_mzs = [], [], []
 
-        for local_idx, i in enumerate(range(start, end)):
-            entry = self.dataset[i]
-            spectrum_id = str(entry.get("spectrum_id", f"row_{i}"))
-            if "spectrum_id" in observed and str(observed["spectrum_id"][local_idx]) != spectrum_id:
-                raise RuntimeError(
-                    f"DataLoader/dataset order mismatch at global row {i}: "
-                    f"loader spectrum_id={observed['spectrum_id'][local_idx]!r}, "
-                    f"dataset spectrum_id={spectrum_id!r}."
-                )
-            spectrum_ids.append(spectrum_id)
+        for local_idx, global_row in enumerate(range(start, end)):
+            checkable, derived = _read_dataset_row(self.dataset[global_row], global_row)
+            _cross_check_row(observed, local_idx, global_row, checkable)
 
-            # `sequence` is the bare peptide; `modified_sequence` carries the
-            # mods. Fall back to other common names, then to deriving the bare
-            # sequence from the (ProForma-normalised) label.
-            bare = entry.get("sequence") or entry.get("peptide") or ""
-            modseq = entry.get("modified_sequence") or entry.get("proforma") or bare
-            if "sequence" in observed and str(observed["sequence"][local_idx]) != str(bare):
-                raise RuntimeError(
-                    f"DataLoader/dataset sequence mismatch at global row {i}: "
-                    f"loader={observed['sequence'][local_idx]!r}, dataset={bare!r}."
-                )
-            if "modified_sequence" in observed and str(observed["modified_sequence"][local_idx]) != str(modseq):
-                raise RuntimeError(
-                    f"DataLoader/dataset modified_sequence mismatch at global row {i}: "
-                    f"loader={observed['modified_sequence'][local_idx]!r}, dataset={modseq!r}."
-                )
-            proforma = _to_proforma(str(modseq))
-            bare = str(bare) if bare else _bare_sequence(proforma)
-
-            peptides.append(bare)
-            proforma_strings.append(proforma)
-            modifications.append(parse_proforma_modifications(proforma))
-
-            charge = int(entry.get("precursor_charge", 0))
-            mz = float(entry.get("precursor_mz", 0.0))
-            if "precursor_charge" in observed and int(observed["precursor_charge"][local_idx]) != charge:
-                raise RuntimeError(
-                    f"DataLoader/dataset precursor_charge mismatch at global row {i}: "
-                    f"loader={observed['precursor_charge'][local_idx]!r}, dataset={charge!r}."
-                )
-            if "precursor_mz" in observed and abs(float(observed["precursor_mz"][local_idx]) - mz) > 1e-5:
-                raise RuntimeError(
-                    f"DataLoader/dataset precursor_mz mismatch at global row {i}: "
-                    f"loader={observed['precursor_mz'][local_idx]!r}, dataset={mz!r}."
-                )
-            precursor_charges.append(charge)
-            precursor_mzs.append(mz)
+            spectrum_ids.append(checkable["spectrum_id"])
+            peptides.append(derived["peptide"])
+            proforma_strings.append(derived["proforma"])
+            modifications.append(parse_proforma_modifications(derived["proforma"]))
+            precursor_charges.append(checkable["precursor_charge"])
+            precursor_mzs.append(checkable["precursor_mz"])
 
         return {
             "spectrum_ids": spectrum_ids,
@@ -778,7 +878,6 @@ class ActivationExtractor:
             "precursor_mzs": torch.tensor(precursor_mzs, dtype=torch.float32),
         }
 
-    # ─── resume helper ───────────────────────────────────────────────────────
     def _drain_spectra(self, loader_iter, n_spectra: int, chunk_idx: int) -> int:
         """Advance loader_iter by exactly n_spectra without processing them.
 
@@ -807,18 +906,27 @@ class ActivationExtractor:
             drained += bsz
         return drained
 
-    # ─── public entry points ────────────────────────────────────────────────
+    def _flush_chunk(
+        self, chunk_idx: int, chunk_start: int, accumulated: list[dict]
+    ) -> ChunkMeta:
+        """Build, write and return one chunk from the accumulated batches."""
+        meta, layer_acts = self._build_chunk(chunk_idx, chunk_start, accumulated)
+        self._save_chunk(chunk_idx, meta, layer_acts)
+        return meta
+
+    # --- public entry points --------------------------------------------------
+
     def __iter__(self) -> Iterator[ChunkMeta]:
         """Yield each chunk's ChunkMeta one at a time, writing the meta file and
         per-layer activation files to disk as a side effect.
 
         Uses an explicit iterator (loader_iter) rather than a for-loop so that
         skipped chunks can drain the DataLoader by the exact number of batches
-        they would have consumed. The for-loop `continue` that the old code used
-        left the iterator pointing at the start of the skipped chunk's spectra,
-        causing every chunk that followed a resumed skip to receive the wrong
-        spectra's activations paired with the correct chunk's metadata -- a silent
-        misalignment that corrupted all downstream training and evaluation.
+        they would have consumed. A for-loop `continue` would leave the iterator
+        pointing at the start of the skipped chunk's spectra, causing every chunk
+        that followed a resumed skip to receive the wrong spectra's activations
+        paired with the correct chunk's metadata -- a silent misalignment that
+        would corrupt all downstream training and evaluation.
         """
         with MultiLayerCapture(self.model, self.config.target_layers) as capture:
             chunk_idx = 0
@@ -830,39 +938,36 @@ class ActivationExtractor:
             loader_iter = iter(self.loader)
 
             while True:
-                # ── Resume: skip completed chunks, draining the loader ──────
-                # Check before pulling the next batch so we never process a
-                # batch that belongs to a skipped chunk.
+                # Resume check comes before pulling the next batch, so we never
+                # process a batch that belongs to an already-completed chunk.
                 if self._is_chunk_done(chunk_idx) and spectra_in_chunk == 0:
                     done_meta = ChunkMeta.load(chunk_meta_path(self.chunks_dir, chunk_idx))
                     LOG.info(
                         "Chunk %d already exists -- draining %d spectra and skipping",
                         chunk_idx, done_meta.n_spectra,
                     )
-                    drained = self._drain_spectra(loader_iter, done_meta.n_spectra, chunk_idx)
-                    total_seen += drained
+                    total_seen += self._drain_spectra(
+                        loader_iter, done_meta.n_spectra, chunk_idx,
+                    )
                     chunk_idx += 1
                     if self.config.max_spectra and total_seen >= self.config.max_spectra:
                         break
                     continue
 
-                # ── Pull the next batch ─────────────────────────────────────
                 try:
                     batch = next(loader_iter)
                 except StopIteration:
                     break
 
                 bsz = batch["spectra"].size(0)
-
-                processed = self._process_batch(batch, capture)
-                accumulated.append(processed)
+                accumulated.append(self._process_batch(batch, capture))
                 spectra_in_chunk += bsz
                 total_seen += bsz
 
                 if spectra_in_chunk >= self.config.chunk_size:
-                    chunk_start = total_seen - spectra_in_chunk
-                    meta, layer_acts = self._build_chunk(chunk_idx, chunk_start, accumulated)
-                    self._save_chunk(chunk_idx, meta, layer_acts)
+                    meta = self._flush_chunk(
+                        chunk_idx, total_seen - spectra_in_chunk, accumulated,
+                    )
                     LOG.info(
                         "Wrote chunk %d (n_spectra=%d, total_tokens=%d, layers=%s, elapsed=%.1fs)",
                         chunk_idx, meta.n_spectra, meta.total_tokens,
@@ -876,19 +981,16 @@ class ActivationExtractor:
                 if self.config.max_spectra and total_seen >= self.config.max_spectra:
                     break
 
-            # Flush partial final chunk.
             if accumulated:
-                chunk_start = total_seen - spectra_in_chunk
-                meta, layer_acts = self._build_chunk(chunk_idx, chunk_start, accumulated)
-                self._save_chunk(chunk_idx, meta, layer_acts)
+                meta = self._flush_chunk(
+                    chunk_idx, total_seen - spectra_in_chunk, accumulated,
+                )
                 LOG.info("Wrote final chunk %d (n_spectra=%d)", chunk_idx, meta.n_spectra)
                 yield meta
 
     def extract_all(self) -> None:
         """Materialise every chunk to disk. Updates the manifest at the end."""
-        n_chunks = 0
-        n_spectra = 0
-        n_tokens = 0
+        n_chunks = n_spectra = n_tokens = 0
         for meta in self:
             n_chunks += 1
             n_spectra += meta.n_spectra
@@ -904,7 +1006,7 @@ class ActivationExtractor:
             return str(p.relative_to(self.output_dir))
 
         manifest = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": EXTRACT_SCHEMA_VERSION,
             "config": self.config.as_jsonable(),
             "n_chunks": n_chunks,
             "n_spectra": n_spectra,
@@ -926,9 +1028,15 @@ class ActivationExtractor:
         LOG.info("Wrote manifest to %s", self.manifest_path)
 
 
-# -----------------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------------
+# --- CLI ----------------------------------------------------------------------
+
+DTYPE_MAP = {
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+}
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--model-path", type=Path, required=True)
@@ -938,9 +1046,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--chunk-size", type=int, default=1024)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--n-peaks", type=int, default=instanovo_io.DEFAULT_N_PEAKS,
+                   help="Peaks kept per spectrum. Recorded in the manifest; "
+                        "evaluate.py reads it from there so Phase 7/8 rebuild "
+                        "the same spectra.")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--dtype", default="float32",
-                   choices=["float32", "bfloat16", "float16"],
+                   choices=list(DTYPE_MAP),
                    help="Storage dtype for activations (bfloat16 ~halves disk).")
     p.add_argument("--no-baseline", action="store_true",
                    help="Skip caching baseline top-1 and CE.")
@@ -959,11 +1071,6 @@ def main() -> int:
         format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
     )
 
-    dtype_map = {
-        "float32": torch.float32,
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-    }
     config = ExtractionConfig(
         model_path=args.model_path,
         dataset_path=args.dataset_path,
@@ -972,15 +1079,15 @@ def main() -> int:
         chunk_size=args.chunk_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        n_peaks=args.n_peaks,
         device=args.device,
-        dtype=dtype_map[args.dtype],
+        dtype=DTYPE_MAP[args.dtype],
         save_baseline=not args.no_baseline,
         resume=not args.no_resume,
         max_spectra=args.max_spectra,
     )
 
-    extractor = ActivationExtractor(config)
-    extractor.extract_all()
+    ActivationExtractor(config).extract_all()
     return 0
 
 

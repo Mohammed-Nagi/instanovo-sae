@@ -1,22 +1,20 @@
 #!/usr/bin/env bash
 # =============================================================================
-# run_pipeline.sh -- v4 SAE pipeline for layers {2, 4, 6, 8} of InstaNovo
+# run_pipeline.sh -- SAE pipeline for layers {2, 4, 6, 8} of InstaNovo
 # =============================================================================
 #
-# Four-script pipeline (schema v4):
-#   1. extract.py              -- one multi-layer forward pass over all spectra;
-#                                writes per-layer activation files + ChunkMeta.
-#                                REUSABLE: chunks are kept by default so future
-#                                experiments (new SAE widths, seeds, layers) can
-#                                skip this expensive step entirely.
-#   2. annotate.py             -- one annotation pass; produces concept labels
-#                                that are layer-independent and dataset-fixed.
-#                                REUSABLE: labels are always kept.
-#   3. train.py                -- one run per (layer, seed); reads only its own
-#                                layer's activation files from the extract dir.
-#   4. evaluate.py             -- one run per (layer, seed); eight evaluation
-#                                phases including causal ablation (Phases 7/8)
-#                                when the InstaNovo model is available.
+# Four-script pipeline:
+#   1. extract.py   -- one multi-layer forward pass over all spectra; writes
+#                      per-layer activation files + ChunkMeta.
+#                      REUSABLE: chunks are kept by default so future experiments
+#                      (new SAE widths, seeds, layers) skip this expensive step.
+#   2. annotate.py  -- one annotation pass; concept labels are layer-independent
+#                      and dataset-fixed. REUSABLE: labels are always kept.
+#   3. train.py     -- one run per (layer, seed); reads only its own layer's
+#                      activation files from the extract dir.
+#   4. evaluate.py  -- one run per (layer, seed); eight evaluation phases,
+#                      including causal ablation (Phases 7/8) when the InstaNovo
+#                      model is available.
 #
 # Flow:
 #   prepare dataset (merge all HF splits into one parquet)
@@ -27,30 +25,24 @@
 #          (cross-layer matching runs on the deepest/anchor layer)
 #     -> cross-layer summary table
 #
-# Key behavior:
-#   - KEEP_CHUNKS defaults to 1: the extract chunks are the most expensive
-#     artifact to produce. Deleting them after one run wastes that compute.
-#     Set KEEP_CHUNKS=0 only if you are genuinely short on disk.
-#   - KEEP_ANNOTATION defaults to 1: labels are cheap to store and expensive
-#     to regenerate if you change the concept vocabulary later.
-#   - Fragment tolerance is 20 ppm (Orbitrap-class data), not 0.5 Da.
-#     The old 0.5 Da window admits spurious ion matches at high resolution.
-#   - Ion types include precursor ('p') alongside b, y, immonium; internal
-#     fragments are annotated by default in annotate.py.
-#   - Phases 7 and 8 (loss recovered + causal ablation) are fully implemented
-#     and enabled when MODEL_PATH is set; RUN_CAUSAL now defaults to 1.
-#   - SAE training uses k=32 and 3 epochs (convergence at ~85 M tokens/epoch);
-#     the old k=48 / 8 epochs would overfit past convergence.
-#   - Activation dtype is bfloat16 for the reusable chunks (~half the disk of
-#     float32 with negligible effect on SAE training quality).
-#   - evaluate.py writes to output_dir/layer_{L}/seed_{S}/eval/ automatically
-#     (via EvaluationConfig.output_subdir), so --output-dir must point at the
-#     SAE root, not a separate eval dir.
-#   - SKIP_TRAIN=1 turns this into an evaluation-only resume: every layer must
-#     already have layer_{L}/seed_{S}/checkpoint.pt under the SAE root.
-#
 # Resume: every step skips if its sentinel output already exists.
 #         Safe to kill and re-run at any point.
+#
+# -----------------------------------------------------------------------------
+# WHERE THE TIME GOES, and the knobs that move it
+# -----------------------------------------------------------------------------
+#   Phase 8 (causal ablation) dominates everything else when enabled. Cost is
+#   n_concepts x (1 group + N_RANDOM_CONTROLS + ABLATION_PER_FEATURE_TOP) model
+#   passes over ABLATION_SPECTRA spectra, per layer. At the defaults that is
+#   50 x 106 = 5,300 passes over 5,000 spectra = 26.5M spectrum-forwards per
+#   layer. ABLATION_PER_FEATURE_TOP is 94% of that; halving it halves Phase 8.
+#   This is why RUN_PHASE_8 defaults to 0.
+#
+#   SAE training I/O is the next lever. TRAIN_NO_RAM_CACHE=1 re-reads the whole
+#   layer from disk every epoch (3x); =0 loads it once and shuffles in RAM. The
+#   script now sizes this automatically against free memory -- see below.
+#
+#   Extraction is the largest one-off cost but runs once and is cached.
 #
 # Usage
 #   MODEL_PATH=/path/to/instanovo.ckpt ./run_pipeline.sh
@@ -60,15 +52,19 @@
 #   DATASET_PATH=/data/combined.parquet MODEL_PATH=... ./run_pipeline.sh  # skip merge
 #   KEEP_CHUNKS=0 MODEL_PATH=... ./run_pipeline.sh         # free disk after run
 #   SKIP_TRAIN=1 MODEL_PATH=... ./run_pipeline.sh          # evaluate existing checkpoints
+#   RUN_PHASE_8=1 ABLATION_PER_FEATURE_TOP=20 MODEL_PATH=... ./run_pipeline.sh
+#       # causal ablation at ~4x lower cost than the default per-feature depth
 #   PHASE8_RESUME=1 SKIP_TRAIN=1 MODEL_PATH=... ./run_pipeline.sh
 #       # reuse existing Phase 4 CSV/report cache and run only Phase 8
 #
+# Layers are independent: train/eval for different layers can run concurrently
+# on separate GPUs by launching this script with LAYERS_OVERRIDE="<layer>" and
+# a distinct DEVICE in separate shells, once extract + annotate have completed.
 # =============================================================================
 
 set -euo pipefail
 
 # -----------------------------------------------------------------------------
-# Dataset
 # Configuration
 # -----------------------------------------------------------------------------
 
@@ -86,6 +82,7 @@ SEED="${SEED:-0}"
 DEVICE="${DEVICE:-cuda}"
 
 # -----------------------------------------------------------------------------
+# Dataset
 # Full nine-species benchmark (all splits concatenated). If DATASET_PATH is
 # already set (pointing at a pre-merged parquet), the merge step is skipped.
 DATASET_HF_ID="${DATASET_HF_ID:-InstaDeepAI/ms_ninespecies_benchmark}"
@@ -103,6 +100,9 @@ CHUNK_SIZE="${CHUNK_SIZE:-1024}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 # bfloat16 halves disk vs float32 with negligible precision loss for SAE training.
 EXTRACT_DTYPE="${EXTRACT_DTYPE:-bfloat16}"
+# Peaks kept per spectrum. Recorded in the extract manifest; evaluate.py reads it
+# from there so the Phase 7/8 re-run loader rebuilds exactly the same spectra.
+N_PEAKS="${N_PEAKS:-200}"
 
 # -----------------------------------------------------------------------------
 # Annotation
@@ -117,20 +117,26 @@ FRAGMENT_TOL_MODE="${FRAGMENT_TOL_MODE:-ppm}"
 
 # -----------------------------------------------------------------------------
 # SAE architecture and training
-D_MODEL=768                                   # InstaNovo encoder hidden size
+D_MODEL=768                                    # InstaNovo encoder hidden size
 EXPANSION_FACTOR="${EXPANSION_FACTOR:-16}"
 D_DICT=$(( D_MODEL * EXPANSION_FACTOR ))       # 12,288 features at 16x
 K="${K:-32}"                                   # avg active features / token (BatchTopK)
 K_AUX="${K_AUX:-512}"                          # aux features for dead-feature recovery
-ALPHA_AUX="${ALPHA_AUX:-0.03125}"              # aux loss weight (1/32, Bussmann et al.)
+ALPHA_AUX="${ALPHA_AUX:-0.03125}"              # aux loss weight (1/32, Gao et al. 2024)
 LR="${LR:-2e-4}"
 LR_MIN_RATIO="${LR_MIN_RATIO:-0.1}"
 WARMUP_STEPS="${WARMUP_STEPS:-1000}"
 EPOCHS="${EPOCHS:-3}"                          # ~85M tokens/epoch -> convergence by ep 2
 SAE_BATCH_SIZE="${SAE_BATCH_SIZE:-8192}"       # tokens/batch; larger steadies BatchTopK
 GRAD_CLIP="${GRAD_CLIP:-1.0}"
-TRAIN_NO_RAM_CACHE="${TRAIN_NO_RAM_CACHE:-}"
 SKIP_TRAIN="${SKIP_TRAIN:-0}"  # 1 = require restored checkpoints; never train
+
+# RAM cache vs streaming. Unset (the default) means "decide automatically once
+# the manifest is known" -- see choose_ram_cache below. Set to 1 to force
+# streaming, 0 to force the RAM cache.
+TRAIN_NO_RAM_CACHE="${TRAIN_NO_RAM_CACHE:-}"
+# Fraction of free RAM the cached layer may occupy before streaming is chosen.
+RAM_CACHE_SAFETY="${RAM_CACHE_SAFETY:-0.6}"
 
 # -----------------------------------------------------------------------------
 # Evaluation
@@ -144,10 +150,14 @@ RUN_CAUSAL="${RUN_CAUSAL:-1}"
 RUN_PHASE_7="${RUN_PHASE_7:-$RUN_CAUSAL}"
 RUN_PHASE_8="${RUN_PHASE_8:-0}"
 PHASE8_RESUME="${PHASE8_RESUME:-0}"          # 1 = force eval and skip all phases except 8
-FORCE_EVAL="${FORCE_EVAL:-$PHASE8_RESUME}"  # 1 = ignore existing report.json sentinels
+FORCE_EVAL="${FORCE_EVAL:-$PHASE8_RESUME}"   # 1 = ignore existing report.json sentinels
 EVAL_SKIP_PHASES="${EVAL_SKIP_PHASES:-}"     # optional explicit evaluate.py --skip list
 ABLATION_SPECTRA="${ABLATION_SPECTRA:-5000}"
 ABLATION_TOP_N="${ABLATION_TOP_N:-10}"
+# Single-feature ablations per concept. This is the dominant Phase 8 cost: each
+# one is a full model pass over ABLATION_SPECTRA spectra. The evaluate.py default
+# is 100; lower it to trade per-feature resolution for wall-clock.
+ABLATION_PER_FEATURE_TOP="${ABLATION_PER_FEATURE_TOP:-100}"
 CROSS_LAYER_TOKENS="${CROSS_LAYER_TOKENS:-100000}"
 
 # -----------------------------------------------------------------------------
@@ -158,6 +168,8 @@ CROSS_LAYER_TOKENS="${CROSS_LAYER_TOKENS:-100000}"
 KEEP_CHUNKS="${KEEP_CHUNKS:-1}"
 # Annotation labels are always kept -- they are small and layer-independent.
 KEEP_ANNOTATION="${KEEP_ANNOTATION:-1}"
+# `du -sh` over a multi-terabyte chunk tree can take minutes; set to 0 to skip.
+REPORT_DISK_USAGE="${REPORT_DISK_USAGE:-1}"
 
 # -----------------------------------------------------------------------------
 # Smoke-test override
@@ -171,12 +183,10 @@ if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
     RUN_PHASE_7=0
     RUN_PHASE_8=0
     ABLATION_SPECTRA=256
+    ABLATION_PER_FEATURE_TOP=5
     EXTRACT_DTYPE="float32"              # avoid bfloat16 issues on CPU-only smoke runs
 else
     MAX_SPECTRA="${MAX_SPECTRA:-0}"      # 0 = no cap (entire dataset)
-    # Streaming is the conservative full-run default. Set TRAIN_NO_RAM_CACHE=0
-    # on high-RAM machines if you want true global token shuffling in RAM.
-    TRAIN_NO_RAM_CACHE="${TRAIN_NO_RAM_CACHE:-1}"
 fi
 
 if [[ "$PHASE8_RESUME" == "1" ]]; then
@@ -218,7 +228,7 @@ mkdir -p "$OUTPUT_ROOT"
 OUTPUT_ROOT="$(cd "$OUTPUT_ROOT" && pwd)"
 PIPELINE_LOG="$OUTPUT_ROOT/pipeline.log"
 
-# Shared output locations (v4 layout).
+# Shared output locations.
 EXTRACT_DIR="$OUTPUT_ROOT/extract"
 ANNOTATION_DIR="$OUTPUT_ROOT/annotation"
 # SAE training writes to $SAE_ROOT/layer_{L}/seed_{S}/checkpoint.pt
@@ -259,24 +269,86 @@ eval_report_path() {       # $1 = layer
     echo "$SAE_ROOT/layer_$1/seed_${SEED}/eval/report.json"
 }
 
+dir_size() {              # $1 = directory; cheap no-op when disabled
+    if [[ "$REPORT_DISK_USAGE" != "1" ]]; then
+        echo "(not measured)"
+        return
+    fi
+    du -sh "$1" 2>/dev/null | awk '{print $1}' || echo "?"
+}
+
+# Decide between the RAM cache and streaming for SAE training.
+#
+# The cache loads one layer's activations into memory once, so every epoch is a
+# true global shuffle with no further disk reads; streaming re-reads the layer
+# from disk each epoch. With EPOCHS=3 that is 3 full reads of a ~100 GB layer
+# instead of 1, so the cache is a large win whenever it fits. This sizes the
+# layer from the manifest's token count and compares it against free RAM.
+choose_ram_cache() {
+    if [[ -n "$TRAIN_NO_RAM_CACHE" ]]; then
+        log "  RAM cache      : explicit TRAIN_NO_RAM_CACHE=$TRAIN_NO_RAM_CACHE"
+        return
+    fi
+
+    local decision
+    decision="$("$PYTHON" - "$EXTRACT_DIR/manifest.json" "$D_MODEL" "$RAM_CACHE_SAFETY" <<'PYEOF'
+import json, sys
+from pathlib import Path
+
+manifest_path, d_model, safety = Path(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3])
+DTYPE_BYTES = {"float32": 4, "bfloat16": 2, "float16": 2}
+
+try:
+    manifest = json.loads(manifest_path.read_text())
+    n_tokens = int(manifest["n_tokens"])
+    dtype = str(manifest.get("config", {}).get("dtype", "float32"))
+    needed = n_tokens * d_model * DTYPE_BYTES.get(dtype, 4)
+except Exception as exc:                       # manifest unreadable -> stay safe
+    print(f"1 unknown could-not-size-layer:{exc}")
+    raise SystemExit(0)
+
+# MemAvailable is the kernel's own estimate of what can be allocated without
+# swapping, which is the right number here (MemFree ignores reclaimable cache).
+available = 0
+try:
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        if line.startswith("MemAvailable:"):
+            available = int(line.split()[1]) * 1024
+            break
+except Exception:
+    pass
+
+if available <= 0:
+    print(f"1 {needed/1e9:.0f}GB free-ram-unknown")
+elif needed <= available * safety:
+    print(f"0 {needed/1e9:.0f}GB fits-in-{available/1e9:.0f}GB-available")
+else:
+    print(f"1 {needed/1e9:.0f}GB exceeds-{safety:.0%}-of-{available/1e9:.0f}GB-available")
+PYEOF
+)"
+    TRAIN_NO_RAM_CACHE="${decision%% *}"
+    log "  RAM cache      : auto -> no_ram_cache=$TRAIN_NO_RAM_CACHE  (${decision#* })"
+}
+
 # -----------------------------------------------------------------------------
 # Header
 # -----------------------------------------------------------------------------
 
 log "================================================================"
-log "SAE pipeline (v4) starting"
+log "SAE pipeline starting"
 log "  Script dir      : $SCRIPT_DIR"
 log "  Output root     : $OUTPUT_ROOT"
 log "  Layers          : ${LAYERS[*]}  (seed $SEED)"
 log "  Dataset         : ${DATASET_PATH:-$DATASET_HF_ID (all splits merged)}"
 log "  Model           : $MODEL_PATH"
-log "  Extract dtype   : $EXTRACT_DTYPE  (chunk size $CHUNK_SIZE, batch $EXTRACT_BATCH_SIZE)"
+log "  Extract dtype   : $EXTRACT_DTYPE  (chunk $CHUNK_SIZE, batch $EXTRACT_BATCH_SIZE, n_peaks $N_PEAKS)"
 log "  Annotate        : ion_types=$ION_TYPES, tol=${FRAGMENT_TOL} ${FRAGMENT_TOL_MODE}"
 log "  SAE config      : d_dict=$D_DICT (${EXPANSION_FACTOR}x), k=$K, k_aux=$K_AUX"
 log "                    lr=$LR (min_ratio=$LR_MIN_RATIO, warmup=$WARMUP_STEPS)"
-log "                    epochs=$EPOCHS, batch=$SAE_BATCH_SIZE, grad_clip=$GRAD_CLIP, no_ram_cache=$TRAIN_NO_RAM_CACHE"
+log "                    epochs=$EPOCHS, batch=$SAE_BATCH_SIZE, grad_clip=$GRAD_CLIP"
 log "                    skip_train=$SKIP_TRAIN"
-log "  Eval            : FDR q=$FDR_Q, phase7=$RUN_PHASE_7, phase8=$RUN_PHASE_8, ablation_spectra=$ABLATION_SPECTRA"
+log "  Eval            : FDR q=$FDR_Q, phase7=$RUN_PHASE_7, phase8=$RUN_PHASE_8"
+log "                    ablation_spectra=$ABLATION_SPECTRA, per_feature_top=$ABLATION_PER_FEATURE_TOP"
 log "                    force_eval=$FORCE_EVAL, phase8_resume=$PHASE8_RESUME, explicit_skip='${EVAL_SKIP_PHASES:-}'"
 log "  Keep chunks     : $KEEP_CHUNKS  (annotation always kept)"
 log "  Smoke / cap     : smoke=${SMOKE_TEST:-0}, max_spectra=$MAX_SPECTRA"
@@ -324,7 +396,7 @@ fi
 # This is the most expensive step. The result is stored permanently (KEEP_CHUNKS=1
 # by default) so it can be reused across all future SAE experiments:
 #   - different d_dict / k / seed values (re-run only train + evaluate)
-#   - additional layers (re-run extract with --no-resume for new layers only)
+#   - additional layers (re-run extract; per-chunk resume fills the new layer)
 #   - evaluation-only reruns (extract + annotate are already done)
 #
 # Per-chunk resume is handled internally: if the manifest exists and individual
@@ -339,6 +411,7 @@ EXTRACT_ARGS=(
     --chunk-size   "$CHUNK_SIZE"
     --batch-size   "$EXTRACT_BATCH_SIZE"
     --num-workers  "$NUM_WORKERS"
+    --n-peaks      "$N_PEAKS"
     --device       "$DEVICE"
     --dtype        "$EXTRACT_DTYPE"
 )
@@ -346,6 +419,7 @@ if [[ "$MAX_SPECTRA" != "0" ]]; then
     EXTRACT_ARGS+=(--max-spectra "$MAX_SPECTRA")
 fi
 
+RUN_EXTRACT=1
 if [[ -f "$EXTRACT_DIR/manifest.json" ]]; then
     missing_layers="$("$PYTHON" - "$EXTRACT_DIR/manifest.json" "${LAYERS[@]}" <<'PYEOF'
 import json, sys
@@ -366,14 +440,14 @@ PYEOF
 )"
     if [[ -z "$missing_layers" ]]; then
         log "Extract manifest exists and contains requested layers (${LAYERS[*]}) -- skipping extraction"
+        RUN_EXTRACT=0
     else
         log "Extract manifest exists but is missing requested layer(s): $missing_layers"
         log "Re-running extraction; per-chunk resume will keep intact chunks and fill missing layer files."
-        run_step "Extract activations (layers ${LAYERS[*]}, dtype=$EXTRACT_DTYPE)" \
-            "$OUTPUT_ROOT/extract.log" \
-            "$PYTHON" "$EXTRACT_PY" "${EXTRACT_ARGS[@]}"
     fi
-else
+fi
+
+if [[ "$RUN_EXTRACT" == "1" ]]; then
     run_step "Extract activations (layers ${LAYERS[*]}, dtype=$EXTRACT_DTYPE)" \
         "$OUTPUT_ROOT/extract.log" \
         "$PYTHON" "$EXTRACT_PY" "${EXTRACT_ARGS[@]}"
@@ -387,9 +461,9 @@ fi
 # extraction. Labels are fixed once the dataset and concept vocabulary are fixed,
 # so they are always kept and reused across all layer/seed/SAE-width experiments.
 #
-# Fragment tolerance: 20 ppm for Orbitrap-class high-resolution data.
-# The old default of 0.5 Da is far too wide at Orbitrap resolution and would
-# match spurious peaks as b/y ions, corrupting the cleavage-site labels.
+# Fragment tolerance: 20 ppm for Orbitrap-class high-resolution data. A 0.5 Da
+# window is far too wide at Orbitrap resolution and would match spurious peaks
+# as b/y ions, corrupting the cleavage-site labels.
 
 if [[ -f "$ANNOTATION_DIR/annotation_manifest.json" ]]; then
     log "Annotation manifest exists -- skipping annotation"
@@ -411,8 +485,12 @@ fi
 # -----------------------------------------------------------------------------
 #
 # Each run reads only its own layer's activation files (acts_L{N}_*.pt), so
-# layers are independent and could be parallelised on separate GPUs by running
-# this script with LAYERS_OVERRIDE="<layer>" in separate shells.
+# layers are independent and can be parallelised across GPUs by running this
+# script with LAYERS_OVERRIDE="<layer>" and a distinct DEVICE in separate shells.
+
+if [[ "$SKIP_TRAIN" != "1" ]]; then
+    choose_ram_cache
+fi
 
 for LAYER in "${LAYERS[@]}"; do
     CKPT="$(sae_checkpoint_path "$LAYER")"
@@ -489,8 +567,10 @@ for LAYER in "${LAYERS[@]}"; do
     # Build the --skip list. EVAL_SKIP_PHASES is an explicit override for
     # resume/specialty runs, e.g. PHASE8_RESUME=1 uses the Phase 4 cache and
     # skips every other phase. Otherwise, keep the default full-eval policy.
+    USING_EXPLICIT_SKIP=0
     SKIP_LIST=()
     if [[ -n "$EVAL_SKIP_PHASES" ]]; then
+        USING_EXPLICIT_SKIP=1
         # shellcheck disable=SC2206
         SKIP_LIST=($EVAL_SKIP_PHASES)
     else
@@ -508,48 +588,49 @@ for LAYER in "${LAYERS[@]}"; do
         fi
     fi
 
-    # Cross-layer matching: only the anchor layer runs it, pointing at the
-    # other layers' checkpoints. Non-anchor layers skip it.
     EVAL_ARGS=(
-        --extract-dir        "$EXTRACT_DIR"
-        --annotation-dir     "$ANNOTATION_DIR"
-        --sae-checkpoint     "$CKPT"
-        --output-dir         "$SAE_ROOT"       # evaluate.py appends layer/seed/eval
-        --target-layer       "$LAYER"
-        --seed               "$SEED"
-        --fdr-q              "$FDR_Q"
-        --batch-size         "$EVAL_BATCH_SIZE"
-        --ablation-spectra   "$ABLATION_SPECTRA"
-        --ablation-top-n     "$ABLATION_TOP_N"
-        --cross-layer-tokens "$CROSS_LAYER_TOKENS"
-        --device             "$DEVICE"
+        --extract-dir             "$EXTRACT_DIR"
+        --annotation-dir          "$ANNOTATION_DIR"
+        --sae-checkpoint          "$CKPT"
+        --output-dir              "$SAE_ROOT"    # evaluate.py appends layer/seed/eval
+        --target-layer            "$LAYER"
+        --seed                    "$SEED"
+        --fdr-q                   "$FDR_Q"
+        --batch-size              "$EVAL_BATCH_SIZE"
+        --ablation-spectra        "$ABLATION_SPECTRA"
+        --ablation-top-n          "$ABLATION_TOP_N"
+        --ablation-per-feature-top "$ABLATION_PER_FEATURE_TOP"
+        --cross-layer-tokens      "$CROSS_LAYER_TOKENS"
+        --device                  "$DEVICE"
     )
     if [[ "$PHASE8_RESUME" == "1" ]]; then
         EVAL_ARGS+=(--phase4-cache-dir "$SAE_ROOT/layer_${LAYER}/seed_${SEED}/eval")
     fi
 
     # Phases 7/8: pass the model path so the evaluator can load InstaNovo.
-    # The spectra source defaults to the dataset_path recorded in the extract
-    # manifest, so --spectra-path is only needed if the file has moved.
+    # The spectra source and n_peaks both default to the extract manifest, so
+    # --spectra-path is only needed if the dataset file has moved.
     if [[ "$RUN_PHASE_7" == "1" || "$RUN_PHASE_8" == "1" ]]; then
         EVAL_ARGS+=(--instanovo-path "$MODEL_PATH")
     fi
 
-    # Cross-layer matching on the anchor layer: pass every other checkpoint.
-    if [[ -n "$EVAL_SKIP_PHASES" ]]; then
-        :
-    elif [[ "$LAYER" == "$ANCHOR_LAYER" && ${#LAYERS[@]} -ge 2 ]]; then
-        for OL in "${LAYERS[@]}"; do
-            [[ "$OL" == "$ANCHOR_LAYER" ]] && continue
-            OTHER_CKPT="$(sae_checkpoint_path "$OL")"
-            if [[ -f "$OTHER_CKPT" ]]; then
-                EVAL_ARGS+=(--other-layer-checkpoint "${OL}=${OTHER_CKPT}")
-            else
-                log "WARNING: checkpoint for layer $OL not found; skipping it in cross-layer matching"
-            fi
-        done
-    else
-        SKIP_LIST+=(cross_layer)
+    # Cross-layer matching: only the anchor layer runs it, pointing at the other
+    # layers' checkpoints. Non-anchor layers skip it. An explicit skip list is
+    # left exactly as given.
+    if [[ "$USING_EXPLICIT_SKIP" == "0" ]]; then
+        if [[ "$LAYER" == "$ANCHOR_LAYER" && ${#LAYERS[@]} -ge 2 ]]; then
+            for OL in "${LAYERS[@]}"; do
+                [[ "$OL" == "$ANCHOR_LAYER" ]] && continue
+                OTHER_CKPT="$(sae_checkpoint_path "$OL")"
+                if [[ -f "$OTHER_CKPT" ]]; then
+                    EVAL_ARGS+=(--other-layer-checkpoint "${OL}=${OTHER_CKPT}")
+                else
+                    log "WARNING: checkpoint for layer $OL not found; skipping it in cross-layer matching"
+                fi
+            done
+        else
+            SKIP_LIST+=(cross_layer)
+        fi
     fi
 
     EVAL_ARGS+=(--skip "${SKIP_LIST[@]}")
@@ -566,14 +647,12 @@ done
 if [[ "$KEEP_CHUNKS" == "1" ]]; then
     log "KEEP_CHUNKS=1 -- extract chunks retained for future experiments"
     log "  Location : $EXTRACT_DIR/chunks/"
-    chunk_gb=$(du -sh "$EXTRACT_DIR/chunks" 2>/dev/null | awk '{print $1}' || echo "?")
-    log "  Disk used: $chunk_gb"
+    log "  Disk used: $(dir_size "$EXTRACT_DIR/chunks")"
     log "  To free disk later: rm -rf $EXTRACT_DIR/chunks"
     log "  (The manifest.json is kept for provenance even if chunks are deleted.)"
 else
     if [[ -d "$EXTRACT_DIR/chunks" ]]; then
-        chunk_size=$(du -sh "$EXTRACT_DIR/chunks" 2>/dev/null | awk '{print $1}' || echo "?")
-        log "KEEP_CHUNKS=0 -- deleting extract chunks (freeing ~$chunk_size)"
+        log "KEEP_CHUNKS=0 -- deleting extract chunks (freeing ~$(dir_size "$EXTRACT_DIR/chunks"))"
         rm -rf "$EXTRACT_DIR/chunks"
         log "  manifest.json kept for provenance"
     fi
@@ -581,8 +660,7 @@ fi
 
 # Annotation labels: always kept (they are small and layer-independent).
 if [[ -d "$ANNOTATION_DIR" ]]; then
-    ann_size=$(du -sh "$ANNOTATION_DIR" 2>/dev/null | awk '{print $1}' || echo "?")
-    log "Annotation labels retained: $ANNOTATION_DIR  ($ann_size)"
+    log "Annotation labels retained: $ANNOTATION_DIR  ($(dir_size "$ANNOTATION_DIR"))"
 fi
 
 # -----------------------------------------------------------------------------

@@ -1,8 +1,8 @@
 """annotate.py — multi-concept token annotation for InstaNovo SAE evaluation.
 
-Reads the v4 per-chunk metadata written by extract.py (the ChunkMeta
-files — activations are not needed here) and writes one LabelChunkData per chunk
-with the same token ordering, ready for row-by-row joining with activations.
+Reads the per-chunk metadata written by extract.py (the ChunkMeta files —
+activations are not needed here) and writes one LabelChunkData per chunk with the
+same token ordering, ready for row-by-row joining with activations.
 
 Fragment-ion annotation uses spectrum_utils 0.5.x (mzPAF-style annotations). The
 adapter below is the single place that depends on the spectrum_utils annotation
@@ -65,6 +65,8 @@ import torch
 # place, _annotation_to_dict, which is where any future-version tweak would go.
 import spectrum_utils.spectrum as sus
 
+from schema import ANNOTATION_SCHEMA_VERSION, EXTRACT_SCHEMA_VERSION
+
 # InstaNovo's canonical legacy-token -> UNIMOD ProForma table (see module docstring).
 # Guarded so this file still runs without the InstaNovo package; PTM identity then
 # falls back to mass matching against the tracked PTMs (see _mod_unimod_id).
@@ -73,14 +75,13 @@ try:
 except Exception:
     LEGACY_PTM_TO_UNIMOD: dict[str, str] = {}
 
-SCHEMA_VERSION = 4          # LabelChunkData schema (row-aligned with v4 activations)
-EXTRACT_SCHEMA_VERSION = 4  # extract.py manifest/ChunkMeta this reads
+# Re-exported under its historical name for any consumer reading label chunks.
+SCHEMA_VERSION = ANNOTATION_SCHEMA_VERSION
+
 LOG = logging.getLogger("annotate")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Concept registry
-# ─────────────────────────────────────────────────────────────────────────────
+# --- Concept registry ---------------------------------------------------------
 # Families are ordered for consistent indexing across chunks. Adding new
 # concepts at the end of a family preserves backward compatibility.
 CONCEPT_FAMILIES: dict[str, list[str]] = {
@@ -120,6 +121,12 @@ CONCEPT_FAMILIES: dict[str, list[str]] = {
 # ablation — they exist as negative controls for methodology validation.
 DIAGNOSTIC_FAMILIES: set[str] = {"spectrum_ptm_diagnostic"}
 
+# Residues with a covers_<residue> concept. Derived from the registry so the
+# loop and the concept list cannot drift apart.
+COVERED_RESIDUES: str = "".join(
+    c.removeprefix("covers_") for c in CONCEPT_FAMILIES["residue_cover"]
+)
+
 # Mass-region bin boundaries in Da.
 MZ_LOW_HIGH_CUT = (300.0, 1000.0)
 
@@ -142,8 +149,12 @@ TRACKED_PTMS: dict[int, tuple[str, float]] = {
 # the tracked masses are well separated, so 0.02 Da is safe and unambiguous.
 PTM_MASS_TOL = 0.02
 
+# Neutral losses passed to spectrum_utils, as exact monoisotopic deltas.
+NEUTRAL_LOSSES = {"H2O": -18.010565, "NH3": -17.026549}
+
 _MASS_DELTA_RE = re.compile(r"[+-]?\d*\.?\d+")
 _UNIMOD_ID_RE = re.compile(r"UNIMOD:(\d+)")
+_PROFORMA_TAG_RE = re.compile(r"\[([^\]]+)\]")
 
 # Small int vocabularies for compact per-token metadata storage.
 ION_TYPE_VOCAB: dict[str, int] = {
@@ -157,6 +168,10 @@ NEUTRAL_LOSS_VOCAB: dict[str, int] = {
     "": 0, "H2O": 1, "NH3": 2, "H2O+NH3": 3, "H3PO4": 4,
 }
 NEUTRAL_LOSS_INV: dict[int, str] = {v: k for k, v in NEUTRAL_LOSS_VOCAB.items()}
+
+# Storage caps for the compact per-token metadata tensors (int16 / int8).
+_ION_INDEX_CAP = 32_000
+_FRAGMENT_CHARGE_CAP = 127
 
 
 @dataclasses.dataclass
@@ -197,9 +212,6 @@ class ConceptRegistry:
         }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Chunk schema
-# ─────────────────────────────────────────────────────────────────────────────
 @dataclasses.dataclass
 class LabelChunkData:
     """Per-token labels for one input chunk. Same token ordering and total_tokens
@@ -235,9 +247,6 @@ class LabelChunkData:
         return cls(**torch.load(path, map_location="cpu", weights_only=False))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Ion geometry — what residue positions does each fragment ion cover?
-# ─────────────────────────────────────────────────────────────────────────────
 class IonGeometry:
     """Compute geometric coverage of a fragment ion over its parent peptide.
 
@@ -295,10 +304,20 @@ class IonGeometry:
                 return True
         return False
 
+    def backbone_index(self) -> int | None:
+        """The backbone cleavage index k for a b/y ion, else None.
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Modification helpers (UNIMOD identity via the canonical table + exact-mass ProForma)
-# ─────────────────────────────────────────────────────────────────────────────
+        Several concept families are defined only for backbone ions with an
+        integer index; this centralises that guard.
+        """
+        if self.ion_type in ("b", "y") and isinstance(self.ion_index, int):
+            return self.ion_index
+        return None
+
+
+# --- Modification helpers -----------------------------------------------------
+# UNIMOD identity via the canonical table, plus exact-mass ProForma rewriting.
+
 def _mod_delta_mass(mod: dict) -> float | None:
     """Parse the numeric delta mass from a modification's mod_name, or None if it
     is a UNIMOD tag (handled separately) or unparseable."""
@@ -309,33 +328,38 @@ def _mod_delta_mass(mod: dict) -> float | None:
     return float(m.group(0)) if m else None
 
 
+def _legacy_ptm_tokens(mod_name: str, position: int, peptide: str) -> list[str]:
+    """Candidate LEGACY_PTM_TO_UNIMOD keys for a modification.
+
+    An in-sequence modification is keyed as residue + delta (e.g. "M(+15.99)").
+    N-terminal modifications are commonly keyed without a residue, but some
+    residue sets encode N-terminal chemistry on the first residue, so both forms
+    are tried.
+    """
+    if 1 <= position <= len(peptide):
+        return [f"{peptide[position - 1]}({mod_name})"]
+    tokens = [f"({mod_name})"]
+    if peptide:
+        tokens.append(f"{peptide[0]}({mod_name})")
+    return tokens
+
+
 def _mod_unimod_id(mod: dict, peptide: str) -> int:
     """Resolve a modification to its UNIMOD id.
 
-    Identity is taken from InstaNovo's canonical LEGACY_PTM_TO_UNIMOD table: the
-    modification's legacy token is reconstructed as residue + delta (e.g.
-    "M(+15.99)", plus N-terminal forms such as "(+42.01)") and looked up there.
-    A unimod_id already set by the extractor is trusted directly. As a last
-    resort -- used when the table is unavailable (no InstaNovo package) or lacks
-    the token -- the delta mass is matched against the tracked PTMs. Returns -1
-    if unresolved.
+    Identity is taken from InstaNovo's canonical LEGACY_PTM_TO_UNIMOD table. A
+    unimod_id already set by the extractor is trusted directly. As a last resort
+    -- used when the table is unavailable (no InstaNovo package) or lacks the
+    token -- the delta mass is matched against the tracked PTMs. Returns -1 if
+    unresolved.
     """
     uid = int(mod.get("unimod_id", -1))
     if uid > 0:
         return uid
 
-    pos = int(mod.get("position", 0))
-    mod_name = str(mod.get("mod_name", ""))
-    tokens: list[str] = []
-    if 1 <= pos <= len(peptide):
-        tokens.append(f"{peptide[pos - 1]}({mod_name})")
-    else:
-        # N-terminal modifications are commonly keyed without a residue, but
-        # some residue sets encode N-terminal chemistry on the first residue.
-        tokens.append(f"({mod_name})")
-        if peptide:
-            tokens.append(f"{peptide[0]}({mod_name})")
-
+    tokens = _legacy_ptm_tokens(
+        str(mod.get("mod_name", "")), int(mod.get("position", 0)), peptide,
+    )
     for token in tokens:
         match = _UNIMOD_ID_RE.search(LEGACY_PTM_TO_UNIMOD.get(token, ""))
         if match:
@@ -394,12 +418,10 @@ def exact_mass_proforma(proforma: str) -> str:
                 return f"[{sign}{mass:.6f}]"
         return m.group(0)
 
-    return re.sub(r"\[([^\]]+)\]", repl, proforma)
+    return _PROFORMA_TAG_RE.sub(repl, proforma)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# spectrum_utils adapter (spectrum_utils 0.5.x)
-# ─────────────────────────────────────────────────────────────────────────────
+# --- spectrum_utils adapter (spectrum_utils 0.5.x) ----------------------------
 # In 0.5.x each peak carries a PeakInterpretation with a list of FragmentAnnotation
 # objects. Each FragmentAnnotation has a combined ion_type string ("b2", "y3",
 # "IC" for the Cys immonium, "m3:5" for an internal fragment, "p" for precursor),
@@ -437,13 +459,31 @@ def _parse_ion_type(ion_type_str: str) -> tuple:
     return None, None
 
 
+def _candidate_sort_key(fa, ion_type: str, neutral_loss: str, charge: int) -> tuple:
+    """Preference ordering for competing annotations of one peak (lower = better).
+
+    Monoisotopic before isotopic, no neutral loss before a loss, canonical b/y
+    before other ion series, then lowest charge, then smallest mass error. This
+    reflects the physical expectation that the dominant annotation for a matched
+    peak is the one most consistent with the observed mass.
+    """
+    isotope = int(getattr(fa, "isotope", 0) or 0)
+    mz_delta = getattr(fa, "mz_delta", None)
+    return (
+        isotope != 0,
+        bool(neutral_loss),
+        _ION_PRIORITY.get(ion_type, 5),
+        charge,
+        abs(mz_delta[0]) if mz_delta else 0.0,
+    )
+
+
 def _annotation_to_dict(peak_interpretation) -> dict:
     """Reduce one spectrum_utils PeakInterpretation to a flat label dict.
 
-    Picks the best candidate annotation (monoisotopic first, then no neutral loss,
-    then canonical b/y over other ions, then lowest charge and smallest mass
-    error) and maps it to {ion_type, ion_index, charge, neutral_loss}. Peaks with
-    no annotation become noise.
+    Picks the best candidate annotation (see _candidate_sort_key) and maps it to
+    {ion_type, ion_index, charge, neutral_loss}. Peaks with no annotation become
+    noise.
     """
     frags = getattr(peak_interpretation, "fragment_annotations", None) or []
     candidates = []
@@ -454,22 +494,15 @@ def _annotation_to_dict(peak_interpretation) -> dict:
         nl_raw = getattr(fa, "neutral_loss", None)
         neutral_loss = str(nl_raw).lstrip("-") if nl_raw else ""
         charge = int(getattr(fa, "charge", 1))
-        isotope = int(getattr(fa, "isotope", 0) or 0)
-        mz_delta = getattr(fa, "mz_delta", None)
-        delta_abs = abs(mz_delta[0]) if mz_delta else 0.0
-        sort_key = (
-            isotope != 0,
-            bool(neutral_loss),
-            _ION_PRIORITY.get(ion_type, 5),
-            charge,
-            delta_abs,
-        )
-        candidates.append((sort_key, {
-            "ion_type": ion_type,
-            "ion_index": ion_index,
-            "charge": charge,
-            "neutral_loss": neutral_loss,
-        }))
+        candidates.append((
+            _candidate_sort_key(fa, ion_type, neutral_loss, charge),
+            {
+                "ion_type": ion_type,
+                "ion_index": ion_index,
+                "charge": charge,
+                "neutral_loss": neutral_loss,
+            },
+        ))
 
     if not candidates:
         return dict(_NOISE)
@@ -512,7 +545,7 @@ def run_spectrum_utils(
             fragment_tol_mode,
             ion_types=annotation_ion_types,
             max_isotope=0,                               # monoisotopic fragments only
-            neutral_losses={"H2O": -18.010565, "NH3": -17.026549},
+            neutral_losses=NEUTRAL_LOSSES,
         )
     except Exception as exc:
         # Bad ProForma or unsupported residue — return all-noise to keep the run going.
@@ -525,9 +558,8 @@ def run_spectrum_utils(
     return [_annotation_to_dict(a) for a in annotations]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Concept computation
-# ─────────────────────────────────────────────────────────────────────────────
+# --- Concept computation ------------------------------------------------------
+
 def compute_spectrum_concepts(
     modifications: list[dict],
     precursor_charge: int,
@@ -569,6 +601,137 @@ def compute_top_decile_threshold(intensities: torch.Tensor) -> float:
     return float(torch.quantile(intensities.float(), 0.9))
 
 
+def _set_ion_type_concepts(out: dict[str, bool], ion_type: str) -> None:
+    """Ion-identity family. is_matched_peak is the complement of noise/latent."""
+    out["is_b_ion"] = ion_type == "b"
+    out["is_y_ion"] = ion_type == "y"
+    out["is_I_ion"] = ion_type == "I"
+    out["is_internal_fragment"] = ion_type == "internal"
+    out["is_precursor_related"] = ion_type == "precursor"
+    out["is_noise_peak"] = ion_type == "noise"
+    out["is_latent_token"] = False  # latent handled separately
+    out["is_matched_peak"] = ion_type not in ("noise", "latent")
+
+
+def _set_neutral_loss_concepts(out: dict[str, bool], neutral_loss: str) -> None:
+    nl = neutral_loss or ""
+    out["is_H2O_loss"] = "H2O" in nl
+    out["is_NH3_loss"] = "NH3" in nl
+    out["has_neutral_loss"] = bool(nl)
+
+
+def _set_physical_concepts(
+    out: dict[str, bool],
+    mz: float,
+    intensity: float,
+    intensity_threshold: float,
+    fragment_charge: int,
+) -> None:
+    """Properties readable from the peak itself: charge, m/z region, intensity."""
+    out["is_fragment_charge_1"] = fragment_charge == 1
+    out["is_fragment_charge_2"] = fragment_charge == 2
+
+    low_cut, high_cut = MZ_LOW_HIGH_CUT
+    out["mz_low"] = mz < low_cut
+    out["mz_mid"] = low_cut <= mz < high_cut
+    out["mz_high"] = mz >= high_cut
+
+    out["top_decile_intensity"] = intensity >= intensity_threshold
+
+
+def _set_position_concepts(
+    out: dict[str, bool], geom: IonGeometry, peptide_length: int
+) -> None:
+    """Position and first/last-ion families, defined only for backbone b/y ions.
+
+    b_k / y_k: k is the cleavage index. It is mapped to N/middle/C terms by where
+    the cleavage falls along the peptide, in thirds.
+    """
+    k = geom.backbone_index()
+    if k is None:
+        return
+
+    if k > 0:
+        cleavage_pos = k if geom.ion_type == "b" else (peptide_length - k)
+        third = peptide_length / 3.0
+        out["position_Nterm"] = cleavage_pos < third
+        out["position_middle"] = third <= cleavage_pos < 2 * third
+        out["position_Cterm"] = cleavage_pos >= 2 * third
+
+    out["is_first_ion"] = k == 1
+    out["is_last_ion"] = k == peptide_length - 1
+
+
+def _cleavage_site(geom: IonGeometry, peptide_length: int) -> int | None:
+    """1-indexed residue after which this ion's backbone cleavage occurred.
+
+    A b_k ion cleaves after residue k; the complementary y_k ion cleaves after
+    residue L-k. Returns None for non-backbone ions or terminal indices that
+    imply no interior cleavage.
+    """
+    k = geom.backbone_index()
+    if k is None or not (1 <= k < peptide_length):
+        return None
+    return k if geom.ion_type == "b" else peptide_length - k
+
+
+def _set_cleavage_concepts(
+    out: dict[str, bool], geom: IonGeometry, peptide: str, peptide_length: int
+) -> None:
+    """Canonical (tryptic) and enhanced cleavage families.
+
+    Named for the residue flanking the cleavage: C-terminal-to-X means X sits
+    before the break, N-terminal-to-Pro means proline sits after it.
+    """
+    site = _cleavage_site(geom, peptide_length)
+    if site is None or not (1 <= site < peptide_length):
+        return
+
+    before = peptide[site - 1]
+    after = peptide[site]
+    out["cleaves_C_to_Lys"] = (before == "K")
+    out["cleaves_C_to_Arg"] = (before == "R")
+    out["cleaves_C_to_Asp"] = (before == "D")
+    out["cleaves_C_to_Glu"] = (before == "E")
+    out["cleaves_N_to_Pro"] = (after == "P")
+
+
+def _set_residue_cover_concepts(
+    out: dict[str, bool], geom: IonGeometry, peptide: str, registry: ConceptRegistry
+) -> None:
+    for residue in COVERED_RESIDUES:
+        concept_name = f"covers_{residue}"
+        if concept_name in registry.names:
+            out[concept_name] = geom.covers_any_residue(peptide, residue)
+
+
+def _set_ion_ptm_concepts(
+    out: dict[str, bool],
+    geom: IonGeometry,
+    peptide: str,
+    modifications: list[dict],
+    peptide_length: int,
+    registry: ConceptRegistry,
+) -> None:
+    """Token-level PTM containment.
+
+    A b/y/internal ion that spans the modified residue's position contains it;
+    immonium ions don't localise (geom.covers returns False for them), which is
+    what makes ion_contains_* a genuine localisation signal rather than a
+    spectrum-level correlate.
+    """
+    for mod in modifications:
+        mod_pos = mod.get("position", 0)
+        if mod_pos < 1 or mod_pos > peptide_length:
+            continue
+        ptm_name = _mod_to_ptm_name(mod, peptide)
+        if ptm_name is None:
+            continue
+        concept_name = f"ion_contains_{ptm_name}"
+        if concept_name in registry.names and geom.covers(mod_pos):
+            out[concept_name] = True
+
+
 def compute_peak_concepts(
     annotation: dict,
     mz: float,
@@ -583,93 +746,17 @@ def compute_peak_concepts(
     out: dict[str, bool] = {n: False for n in registry.names}
 
     ion_type = annotation["ion_type"]
-    ion_index = annotation["ion_index"]
-    fragment_charge = annotation["charge"]
-    neutral_loss = annotation["neutral_loss"]
+    geom = IonGeometry(ion_type, annotation["ion_index"], peptide_length)
 
-    # ─── Ion-type family ───
-    out["is_b_ion"] = ion_type == "b"
-    out["is_y_ion"] = ion_type == "y"
-    out["is_I_ion"] = ion_type == "I"
-    out["is_internal_fragment"] = ion_type == "internal"
-    out["is_precursor_related"] = ion_type == "precursor"
-    out["is_noise_peak"] = ion_type == "noise"
-    out["is_latent_token"] = False  # latent handled separately
-    out["is_matched_peak"] = ion_type not in ("noise", "latent")
-
-    # ─── Neutral loss family ───
-    nl = neutral_loss or ""
-    out["is_H2O_loss"] = "H2O" in nl
-    out["is_NH3_loss"] = "NH3" in nl
-    out["has_neutral_loss"] = bool(nl)
-
-    # ─── Fragment charge family ───
-    out["is_fragment_charge_1"] = fragment_charge == 1
-    out["is_fragment_charge_2"] = fragment_charge == 2
-
-    # ─── Mass region family ───
-    low_cut, high_cut = MZ_LOW_HIGH_CUT
-    out["mz_low"] = mz < low_cut
-    out["mz_mid"] = low_cut <= mz < high_cut
-    out["mz_high"] = mz >= high_cut
-
-    # ─── Intensity family ───
-    out["top_decile_intensity"] = intensity >= intensity_threshold
-
-    # The remaining concepts require ion geometry.
-    geom = IonGeometry(ion_type, ion_index, peptide_length)
-
-    # ─── Position family (for matched b/y) ───
-    # b_k / y_k: k is the cleavage index. Map to N/middle/C terms based on
-    # where the cleavage falls along the peptide.
-    if ion_type in ("b", "y") and isinstance(geom.ion_index, int) and geom.ion_index > 0:
-        cleavage_pos = geom.ion_index if ion_type == "b" else (peptide_length - geom.ion_index)
-        third = peptide_length / 3.0
-        out["position_Nterm"] = cleavage_pos < third
-        out["position_middle"] = third <= cleavage_pos < 2 * third
-        out["position_Cterm"] = cleavage_pos >= 2 * third
-
-    # ─── First/last ion family ───
-    if ion_type in ("b", "y") and isinstance(geom.ion_index, int):
-        out["is_first_ion"] = geom.ion_index == 1
-        out["is_last_ion"] = geom.ion_index == peptide_length - 1
-
-    # ─── Cleavage chemistry families ───
-    # A b_k or y_(L-k) ion implies a cleavage between residues k and k+1 (1-indexed).
-    cleavage_after_idx = None
-    if ion_type == "b" and isinstance(geom.ion_index, int) and 1 <= geom.ion_index < peptide_length:
-        cleavage_after_idx = geom.ion_index
-    elif ion_type == "y" and isinstance(geom.ion_index, int) and 1 <= geom.ion_index < peptide_length:
-        cleavage_after_idx = peptide_length - geom.ion_index
-
-    if cleavage_after_idx is not None and 1 <= cleavage_after_idx < peptide_length:
-        before = peptide[cleavage_after_idx - 1]
-        after = peptide[cleavage_after_idx]
-        out["cleaves_C_to_Lys"] = (before == "K")
-        out["cleaves_C_to_Arg"] = (before == "R")
-        out["cleaves_C_to_Asp"] = (before == "D")
-        out["cleaves_C_to_Glu"] = (before == "E")
-        out["cleaves_N_to_Pro"] = (after == "P")
-
-    # ─── Residue-cover family ───
-    for residue in "KRWFYPMCDEN":
-        concept_name = f"covers_{residue}"
-        if concept_name in registry.names:
-            out[concept_name] = geom.covers_any_residue(peptide, residue)
-
-    # ─── Token-level PTM containment ───
-    # A b/y/internal ion that spans the modified residue's position contains it;
-    # immonium ions don't localise (geom.covers returns False for them).
-    for mod in modifications:
-        mod_pos = mod.get("position", 0)
-        if mod_pos < 1 or mod_pos > peptide_length:
-            continue
-        ptm_name = _mod_to_ptm_name(mod, peptide)
-        if ptm_name is None:
-            continue
-        concept_name = f"ion_contains_{ptm_name}"
-        if concept_name in registry.names and geom.covers(mod_pos):
-            out[concept_name] = True
+    _set_ion_type_concepts(out, ion_type)
+    _set_neutral_loss_concepts(out, annotation["neutral_loss"])
+    _set_physical_concepts(
+        out, mz, intensity, intensity_threshold, annotation["charge"],
+    )
+    _set_position_concepts(out, geom, peptide_length)
+    _set_cleavage_concepts(out, geom, peptide, peptide_length)
+    _set_residue_cover_concepts(out, geom, peptide, registry)
+    _set_ion_ptm_concepts(out, geom, peptide, modifications, peptide_length, registry)
 
     return out
 
@@ -692,7 +779,7 @@ def compute_latent_concepts(
     out["is_latent_token"] = True
 
     # Latent covers whole peptide for residue-cover concepts.
-    for residue in "KRWFYPMCDEN":
+    for residue in COVERED_RESIDUES:
         concept_name = f"covers_{residue}"
         if concept_name in registry.names:
             out[concept_name] = residue in peptide
@@ -709,9 +796,8 @@ def compute_latent_concepts(
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-chunk annotation
-# ─────────────────────────────────────────────────────────────────────────────
+# --- Per-chunk annotation -----------------------------------------------------
+
 @dataclasses.dataclass
 class AnnotationConfig:
     """Configuration for an annotation run."""
@@ -731,6 +817,113 @@ class AnnotationConfig:
         return out
 
 
+class _SpectrumTokens:
+    """Per-token tensors for one spectrum: the latent token at row 0, then one
+    row per peak. Allocated all-zero and filled row by row, which is cheaper than
+    indexing into a chunk-wide tensor from Python.
+    """
+
+    def __init__(self, n_tokens: int, n_concepts: int):
+        self.labels = torch.zeros(n_tokens, n_concepts, dtype=torch.bool)
+        self.ion_type = torch.zeros(n_tokens, dtype=torch.int8)
+        self.ion_index = torch.full((n_tokens,), -1, dtype=torch.int16)
+        self.fragment_charge = torch.zeros(n_tokens, dtype=torch.int8)
+        self.neutral_loss_id = torch.zeros(n_tokens, dtype=torch.int8)
+        self.mz = torch.zeros(n_tokens, dtype=torch.float32)
+        self.intensity = torch.zeros(n_tokens, dtype=torch.float32)
+
+    def set_concepts(self, row: int, concepts: dict[str, bool], name_to_idx: dict[str, int]) -> None:
+        for cname, val in concepts.items():
+            if val:
+                self.labels[row, name_to_idx[cname]] = True
+
+    def set_peak_metadata(self, row: int, ann: dict, mz: float, intensity: float) -> None:
+        """Store the compact per-token metadata for one annotated peak."""
+        self.ion_type[row] = ION_TYPE_VOCAB.get(ann["ion_type"], 0)
+
+        ii = ann["ion_index"]
+        if isinstance(ii, int) and ii >= 0:
+            self.ion_index[row] = min(ii, _ION_INDEX_CAP)
+        elif isinstance(ii, tuple):
+            # Internal fragment: store the start position only.
+            self.ion_index[row] = min(ii[0], _ION_INDEX_CAP)
+
+        self.fragment_charge[row] = min(ann["charge"], _FRAGMENT_CHARGE_CAP)
+        self.neutral_loss_id[row] = NEUTRAL_LOSS_VOCAB.get(ann["neutral_loss"] or "", 0)
+        self.mz[row] = mz
+        self.intensity[row] = intensity
+
+
+def _annotate_spectrum(
+    chunk_data: dict,
+    s: int,
+    config: AnnotationConfig,
+    registry: ConceptRegistry,
+    name_to_idx: dict[str, int],
+) -> _SpectrumTokens:
+    """Annotate spectrum `s` of a chunk into its per-token tensors.
+
+    Token ordering is the latent summary token followed by one token per peak,
+    matching how extract.py flattened the same spectrum.
+    """
+    peptide = chunk_data["peptides"][s]
+    modifications = chunk_data["modifications"][s]
+    mz_array = chunk_data["mz_arrays"][s]
+    intensity_array = chunk_data["intensity_arrays"][s]
+    precursor_charge = int(chunk_data["precursor_charges"][s])
+    peptide_length = len(peptide)
+
+    spectrum_concepts = compute_spectrum_concepts(
+        modifications, precursor_charge, peptide,
+    )
+    intensity_threshold = compute_top_decile_threshold(intensity_array)
+
+    # One label dict per peak (noise if unmatched).
+    annotations = run_spectrum_utils(
+        proforma=chunk_data["proforma_strings"][s],
+        mz_array=mz_array,
+        intensity_array=intensity_array,
+        precursor_mz=float(chunk_data["precursor_mzs"][s]),
+        precursor_charge=precursor_charge,
+        ion_types=config.ion_types,
+        fragment_tol_mass=config.fragment_tol_mass,
+        fragment_tol_mode=config.fragment_tol_mode,
+        enable_internal=config.enable_internal,
+    )
+
+    tokens = _SpectrumTokens(1 + len(mz_array), len(registry.names))
+
+    # Row 0: the latent summary token.
+    tokens.set_concepts(
+        0,
+        compute_latent_concepts(
+            spectrum_concepts, peptide, modifications, peptide_length, registry,
+        ),
+        name_to_idx,
+    )
+    tokens.ion_type[0] = ION_TYPE_VOCAB["latent"]
+
+    # Rows 1..n_peaks: one per spectral peak.
+    for peak_idx, ann in enumerate(annotations):
+        row = peak_idx + 1
+        mz = float(mz_array[peak_idx])
+        intensity = float(intensity_array[peak_idx])
+
+        peak_concepts = compute_peak_concepts(
+            ann, mz, intensity, intensity_threshold,
+            peptide, modifications, peptide_length, registry,
+        )
+        # Spectrum-level concepts apply to every peak too. Merge with OR
+        # semantics so spectrum labels cannot clobber peak-local labels if a
+        # future concept family reuses a name.
+        merge_spectrum_concepts(peak_concepts, spectrum_concepts)
+
+        tokens.set_concepts(row, peak_concepts, name_to_idx)
+        tokens.set_peak_metadata(row, ann, mz, intensity)
+
+    return tokens
+
+
 def annotate_chunk(
     chunk_data: dict,
     config: AnnotationConfig,
@@ -738,135 +931,39 @@ def annotate_chunk(
 ) -> LabelChunkData:
     """Build a LabelChunkData for one input chunk.
 
-    `chunk_data` is a v4 ChunkMeta loaded as a dict. The output token ordering
+    `chunk_data` is a ChunkMeta loaded as a dict. The output token ordering
     matches the chunk's flattening — for each spectrum, the latent token at
     position 0 followed by one token per peak — so the result row-aligns with
     activations[layer] for that chunk.
     """
     n_spectra = chunk_data["n_spectra"]
-    chunk_idx = chunk_data["chunk_idx"]
     name_to_idx = registry.index
-    n_concepts = len(registry.names)
 
-    # Accumulate per-spectrum tensors and concatenate at the end. Cheaper
-    # than indexing into a pre-allocated tensor token-by-token in Python.
-    label_parts: list[torch.Tensor] = []
-    ion_type_parts: list[torch.Tensor] = []
-    ion_index_parts: list[torch.Tensor] = []
-    fragment_charge_parts: list[torch.Tensor] = []
-    nl_id_parts: list[torch.Tensor] = []
-    mz_parts: list[torch.Tensor] = []
-    intensity_parts: list[torch.Tensor] = []
+    per_spectrum = [
+        _annotate_spectrum(chunk_data, s, config, registry, name_to_idx)
+        for s in range(n_spectra)
+    ]
 
-    for s in range(n_spectra):
-        peptide = chunk_data["peptides"][s]
-        proforma = chunk_data["proforma_strings"][s]
-        modifications = chunk_data["modifications"][s]
-        mz_array = chunk_data["mz_arrays"][s]
-        intensity_array = chunk_data["intensity_arrays"][s]
-        precursor_charge = int(chunk_data["precursor_charges"][s])
-        precursor_mz = float(chunk_data["precursor_mzs"][s])
-        peptide_length = len(peptide)
-        n_peaks = len(mz_array)
-        n_tokens_s = 1 + n_peaks  # latent + peaks
+    def joined(attr: str) -> torch.Tensor:
+        return torch.cat([getattr(t, attr) for t in per_spectrum], dim=0)
 
-        # Pre-compute spectrum-level concepts and intensity threshold once.
-        spectrum_concepts = compute_spectrum_concepts(
-            modifications, precursor_charge, peptide,
-        )
-        intensity_threshold = compute_top_decile_threshold(intensity_array)
-
-        # Annotate the spectrum; returns one label dict per peak (noise if unmatched).
-        annotations = run_spectrum_utils(
-            proforma=proforma,
-            mz_array=mz_array,
-            intensity_array=intensity_array,
-            precursor_mz=precursor_mz,
-            precursor_charge=precursor_charge,
-            ion_types=config.ion_types,
-            fragment_tol_mass=config.fragment_tol_mass,
-            fragment_tol_mode=config.fragment_tol_mode,
-            enable_internal=config.enable_internal,
-        )
-
-        # Allocate per-spectrum tensors and fill row by row.
-        labels_s = torch.zeros(n_tokens_s, n_concepts, dtype=torch.bool)
-        ion_type_s = torch.zeros(n_tokens_s, dtype=torch.int8)
-        ion_index_s = torch.full((n_tokens_s,), -1, dtype=torch.int16)
-        fragment_charge_s = torch.zeros(n_tokens_s, dtype=torch.int8)
-        nl_id_s = torch.zeros(n_tokens_s, dtype=torch.int8)
-        mz_s = torch.zeros(n_tokens_s, dtype=torch.float32)
-        intensity_s = torch.zeros(n_tokens_s, dtype=torch.float32)
-
-        # Position 0: latent token.
-        latent_concepts = compute_latent_concepts(
-            spectrum_concepts, peptide, modifications, peptide_length, registry,
-        )
-        for cname, val in latent_concepts.items():
-            if val:
-                labels_s[0, name_to_idx[cname]] = True
-        ion_type_s[0] = ION_TYPE_VOCAB["latent"]
-
-        # Positions 1..n_peaks: peak tokens.
-        for peak_idx, ann in enumerate(annotations):
-            pos = peak_idx + 1
-            mz = float(mz_array[peak_idx])
-            intensity = float(intensity_array[peak_idx])
-
-            peak_concepts = compute_peak_concepts(
-                ann, mz, intensity, intensity_threshold,
-                peptide, modifications, peptide_length,
-                registry,
-            )
-            # Spectrum-level concepts apply to every peak too. Merge with OR
-            # semantics so spectrum labels cannot clobber peak-local labels if a
-            # future concept family reuses a name.
-            merge_spectrum_concepts(peak_concepts, spectrum_concepts)
-
-            for cname, val in peak_concepts.items():
-                if val:
-                    labels_s[pos, name_to_idx[cname]] = True
-
-            ion_type_s[pos] = ION_TYPE_VOCAB.get(ann["ion_type"], 0)
-            ii = ann["ion_index"]
-            if isinstance(ii, int) and ii >= 0:
-                ion_index_s[pos] = min(ii, 32_000)
-            elif isinstance(ii, tuple):
-                # Internal fragment: store the start position only.
-                ion_index_s[pos] = min(ii[0], 32_000)
-            fragment_charge_s[pos] = min(ann["charge"], 127)
-            nl_id_s[pos] = NEUTRAL_LOSS_VOCAB.get(ann["neutral_loss"] or "", 0)
-            mz_s[pos] = mz
-            intensity_s[pos] = intensity
-
-        label_parts.append(labels_s)
-        ion_type_parts.append(ion_type_s)
-        ion_index_parts.append(ion_index_s)
-        fragment_charge_parts.append(fragment_charge_s)
-        nl_id_parts.append(nl_id_s)
-        mz_parts.append(mz_s)
-        intensity_parts.append(intensity_s)
-
-    token_labels = torch.cat(label_parts, dim=0)
+    token_labels = joined("labels")
     return LabelChunkData(
-        schema_version=SCHEMA_VERSION,
-        chunk_idx=chunk_idx,
+        schema_version=ANNOTATION_SCHEMA_VERSION,
+        chunk_idx=chunk_data["chunk_idx"],
         n_spectra=n_spectra,
         total_tokens=int(token_labels.size(0)),
         concept_names=list(registry.names),
         token_labels=token_labels,
-        ion_type_ids=torch.cat(ion_type_parts, dim=0),
-        ion_indices=torch.cat(ion_index_parts, dim=0),
-        fragment_charges=torch.cat(fragment_charge_parts, dim=0),
-        neutral_loss_ids=torch.cat(nl_id_parts, dim=0),
-        peak_mzs=torch.cat(mz_parts, dim=0),
-        peak_intensities=torch.cat(intensity_parts, dim=0),
+        ion_type_ids=joined("ion_type"),
+        ion_indices=joined("ion_index"),
+        fragment_charges=joined("fragment_charge"),
+        neutral_loss_ids=joined("neutral_loss_id"),
+        peak_mzs=joined("mz"),
+        peak_intensities=joined("intensity"),
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Streaming aggregation of base rates and concept-concept correlations
-# ─────────────────────────────────────────────────────────────────────────────
 class ConceptStatsAccumulator:
     """Accumulate co-occurrence counts across chunks for the manifest.
 
@@ -910,9 +1007,6 @@ class ConceptStatsAccumulator:
         return phi.to(torch.float32)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main runner
-# ─────────────────────────────────────────────────────────────────────────────
 class AnnotationRunner:
     """Walks the extraction manifest, annotates each chunk, writes labels,
     and emits the annotation_manifest.json with global statistics.
@@ -924,26 +1018,35 @@ class AnnotationRunner:
         self.labels_dir = config.output_dir / "labels"
         self.labels_dir.mkdir(parents=True, exist_ok=True)
         self.manifest_path = config.output_dir / "annotation_manifest.json"
-
-        extract_manifest_path = config.extract_dir / "manifest.json"
-        if not extract_manifest_path.exists():
-            raise FileNotFoundError(f"Extract manifest not found at {extract_manifest_path}")
-        self.extract_manifest = json.loads(extract_manifest_path.read_text())
-
-        if self.extract_manifest["schema_version"] != EXTRACT_SCHEMA_VERSION:
-            raise ValueError(
-                f"Extraction schema mismatch: manifest={self.extract_manifest['schema_version']}, "
-                f"annotator expects {EXTRACT_SCHEMA_VERSION}. Re-run extract.py."
-            )
+        self.extract_manifest = self._load_extract_manifest(config.extract_dir)
 
         LOG.info("Annotation registry: %d concepts across %d families",
                  len(self.registry.names), len(CONCEPT_FAMILIES))
+
+    @staticmethod
+    def _load_extract_manifest(extract_dir: Path) -> dict:
+        """Load the extraction manifest, rejecting an incompatible schema.
+
+        Labels must row-align with the activations they will be joined against,
+        so a manifest from a different extraction layout is fatal rather than a
+        warning.
+        """
+        path = extract_dir / "manifest.json"
+        if not path.exists():
+            raise FileNotFoundError(f"Extract manifest not found at {path}")
+        manifest = json.loads(path.read_text())
+        if manifest["schema_version"] != EXTRACT_SCHEMA_VERSION:
+            raise ValueError(
+                f"Extraction schema mismatch: manifest={manifest['schema_version']}, "
+                f"annotator expects {EXTRACT_SCHEMA_VERSION}. Re-run extract.py."
+            )
+        return manifest
 
     def _chunk_path(self, chunk_idx: int) -> Path:
         return self.labels_dir / f"chunk_{chunk_idx:05d}.pt"
 
     def _load_extract_chunk(self, chunk_idx: int) -> dict:
-        # v4: per-chunk metadata lives in its own meta file; the annotator never
+        # Per-chunk metadata lives in its own meta file; the annotator never
         # touches the activation tensors, so only the ChunkMeta is loaded.
         meta_rel = self.extract_manifest["chunks"][chunk_idx]["meta"]
         path = self.config.extract_dir / meta_rel
@@ -982,10 +1085,9 @@ class AnnotationRunner:
 
     def _write_manifest(self, accumulator: ConceptStatsAccumulator, n_chunks: int) -> None:
         base_rates = accumulator.base_rates().tolist()
-        phi = accumulator.phi_matrix()
 
         manifest = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": ANNOTATION_SCHEMA_VERSION,
             "config": self.config.as_jsonable(),
             "registry": self.registry.to_jsonable(),
             "n_chunks": n_chunks,
@@ -1009,7 +1111,7 @@ class AnnotationRunner:
         phi_path = self.config.output_dir / "concept_phi.pt"
         torch.save({
             "concept_names": self.registry.names,
-            "phi": phi,
+            "phi": accumulator.phi_matrix(),
             "marginal": accumulator.marginal.to(torch.float32),
             "cooccur": accumulator.cooccur.to(torch.float32),
             "n_tokens": int(accumulator.total),
@@ -1017,9 +1119,8 @@ class AnnotationRunner:
         LOG.info("Wrote manifest to %s and phi matrix to %s", self.manifest_path, phi_path)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
+# --- CLI ----------------------------------------------------------------------
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--extract-dir", type=Path, required=True,

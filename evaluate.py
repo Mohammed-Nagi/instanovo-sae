@@ -1,4 +1,4 @@
-"""evaluate.py: v4 SAE evaluation pipeline for InstaNovo interpretability.
+"""evaluate.py: SAE evaluation pipeline for InstaNovo interpretability.
 
 The evaluation is organised around four questions:
   Q1: Is the SAE working?
@@ -18,6 +18,26 @@ The evaluation is organised around four questions:
     P8 Causal ablation: SAE-reconstruction baseline, selectivity vs concept
         prevalence, firing-rate-matched random controls, correlated-concept
         controls, and a permutation-test sanity check.
+
+Phase definitions below are ordered to follow the thesis results chapter:
+
+    Definition order          Phase                     Thesis
+    ----------------------------------------------------------------------
+    1                         P1+2 reconstruction       4.1.1 + 4.2.1
+    2                         P6 threshold sweep        4.1.2 (Figure 4.1)
+    3                         P5 geometry               4.2.2 (Table 4.3)
+    4                         P3 top-activating         4.3
+    5                         P4 associations           4.3   (Tables 4.4-4.5)
+    6                         P7 loss recovered         4.4   (Table 4.6)
+    7                         cross-layer matching      4.5   (Table 4.7)
+    8                         P8 causal ablation        4.6
+
+Phase NUMBERS are unchanged: they are a cross-file contract, appearing as
+report.json keys (parsed by run_pipeline.sh), as the --skip CLI choices, and in
+the Phase 4 resume cache. Evaluator.run executes in a different order from the
+definitions above because Phase 8 and the cross-layer/cross-seed checks all
+consume Phase 4's output, which must therefore be computed (or loaded from
+cache) before them.
 
 Streaming model:
   - ChunkStream.__iter__ loads activations, annotations, metadata, and computes
@@ -76,18 +96,40 @@ from scipy.stats import chi2 as scipy_chi2
 
 # Import sibling modules from the pipeline.
 sys.path.insert(0, str(Path(__file__).parent))
-from train import (
-    SCHEMA_VERSION,           # SAE checkpoint schema (also tags this eval's report)
-    EXTRACT_SCHEMA_VERSION,   # extract.py manifest/layout
-    SparseAutoencoder,
-    load_sae_from_checkpoint,
+from schema import (
+    ANNOTATION_SCHEMA_VERSION,  # annotate.py label chunks
+    EVAL_SCHEMA_VERSION,        # this module's report.json + CSVs
+    EXTRACT_SCHEMA_VERSION,     # extract.py manifest/layout
 )
-
-# annotate.py SCHEMA_VERSION, defined locally so evaluate.py has no
-# spectrum_utils dependency. Bump in lockstep if the annotation schema changes.
-ANNOTATION_SCHEMA_VERSION = 4
+from train import SparseAutoencoder, load_sae_from_checkpoint
 
 LOG = logging.getLogger("evaluate")
+
+# Default JumpReLU threshold multipliers for the Phase 6 sweep.
+THRESHOLD_MULTIPLIERS = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
+
+# Cosine similarity above which two decoder directions count as near-duplicates.
+NEAR_DUPLICATE_COSINE = 0.95
+# Cap on the pairwise decoder-similarity sample; the full matrix is d_dict^2.
+NEAR_DUPLICATE_SAMPLE = 2000
+
+# |phi| above which a concept is treated as correlated with the target concept
+# and excluded from the orthogonalised selectivity contrast (thesis 3.5.4).
+CORRELATED_CONCEPT_PHI = 0.3
+# Firing-rate matching window for random ablation controls, in log10 decades.
+FIRING_RATE_MATCH_DEX = 0.3
+# Minimum spectra needed for a tercile selectivity contrast to be meaningful.
+MIN_SPECTRA_FOR_SELECTIVITY = 6
+# Rows kept in the per-concept and per-family Phase 4 rankings.
+TOP_FEATURES_PER_CONCEPT = 20
+# Anchor features carried into cross-layer matching (thesis 4.5).
+CROSS_LAYER_ANCHORS = 100
+# Top-N features per concept compared across seeds for the Jaccard overlap.
+CROSS_SEED_TOP_N = 10
+# Tokens sampled when estimating the layer mean for the Phase 7 mean-ablation.
+LAYER_MEAN_MAX_TOKENS = 200_000
+# Progress is logged every this many chunks during the long streaming phases.
+CHUNK_LOG_INTERVAL = 50
 
 
 def _preserve_hook_output(original_output, patched_first: torch.Tensor):
@@ -97,9 +139,8 @@ def _preserve_hook_output(original_output, patched_first: torch.Tensor):
     return patched_first
 
 
-# -----------------------------------------------------------------------------
-# Configuration
-# -----------------------------------------------------------------------------
+# --- Configuration ------------------------------------------------------------
+
 @dataclasses.dataclass
 class EvaluationConfig:
     """All knobs for one evaluation run."""
@@ -120,7 +161,11 @@ class EvaluationConfig:
     # spectra, read shuffle=False, so per-spectrum CE from the model aligns with
     # the per-spectrum concept prevalence from the chunks by global order.
     spectra_path: Path | None = None
-    n_peaks: int = 200                        # must match extraction's make_dataloader
+    # Peaks per spectrum for the Phase 7/8 loader. None (the default) means read
+    # it from the extract manifest, which is what keeps the re-run loader
+    # producing the same spectra extraction saw. Set it only to override a
+    # manifest that predates the field.
+    n_peaks: int | None = None
 
     # Optional: paths to other-layer SAE checkpoints for cross-layer matching.
     other_layer_checkpoints: dict[int, Path] = dataclasses.field(default_factory=dict)
@@ -186,9 +231,8 @@ class EvaluationConfig:
         return out
 
 
-# -----------------------------------------------------------------------------
-# Statistical primitives
-# -----------------------------------------------------------------------------
+# --- Statistical primitives ---------------------------------------------------
+
 def benjamini_hochberg(p_values: torch.Tensor, q: float = 0.05) -> torch.Tensor:
     """BH-FDR control. Returns a boolean tensor (same shape) of rejected nulls.
 
@@ -283,9 +327,38 @@ def chi2_pvalues_from_stat(chi2_stat: torch.Tensor) -> torch.Tensor:
     return torch.from_numpy(p.astype(np.float32))
 
 
-# -----------------------------------------------------------------------------
-# Streaming data over chunks
-# -----------------------------------------------------------------------------
+def _centred_ss_total(sq_total: float, colsum: torch.Tensor | None, n_tokens: int) -> float:
+    """Centred total sum of squares: sum x^2 - sum_d (sum_t x_d)^2 / n.
+
+    Shared by Phase 1+2 and Phase 6 so both report FVE on the same (centred)
+    convention -- improvement over predicting the per-dimension mean, rather
+    than over predicting zero.
+    """
+    mean_energy = (
+        float((colsum ** 2).sum().item()) / max(n_tokens, 1)
+        if colsum is not None else 0.0
+    )
+    return max(sq_total - mean_energy, 1e-12)
+
+
+def _gini(rates: torch.Tensor) -> float:
+    """Gini coefficient of a non-negative distribution.
+
+    0 means every feature fires equally often; values approaching 1 mean a few
+    features account for nearly all activations. Standard sorted-ascending
+    estimator: G = (2 sum i*x_i - (n+1) sum x_i) / (n sum x_i).
+    """
+    rates_sorted, _ = torch.sort(rates)
+    n_f = rates_sorted.numel()
+    total = rates_sorted.sum()
+    if float(total) <= 0:
+        return 0.0
+    idx = torch.arange(1, n_f + 1, dtype=torch.float64)
+    return float((2.0 * (idx * rates_sorted).sum() - (n_f + 1) * total) / (n_f * total))
+
+
+# --- Streaming data over chunks -----------------------------------------------
+
 @dataclasses.dataclass
 class JoinedChunk:
     """One chunk's worth of (activations, labels, metadata) joined by row."""
@@ -318,7 +391,7 @@ class JoinedChunk:
 
 
 class ChunkStream:
-    """Iterates v4 extract chunks (per-layer activation file + ChunkMeta) paired
+    """Iterates extract chunks (per-layer activation file + ChunkMeta) paired
     with the matching annotation label chunk, joined row-for-row.
 
     The full iterator loads metadata, activations, and annotation labels, then
@@ -348,7 +421,26 @@ class ChunkStream:
 
         extract_manifest = json.loads((extract_dir / "manifest.json").read_text())
         annotation_manifest = json.loads((annotation_dir / "annotation_manifest.json").read_text())
+        self._check_manifests(extract_manifest, annotation_manifest)
 
+        self.meta_paths, self.acts_paths = self._resolve_layer_paths(
+            extract_dir, extract_manifest, target_layer,
+        )
+        self.annotation_paths = [annotation_dir / c["path"] for c in annotation_manifest["chunks"]]
+        self.n_chunks = extract_manifest["n_chunks"]
+        self.concept_names: list[str] = annotation_manifest["registry"]["names"]
+        self.diagnostic_concepts: set[str] = set(annotation_manifest["registry"]["diagnostic"])
+        self.family_of: dict[str, str] = annotation_manifest["registry"]["family_of"]
+        self.base_rates: dict[str, float] = annotation_manifest["base_rates"]
+
+    @staticmethod
+    def _check_manifests(extract_manifest: dict, annotation_manifest: dict) -> None:
+        """Reject manifests that cannot be row-joined.
+
+        Every phase depends on activations, labels, and metadata sharing a token
+        ordering, so a schema or chunk-count disagreement is fatal rather than a
+        warning: the join would otherwise pair each token with another's labels.
+        """
         if extract_manifest["schema_version"] != EXTRACT_SCHEMA_VERSION:
             raise ValueError(
                 f"Extract schema {extract_manifest['schema_version']} != {EXTRACT_SCHEMA_VERSION}"
@@ -363,25 +455,27 @@ class ChunkStream:
                 f"annotation={annotation_manifest['n_chunks']}"
             )
 
-        # v4: each chunk stores metadata (ChunkMeta) and one activation file per
-        # extracted layer separately; the annotator writes one label file per chunk.
+    @staticmethod
+    def _resolve_layer_paths(
+        extract_dir: Path, extract_manifest: dict, target_layer: int
+    ) -> tuple[list[Path], list[Path]]:
+        """Meta and activation file paths for the target layer, one per chunk.
+
+        Each chunk stores metadata (ChunkMeta) and one activation file per
+        extracted layer separately, so only the target layer's bytes are read.
+        """
         layer_key = str(target_layer)
-        self.meta_paths: list[Path] = []
-        self.acts_paths: list[Path] = []
+        meta_paths: list[Path] = []
+        acts_paths: list[Path] = []
         for c in extract_manifest["chunks"]:
             if layer_key not in c["activations"]:
                 raise KeyError(
                     f"Layer {target_layer} not extracted for chunk {c['idx']}; "
                     f"available: {sorted(int(k) for k in c['activations'])}"
                 )
-            self.meta_paths.append(extract_dir / c["meta"])
-            self.acts_paths.append(extract_dir / c["activations"][layer_key])
-        self.annotation_paths = [annotation_dir / c["path"] for c in annotation_manifest["chunks"]]
-        self.n_chunks = extract_manifest["n_chunks"]
-        self.concept_names: list[str] = annotation_manifest["registry"]["names"]
-        self.diagnostic_concepts: set[str] = set(annotation_manifest["registry"]["diagnostic"])
-        self.family_of: dict[str, str] = annotation_manifest["registry"]["family_of"]
-        self.base_rates: dict[str, float] = annotation_manifest["base_rates"]
+            meta_paths.append(extract_dir / c["meta"])
+            acts_paths.append(extract_dir / c["activations"][layer_key])
+        return meta_paths, acts_paths
 
     def _encode_chunk(self, activations: torch.Tensor) -> torch.Tensor:
         """Stream the SAE forward pass over activations, batched to fit memory."""
@@ -459,7 +553,6 @@ class ChunkStream:
             yield meta, annotation
 
 
-# Top-K accumulator
 class TopKAccumulator:
     """Tracks the top-K activation values per feature across all chunks,
     along with provenance (chunk idx, token-in-chunk idx, value).
@@ -500,28 +593,75 @@ class TopKAccumulator:
         self.token_ids = torch.gather(merged_token_ids, 1, new_idx)
 
 
-# -----------------------------------------------------------------------------
-# Phase 1 + 2: Reconstruction + sparsity (combined for one-pass efficiency)
-# -----------------------------------------------------------------------------
+def _log_chunk_progress(label: str, chunk_i: int, n_chunks: int) -> None:
+    """Log streaming progress at a fixed interval and on the final chunk."""
+    if chunk_i == n_chunks or chunk_i % CHUNK_LOG_INTERVAL == 0:
+        LOG.info("%s: processed %d/%d chunks", label, chunk_i, n_chunks)
+
+
+# =============================================================================
+# Thesis 4.1.1 + 4.2.1 -- Phase 1+2: reconstruction and sparsity
+# Combined into one activation-only pass: both metrics need the same forward
+# encode over every token, and the dataset is ~67.5M tokens per layer.
+# =============================================================================
+
+class _ReconSparsityAccumulator:
+    """Streaming accumulators for reconstruction quality and sparsity."""
+
+    def __init__(self, d_dict: int):
+        self.sq_resid = 0.0
+        self.sq_total = 0.0   # uncentred second moment: sum_{t,d} x^2
+        self.sum_l0 = 0.0
+        self.n_tokens = 0
+        self.colsum = None    # sum_t x (per d_model dim), float64 -- for centred FVE
+        self.firing_count = torch.zeros(d_dict, dtype=torch.long)
+
+    def add_batch(self, x: torch.Tensor, x_hat: torch.Tensor, features: torch.Tensor) -> None:
+        resid = x - x_hat
+        self.sq_resid += float((resid ** 2).sum().item())
+        self.sq_total += float((x ** 2).sum().item())
+        xs = x.sum(dim=0).to(torch.float64).cpu()
+        self.colsum = xs if self.colsum is None else self.colsum + xs
+
+        fired = features > 0
+        self.sum_l0 += float(fired.float().sum().item())
+        self.firing_count += fired.sum(dim=0).long().cpu()
+        self.n_tokens += x.size(0)
+
+    def metrics(self, sae: SparseAutoencoder) -> dict:
+        """Finalise into the phase_1_2 report block.
+
+        `fve_overall` is the centred fraction of variance explained: improvement
+        over predicting the per-dimension mean. `fve_uncentered` is retained for
+        continuity with older runs. `mse_total` is conventional elementwise MSE
+        over tokens and hidden dimensions; `sse_per_token` preserves the older
+        per-token summed-squared-error scale.
+        """
+        ss_tot_centered = _centred_ss_total(self.sq_total, self.colsum, self.n_tokens)
+        near_dead_cut = max(1, self.n_tokens // 100_000)
+        rates = self.firing_count.to(torch.float64) / max(self.n_tokens, 1)
+
+        return {
+            "fve_overall": 1.0 - self.sq_resid / ss_tot_centered,
+            "fve_uncentered": 1.0 - self.sq_resid / max(self.sq_total, 1e-12),
+            "mse_total": self.sq_resid / max(self.n_tokens * sae.d_model, 1),
+            "sse_per_token": self.sq_resid / max(self.n_tokens, 1),
+            "l0_mean": self.sum_l0 / max(self.n_tokens, 1),
+            "strict_dead_pct": 100.0 * int((self.firing_count == 0).sum().item()) / sae.d_dict,
+            "near_dead_pct": 100.0 * int((self.firing_count < near_dead_cut).sum().item()) / sae.d_dict,
+            "firing_rate_gini": _gini(rates),
+            "n_tokens": self.n_tokens,
+            "firing_count": self.firing_count.tolist(),
+        }
+
+
 def phase_1_2_reconstruction_and_sparsity(
     stream: ChunkStream,
     sae: SparseAutoencoder,
     device: str,
 ) -> dict:
-    """Compute reconstruction quality and sparsity in one activation-only pass.
-
-    `fve_overall` is centred fraction of variance explained: improvement over
-    predicting the per-dimension mean. `fve_uncentered` is reported for continuity
-    with older runs. `mse_total` is conventional elementwise MSE over tokens and
-    hidden dimensions; `sse_per_token` preserves the older per-token summed squared
-    error scale.
-    """
-    sq_resid = 0.0
-    sq_total = 0.0          # uncentred second moment: sum_{t,d} x^2
-    sum_l0 = 0.0
-    n_tokens = 0
-    colsum = None           # sum_t x  (per d_model dim), float64 -- for the centred FVE
-    firing_count = torch.zeros(sae.d_dict, dtype=torch.long)
+    """Compute reconstruction quality and sparsity in one activation-only pass."""
+    acc = _ReconSparsityAccumulator(sae.d_dict)
 
     for chunk_i, activations in enumerate(stream.iter_activations(), start=1):
         # Process raw activations directly. This avoids loading annotations and
@@ -533,61 +673,178 @@ def phase_1_2_reconstruction_and_sparsity(
                 out = sae.forward_inference(x)
                 features = out["features"]
                 x_hat = out["x_hat"]
-                resid = x - x_hat
 
-            sq_resid += float((resid ** 2).sum().item())
-            sq_total += float((x ** 2).sum().item())
-            xs = x.sum(dim=0).to(torch.float64).cpu()
-            colsum = xs if colsum is None else colsum + xs
+            acc.add_batch(x, x_hat, features)
+            del x, out, features, x_hat
 
-            fired = features > 0
-            sum_l0 += float(fired.float().sum().item())
-            firing_count += fired.sum(dim=0).long().cpu()
-            n_tokens += x.size(0)
-            del x, out, features, x_hat, resid, fired
+        _log_chunk_progress("Phase 1+2", chunk_i, stream.n_chunks)
 
-        if chunk_i == stream.n_chunks or chunk_i % 50 == 0:
-            LOG.info("Phase 1+2: processed %d/%d chunks", chunk_i, stream.n_chunks)
+    return acc.metrics(sae)
 
-    # Centred total sum of squares: SS_tot = sum x^2 - sum_d (sum_t x_d)^2 / n.
-    mean_energy = float((colsum ** 2).sum().item()) / max(n_tokens, 1) if colsum is not None else 0.0
-    ss_tot_centered = max(sq_total - mean_energy, 1e-12)
-    fve_centered = 1.0 - sq_resid / ss_tot_centered
-    fve_uncentered = 1.0 - sq_resid / max(sq_total, 1e-12)
 
-    l0_mean = sum_l0 / max(n_tokens, 1)
-    strict_dead = int((firing_count == 0).sum().item())
-    near_dead = int((firing_count < max(1, n_tokens // 100_000)).sum().item())
+# =============================================================================
+# Thesis 4.1.2 (Figure 4.1) -- Phase 6: JumpReLU threshold sweep
+# =============================================================================
 
-    # Gini of the per-feature firing rates (0 = all fire equally, ->1 = a few
-    # features fire for everything). Standard sorted-ascending estimator:
-    # G = (2 sum i*x_i - (n+1) sum x_i) / (n sum x_i).
-    rates_sorted, _ = torch.sort(firing_count.to(torch.float64) / max(n_tokens, 1))
-    n_f = rates_sorted.numel()
-    total = rates_sorted.sum()
-    if float(total) > 0:
-        idx = torch.arange(1, n_f + 1, dtype=torch.float64)
-        gini = float((2.0 * (idx * rates_sorted).sum() - (n_f + 1) * total) / (n_f * total))
-    else:
-        gini = 0.0
+class _ThresholdSweepAccumulator:
+    """Per-multiplier residual and firing accumulators for the threshold sweep.
+
+    The activations x are identical across multipliers, so the total sum of
+    squares is shared and only the residual changes per threshold.
+    """
+
+    def __init__(self, n_mult: int, d_dict: int):
+        self.sq_resid = torch.zeros(n_mult, dtype=torch.float64)
+        self.sum_l0 = torch.zeros(n_mult, dtype=torch.float64)
+        self.firing = torch.zeros((n_mult, d_dict), dtype=torch.long)
+        self.sq_total = 0.0
+        self.n_tokens = 0
+        self.colsum = None
+
+    def add_shared(self, x: torch.Tensor) -> None:
+        """Accumulate the multiplier-independent totals for one batch."""
+        self.sq_total += float((x ** 2).sum().item())
+        xs = x.sum(dim=0).to(torch.float64).cpu()
+        self.colsum = xs if self.colsum is None else self.colsum + xs
+        self.n_tokens += x.size(0)
+
+    def add_threshold(self, i: int, x: torch.Tensor, x_hat: torch.Tensor,
+                      features: torch.Tensor) -> None:
+        self.sq_resid[i] += float(((x - x_hat) ** 2).sum().item())
+        fired = features > 0
+        self.sum_l0[i] += float(fired.float().sum().item())
+        self.firing[i] += fired.sum(dim=0).long().cpu()
+
+    def results(self, multipliers: tuple[float, ...], d_dict: int) -> list[dict]:
+        """Centred FVE per multiplier, consistent with Phase 1+2."""
+        ss_tot_centered = _centred_ss_total(self.sq_total, self.colsum, self.n_tokens)
+        return [
+            {
+                "multiplier": mult,
+                "fve": 1.0 - float(self.sq_resid[i].item()) / ss_tot_centered,
+                "l0_mean": float(self.sum_l0[i].item()) / max(self.n_tokens, 1),
+                "dead_pct": 100.0 * int((self.firing[i] == 0).sum().item()) / d_dict,
+            }
+            for i, mult in enumerate(multipliers)
+        ]
+
+
+def phase_6_threshold_sweep(
+    stream: ChunkStream,
+    sae: SparseAutoencoder,
+    multipliers: tuple[float, ...] = THRESHOLD_MULTIPLIERS,
+) -> dict:
+    """Sweep JumpReLU threshold multipliers and report FVE/L0/dead.
+
+    Each activation batch is encoded to preactivations once, then all threshold
+    multipliers are applied to that shared tensor. This preserves the same metrics
+    as separate passes while avoiding repeated disk scans.
+    """
+    original_threshold = sae.jumprelu_threshold.detach().clone()
+    thresholds = [original_threshold * mult for mult in multipliers]
+    acc = _ThresholdSweepAccumulator(len(multipliers), sae.d_dict)
+
+    for chunk_i, activations in enumerate(stream.iter_activations(), start=1):
+        for start in range(0, activations.size(0), stream.batch_size):
+            end = min(start + stream.batch_size, activations.size(0))
+            x = activations[start:end].to(stream.device, dtype=stream.dtype, non_blocking=True)
+
+            # Compute preactivations once and reuse them for every threshold.
+            with torch.no_grad():
+                h = sae.preactivations(x)
+                acc.add_shared(x)
+
+                for i, threshold in enumerate(thresholds):
+                    features = h * (h > threshold).to(h.dtype)
+                    x_hat = sae.decode(features)
+                    acc.add_threshold(i, x, x_hat, features)
+                    del features, x_hat
+
+            del x, h
+
+        _log_chunk_progress("Phase 6 threshold sweep", chunk_i, stream.n_chunks)
+
+    results = acc.results(multipliers, sae.d_dict)
+
+    sae.jumprelu_threshold.copy_(original_threshold)  # restore defensively
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"sweep": results}
+
+
+# =============================================================================
+# Thesis 4.2.2 (Table 4.3) -- Phase 5: dictionary geometry
+# =============================================================================
+
+def _encoder_decoder_alignment(W_enc: torch.Tensor, W_dec: torch.Tensor) -> float:
+    """Mean |cos| between each feature's encoder and decoder direction.
+
+    Near 1 would mean the encoder is essentially the decoder transpose, leaving
+    no room for a learned sparse projection; near 0 would mean detection and
+    reconstruction directions are geometrically unrelated.
+    """
+    enc_t = W_enc.t()  # [d_dict, d_model]
+    enc_norm = enc_t.norm(dim=1).clamp_min(1e-12)
+    dec_norm = W_dec.norm(dim=1).clamp_min(1e-12)
+    cos = (enc_t * W_dec).sum(dim=1) / (enc_norm * dec_norm)
+    return float(cos.abs().mean().item())
+
+
+def _near_duplicate_pairs(W_dec: torch.Tensor, d_dict: int) -> tuple[int, int]:
+    """Count near-duplicate decoder directions within a random subsample.
+
+    The full pairwise matrix is d_dict^2, so this is estimated on a subsample and
+    returned as a count WITHIN the sample -- a lower bound on the global count,
+    not an estimate of it.
+    """
+    n_sample = min(NEAR_DUPLICATE_SAMPLE, d_dict)
+    sample_idx = torch.randperm(d_dict)[:n_sample]
+    sample = W_dec[sample_idx]
+    sample = sample / sample.norm(dim=1, keepdim=True).clamp_min(1e-12)
+    sim = sample @ sample.t()
+    sim.fill_diagonal_(0.0)
+    return int((sim > NEAR_DUPLICATE_COSINE).sum().item() // 2), n_sample  # undirected pairs
+
+
+def _effective_rank(W_dec: torch.Tensor) -> float:
+    """Entropy-perplexity of the decoder singular-value spectrum.
+
+    Equals the full rank when all singular values are equal and collapses toward
+    one when a single direction dominates, so it measures how many independent
+    directions the dictionary actually uses.
+    """
+    try:
+        sv = torch.linalg.svdvals(W_dec.to(torch.float32))
+        normalized = sv / sv.sum().clamp_min(1e-12)
+        entropy = -(normalized * (normalized + 1e-12).log()).sum()
+        return float(entropy.exp().item())
+    except Exception:
+        return float("nan")
+
+
+def phase_5_geometric(sae: SparseAutoencoder) -> dict:
+    """Encoder/decoder alignment and near-duplicate feature analysis."""
+    with torch.no_grad():
+        W_enc = sae.W_enc.detach().cpu()  # [d_model, d_dict]
+        W_dec = sae.W_dec.detach().cpu()  # [d_dict, d_model]
+
+        alignment = _encoder_decoder_alignment(W_enc, W_dec)
+        near_dup_pairs, n_sample = _near_duplicate_pairs(W_dec, sae.d_dict)
+        effective_rank = _effective_rank(W_dec)
 
     return {
-        "fve_overall": fve_centered,
-        "fve_uncentered": fve_uncentered,
-        "mse_total": sq_resid / max(n_tokens * sae.d_model, 1),
-        "sse_per_token": sq_resid / max(n_tokens, 1),
-        "l0_mean": l0_mean,
-        "strict_dead_pct": 100.0 * strict_dead / sae.d_dict,
-        "near_dead_pct": 100.0 * near_dead / sae.d_dict,
-        "firing_rate_gini": gini,
-        "n_tokens": n_tokens,
-        "firing_count": firing_count.tolist(),
+        "encoder_decoder_alignment": alignment,
+        "near_duplicate_pairs_in_sample": near_dup_pairs,
+        "near_duplicate_sample_size": n_sample,
+        "near_duplicate_cosine_threshold": NEAR_DUPLICATE_COSINE,
+        "effective_rank": effective_rank,
     }
 
 
-# -----------------------------------------------------------------------------
-# Phase 3: Top-K activating tokens
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Thesis 4.3 -- Phase 3: top-K activating tokens per feature
+# =============================================================================
+
 def phase_3_top_activating(
     stream: ChunkStream,
     sae: SparseAutoencoder,
@@ -616,9 +873,106 @@ def phase_3_top_activating(
     }
 
 
-# -----------------------------------------------------------------------------
-# Phase 4: Feature-concept associations
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Thesis 4.3 (Tables 4.4-4.5) -- Phase 4: feature-concept associations
+# =============================================================================
+
+def _accumulate_contingency(
+    stream: ChunkStream, n_features: int, n_concepts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Stream the feature x concept co-occurrence table over every chunk.
+
+    Accumulators are float64: summing indicator products over ~67.5M tokens
+    would lose precision in float32.
+    """
+    n11 = torch.zeros((n_features, n_concepts), dtype=torch.float64)
+    marginal_f = torch.zeros(n_features, dtype=torch.float64)
+    marginal_c = torch.zeros(n_concepts, dtype=torch.float64)
+    n_total = 0
+
+    for chunk in stream:
+        feat_bool = (chunk.features > 0).to(torch.float64)
+        labels_f = chunk.labels.to(torch.float64)
+
+        n11 += feat_bool.t() @ labels_f
+        marginal_f += feat_bool.sum(dim=0)
+        marginal_c += labels_f.sum(dim=0)
+        n_total += feat_bool.size(0)
+
+    return n11, marginal_f, marginal_c, n_total
+
+
+def _per_concept_top_features(
+    stats: dict[str, torch.Tensor],
+    rejected: torch.Tensor,
+    p_values: torch.Tensor,
+    score: torch.Tensor,
+    concept_names: list[str],
+) -> dict[str, list[dict]]:
+    """Best BH-significant features for each concept, ranked by the composite
+    score (F1-dom weighted by log-lift), as in thesis Table 4.5."""
+    per_concept_top: dict[str, list[dict]] = {}
+    for ci, cname in enumerate(concept_names):
+        rejected_mask = rejected[:, ci]
+        if not rejected_mask.any():
+            per_concept_top[cname] = []
+            continue
+        scores_c = score[:, ci].clone()
+        scores_c[~rejected_mask] = -float("inf")
+        top_vals, top_idx = torch.topk(
+            scores_c, k=min(TOP_FEATURES_PER_CONCEPT, int(rejected_mask.sum())),
+        )
+        per_concept_top[cname] = [
+            {
+                "feature_idx": int(top_idx[i]),
+                "f1_dom": float(stats["f1_dom"][top_idx[i], ci]),
+                "lift": float(stats["lift"][top_idx[i], ci]),
+                "n_co": int(stats["n11"][top_idx[i], ci]),
+                "score": float(top_vals[i]),
+                "p_value": float(p_values[top_idx[i], ci]),
+            }
+            for i in range(top_vals.numel()) if top_vals[i] > -float("inf")
+        ]
+    return per_concept_top
+
+
+def _per_family_top_features(
+    stats: dict[str, torch.Tensor],
+    rejected: torch.Tensor,
+    concept_names: list[str],
+    family_of: dict[str, str],
+) -> dict[str, list[dict]]:
+    """For each concept family, the features scoring highest against ANY concept
+    in that family, with the concept that produced the score."""
+    family_to_concept_indices: dict[str, list[int]] = defaultdict(list)
+    for ci, cname in enumerate(concept_names):
+        family_to_concept_indices[family_of[cname]].append(ci)
+
+    per_family_top: dict[str, list[dict]] = {}
+    for family, concept_indices in family_to_concept_indices.items():
+        family_score = stats["f1_dom"][:, concept_indices].max(dim=1)
+        family_best_concept = torch.tensor(concept_indices)[family_score.indices]
+        family_mask = rejected[:, concept_indices].any(dim=1)
+        if not family_mask.any():
+            per_family_top[family] = []
+            continue
+        family_scores_masked = family_score.values.clone()
+        family_scores_masked[~family_mask] = -float("inf")
+        top_vals, top_idx = torch.topk(
+            family_scores_masked, k=min(TOP_FEATURES_PER_CONCEPT, int(family_mask.sum())),
+        )
+        per_family_top[family] = [
+            {
+                "feature_idx": int(top_idx[i]),
+                "best_concept_idx": int(family_best_concept[top_idx[i]]),
+                "best_concept_name": concept_names[int(family_best_concept[top_idx[i]])],
+                "f1_dom": float(top_vals[i]),
+            }
+            for i in range(top_vals.numel()) if top_vals[i] > -float("inf")
+        ]
+    return per_family_top
+
+
 def phase_4_feature_concept_associations(
     stream: ChunkStream,
     sae: SparseAutoencoder,
@@ -634,92 +988,140 @@ def phase_4_feature_concept_associations(
     n_features = sae.d_dict
     n_concepts = len(stream.concept_names)
 
-    # Accumulators in float64 to avoid precision loss when summing many tokens.
-    n11 = torch.zeros((n_features, n_concepts), dtype=torch.float64)
-    marginal_f = torch.zeros(n_features, dtype=torch.float64)
-    marginal_c = torch.zeros(n_concepts, dtype=torch.float64)
-    n_total = 0
-
-    for chunk in stream:
-        feat_bool = (chunk.features > 0).to(torch.float64)
-        labels_f = chunk.labels.to(torch.float64)
-
-        n11 += feat_bool.t() @ labels_f
-        marginal_f += feat_bool.sum(dim=0)
-        marginal_c += labels_f.sum(dim=0)
-        n_total += feat_bool.size(0)
+    n11, marginal_f, marginal_c, n_total = _accumulate_contingency(
+        stream, n_features, n_concepts,
+    )
 
     stats = compute_contingency_stats(n11, marginal_f, marginal_c, n_total)
     p_values = chi2_pvalues_from_stat(stats["chi2_stat"])
     rejected = benjamini_hochberg(p_values, q=fdr_q)
 
-    # Per-concept best features (top by lift-weighted F1-dom).
+    # Composite ranking score: F1-dom up-weighted by enrichment over base rate.
     score = stats["f1_dom"] * torch.log1p(stats["lift"])
-    per_concept_top: dict[str, list[dict]] = {}
-    for ci, cname in enumerate(stream.concept_names):
-        rejected_mask = rejected[:, ci]
-        if not rejected_mask.any():
-            per_concept_top[cname] = []
-            continue
-        scores_c = score[:, ci].clone()
-        scores_c[~rejected_mask] = -float("inf")
-        top_vals, top_idx = torch.topk(scores_c, k=min(20, int(rejected_mask.sum())))
-        per_concept_top[cname] = [
-            {
-                "feature_idx": int(top_idx[i]),
-                "f1_dom": float(stats["f1_dom"][top_idx[i], ci]),
-                "lift": float(stats["lift"][top_idx[i], ci]),
-                "n_co": int(stats["n11"][top_idx[i], ci]),
-                "score": float(top_vals[i]),
-                "p_value": float(p_values[top_idx[i], ci]),
-            }
-            for i in range(top_vals.numel()) if top_vals[i] > -float("inf")
-        ]
-
-    # Per-family best features: for each family, find the feature with the
-    # highest f1_dom against any concept in the family.
-    family_to_concept_indices: dict[str, list[int]] = defaultdict(list)
-    for ci, cname in enumerate(stream.concept_names):
-        family_to_concept_indices[stream.family_of[cname]].append(ci)
-
-    per_family_top: dict[str, list[dict]] = {}
-    for family, concept_indices in family_to_concept_indices.items():
-        family_score = stats["f1_dom"][:, concept_indices].max(dim=1)
-        family_best_concept = torch.tensor(concept_indices)[family_score.indices]
-        family_mask = rejected[:, concept_indices].any(dim=1)
-        if not family_mask.any():
-            per_family_top[family] = []
-            continue
-        family_scores_masked = family_score.values.clone()
-        family_scores_masked[~family_mask] = -float("inf")
-        top_vals, top_idx = torch.topk(family_scores_masked, k=min(20, int(family_mask.sum())))
-        per_family_top[family] = [
-            {
-                "feature_idx": int(top_idx[i]),
-                "best_concept_idx": int(family_best_concept[top_idx[i]]),
-                "best_concept_name": stream.concept_names[int(family_best_concept[top_idx[i]])],
-                "f1_dom": float(top_vals[i]),
-            }
-            for i in range(top_vals.numel()) if top_vals[i] > -float("inf")
-        ]
-
-    n_significant_pairs = int(rejected.sum().item())
-    features_with_concept = int(rejected.any(dim=1).sum().item())
 
     return {
         "stats": stats,
         "p_values": p_values,
         "rejected": rejected,
-        "n_significant_pairs": n_significant_pairs,
-        "n_features_with_concept": features_with_concept,
-        "per_concept_top": per_concept_top,
-        "per_family_top": per_family_top,
+        "n_significant_pairs": int(rejected.sum().item()),
+        "n_features_with_concept": int(rejected.any(dim=1).sum().item()),
+        "per_concept_top": _per_concept_top_features(
+            stats, rejected, p_values, score, stream.concept_names,
+        ),
+        "per_family_top": _per_family_top_features(
+            stats, rejected, stream.concept_names, stream.family_of,
+        ),
         "n_total_tokens": n_total,
         "concept_names": stream.concept_names,
         "marginal_f": marginal_f,
         "marginal_c": marginal_c,
         "n11": n11,
     }
+
+
+def _read_cached_token_total(report_path: Path) -> tuple[dict, int]:
+    """Load a cached report and its Phase 1+2 token count.
+
+    The token total is what converts the cached per-feature firing RATES back
+    into the marginal COUNTS the contingency maths needs, so a report without it
+    cannot support a resume.
+
+    The report's schema version is checked first: the resume path reads this
+    report together with the CSVs written beside it, so a report from an
+    incompatible layout would be half-parsed into a silently wrong Phase 4 rather
+    than failing.
+    """
+    cached_report = json.loads(report_path.read_text())
+
+    cached_version = cached_report.get("schema_version")
+    if cached_version != EVAL_SCHEMA_VERSION:
+        raise ValueError(
+            f"{report_path} has evaluation schema {cached_version!r}, but this "
+            f"loader expects {EVAL_SCHEMA_VERSION}. Re-run evaluate.py for this "
+            "layer/seed instead of resuming from the cache."
+        )
+
+    phase_1_2 = cached_report.get("phase_1_2", {})
+    n_total = int(phase_1_2.get("n_tokens", 0) or 0)
+    if n_total <= 0:
+        raise ValueError(
+            f"{report_path} does not contain phase_1_2.n_tokens; cannot resume "
+            "Phase 4-dependent phases from cache."
+        )
+    return cached_report, n_total
+
+
+def _read_association_csv(
+    assoc_path: Path, n_features: int, concept_to_idx: dict[str, int],
+) -> dict[str, torch.Tensor]:
+    """Rebuild the Phase 4 stat matrices from the significant-pair CSV.
+
+    Only BH-significant pairs were written, so non-significant entries stay at
+    neutral defaults (p=1, not rejected). Downstream consumers select exclusively
+    from the rejected mask, so those defaults are never read as real metrics.
+    """
+    n_concepts = len(concept_to_idx)
+    out = {
+        "n11": torch.zeros((n_features, n_concepts), dtype=torch.float64),
+        "f1": torch.zeros((n_features, n_concepts), dtype=torch.float32),
+        "f1_dom": torch.zeros((n_features, n_concepts), dtype=torch.float32),
+        "lift": torch.zeros((n_features, n_concepts), dtype=torch.float32),
+        "chi2_stat": torch.zeros((n_features, n_concepts), dtype=torch.float32),
+        "p_values": torch.ones((n_features, n_concepts), dtype=torch.float32),
+        "rejected": torch.zeros((n_features, n_concepts), dtype=torch.bool),
+    }
+
+    with open(assoc_path, newline="") as fp:
+        for row in csv.DictReader(fp):
+            fi = int(row["feature_idx"])
+            concept = row["concept"]
+            if not (0 <= fi < n_features) or concept not in concept_to_idx:
+                raise ValueError(
+                    f"Phase 4 cache row references unknown feature/concept: "
+                    f"feature={fi}, concept={concept!r}"
+                )
+            ci = concept_to_idx[concept]
+            out["f1"][fi, ci] = float(row["f1"])
+            out["f1_dom"][fi, ci] = float(row["f1_dom"])
+            out["lift"][fi, ci] = float(row["lift"])
+            out["n11"][fi, ci] = float(row["n_co"])
+            out["chi2_stat"][fi, ci] = float(row["chi2"])
+            out["p_values"][fi, ci] = float(row["p_value"])
+            out["rejected"][fi, ci] = row.get("p_value_bh_significant", "True").lower() == "true"
+
+    return out
+
+
+def _read_feature_marginals(
+    per_feature_path: Path, n_features: int, n_total: int,
+) -> torch.Tensor:
+    """Recover per-feature marginal counts from the cached firing rates."""
+    marginal_f = torch.zeros(n_features, dtype=torch.float64)
+    with open(per_feature_path, newline="") as fp:
+        for row in csv.DictReader(fp):
+            fi = int(row["feature_idx"])
+            if not (0 <= fi < n_features):
+                raise ValueError(f"Phase 4 cache row references unknown feature: {fi}")
+            marginal_f[fi] = float(row["firing_rate"]) * n_total
+    return marginal_f
+
+
+def _resolve_concept_marginals(
+    stream: ChunkStream, concept_names: list[str], n_total: int,
+) -> torch.Tensor:
+    """Concept marginal counts, preferring the annotation phi blob's exact counts
+    over the manifest's rounded base rates."""
+    phi_path = stream.annotation_dir / "concept_phi.pt"
+    if phi_path.exists():
+        phi_blob = torch.load(phi_path, map_location="cpu", weights_only=False)
+        phi_names = list(phi_blob.get("concept_names", []))
+        phi_marginal = phi_blob.get("marginal")
+        if phi_names == concept_names and phi_marginal is not None:
+            return phi_marginal.to(torch.float64)
+    return torch.tensor(
+        [float(stream.base_rates.get(name, 0.0)) * n_total for name in concept_names],
+        dtype=torch.float64,
+    )
 
 
 def load_phase_4_cache(
@@ -738,87 +1140,37 @@ def load_phase_4_cache(
     assoc_path = cache_dir / "feature_label_associations.csv"
     per_feature_path = cache_dir / "per_feature_stats.csv"
     report_path = cache_dir / "report.json"
-    required = [assoc_path, per_feature_path, report_path]
-    missing = [str(path) for path in required if not path.exists()]
+    missing = [
+        str(path) for path in (assoc_path, per_feature_path, report_path)
+        if not path.exists()
+    ]
     if missing:
         raise FileNotFoundError(
             "Phase 4 cache is incomplete; missing: " + ", ".join(missing)
         )
 
-    cached_report = json.loads(report_path.read_text())
-    phase_1_2 = cached_report.get("phase_1_2", {})
-    n_total = int(phase_1_2.get("n_tokens", 0) or 0)
-    if n_total <= 0:
-        raise ValueError(
-            f"{report_path} does not contain phase_1_2.n_tokens; cannot resume "
-            "Phase 4-dependent phases from cache."
-        )
+    cached_report, n_total = _read_cached_token_total(report_path)
 
     concept_names = stream.concept_names
     concept_to_idx = {name: idx for idx, name in enumerate(concept_names)}
     n_features = sae.d_dict
-    n_concepts = len(concept_names)
 
-    n11 = torch.zeros((n_features, n_concepts), dtype=torch.float64)
-    f1 = torch.zeros((n_features, n_concepts), dtype=torch.float32)
-    f1_dom = torch.zeros((n_features, n_concepts), dtype=torch.float32)
-    lift = torch.zeros((n_features, n_concepts), dtype=torch.float32)
-    chi2_stat = torch.zeros((n_features, n_concepts), dtype=torch.float32)
-    p_values = torch.ones((n_features, n_concepts), dtype=torch.float32)
-    rejected = torch.zeros((n_features, n_concepts), dtype=torch.bool)
+    loaded = _read_association_csv(assoc_path, n_features, concept_to_idx)
+    marginal_f = _read_feature_marginals(per_feature_path, n_features, n_total)
+    marginal_c = _resolve_concept_marginals(stream, concept_names, n_total)
 
-    with open(assoc_path, newline="") as fp:
-        reader = csv.DictReader(fp)
-        for row in reader:
-            fi = int(row["feature_idx"])
-            concept = row["concept"]
-            if not (0 <= fi < n_features) or concept not in concept_to_idx:
-                raise ValueError(
-                    f"Phase 4 cache row references unknown feature/concept: "
-                    f"feature={fi}, concept={concept!r}"
-                )
-            ci = concept_to_idx[concept]
-            f1[fi, ci] = float(row["f1"])
-            f1_dom[fi, ci] = float(row["f1_dom"])
-            lift[fi, ci] = float(row["lift"])
-            n11[fi, ci] = float(row["n_co"])
-            chi2_stat[fi, ci] = float(row["chi2"])
-            p_values[fi, ci] = float(row["p_value"])
-            rejected[fi, ci] = row.get("p_value_bh_significant", "True").lower() == "true"
-
-    marginal_f = torch.zeros(n_features, dtype=torch.float64)
-    with open(per_feature_path, newline="") as fp:
-        reader = csv.DictReader(fp)
-        for row in reader:
-            fi = int(row["feature_idx"])
-            if not (0 <= fi < n_features):
-                raise ValueError(f"Phase 4 cache row references unknown feature: {fi}")
-            marginal_f[fi] = float(row["firing_rate"]) * n_total
-
-    marginal_c = None
-    phi_path = stream.annotation_dir / "concept_phi.pt"
-    if phi_path.exists():
-        phi_blob = torch.load(phi_path, map_location="cpu", weights_only=False)
-        phi_names = list(phi_blob.get("concept_names", []))
-        phi_marginal = phi_blob.get("marginal")
-        if phi_names == concept_names and phi_marginal is not None:
-            marginal_c = phi_marginal.to(torch.float64)
-    if marginal_c is None:
-        marginal_c = torch.tensor(
-            [float(stream.base_rates.get(name, 0.0)) * n_total for name in concept_names],
-            dtype=torch.float64,
-        )
-
+    rejected = loaded["rejected"]
+    n11 = loaded["n11"]
     phase_4_summary = cached_report.get("phase_4", {})
     return {
         "stats": {
             "n11": n11,
-            "f1": f1,
-            "f1_dom": f1_dom,
-            "lift": lift,
-            "chi2_stat": chi2_stat,
+            "f1": loaded["f1"],
+            "f1_dom": loaded["f1_dom"],
+            "lift": loaded["lift"],
+            "chi2_stat": loaded["chi2_stat"],
         },
-        "p_values": p_values,
+        "p_values": loaded["p_values"],
         "rejected": rejected,
         "n_significant_pairs": int(rejected.sum().item()),
         "n_features_with_concept": int(rejected.any(dim=1).sum().item()),
@@ -832,124 +1184,10 @@ def load_phase_4_cache(
     }, cached_report
 
 
-# -----------------------------------------------------------------------------
-# Phase 5: Geometric checks
-# -----------------------------------------------------------------------------
-def phase_5_geometric(sae: SparseAutoencoder) -> dict:
-    """Encoder/decoder alignment and near-duplicate feature analysis."""
-    with torch.no_grad():
-        W_enc = sae.W_enc.detach().cpu()  # [d_model, d_dict]
-        W_dec = sae.W_dec.detach().cpu()  # [d_dict, d_model]
+# =============================================================================
+# Thesis 4.4 (Table 4.6) -- Phase 7: loss recovered under SAE substitution
+# =============================================================================
 
-        # Encoder-decoder cosine: cos(W_enc[:, f], W_dec[f, :])
-        enc_t = W_enc.t()  # [d_dict, d_model]
-        enc_norm = enc_t.norm(dim=1).clamp_min(1e-12)
-        dec_norm = W_dec.norm(dim=1).clamp_min(1e-12)
-        cos = (enc_t * W_dec).sum(dim=1) / (enc_norm * dec_norm)
-        encoder_decoder_alignment = float(cos.abs().mean().item())
-
-        # Near-duplicate features: cosine similarity between decoder directions,
-        # estimated on a random subsample when d_dict is large (the full pairwise
-        # matrix is d_dict^2). Reported as a count WITHIN the sample, not a total.
-        n_sample = min(2000, sae.d_dict)
-        sample_idx = torch.randperm(sae.d_dict)[:n_sample]
-        W_dec_sample = W_dec[sample_idx] / W_dec[sample_idx].norm(dim=1, keepdim=True).clamp_min(1e-12)
-        sim = W_dec_sample @ W_dec_sample.t()
-        sim.fill_diagonal_(0.0)
-        near_dup_pairs = int((sim > 0.95).sum().item() // 2)   # undirected pairs
-
-        # Effective rank of the decoder weight matrix.
-        try:
-            sv = torch.linalg.svdvals(W_dec.to(torch.float32))
-            normalized = sv / sv.sum().clamp_min(1e-12)
-            entropy = -(normalized * (normalized + 1e-12).log()).sum()
-            effective_rank = float(entropy.exp().item())
-        except Exception:
-            effective_rank = float("nan")
-
-    return {
-        "encoder_decoder_alignment": encoder_decoder_alignment,
-        "near_duplicate_pairs_in_sample": near_dup_pairs,
-        "near_duplicate_sample_size": n_sample,
-        "near_duplicate_cosine_threshold": 0.95,
-        "effective_rank": effective_rank,
-    }
-
-
-# -----------------------------------------------------------------------------
-# Phase 6: Threshold sweep
-# -----------------------------------------------------------------------------
-def phase_6_threshold_sweep(
-    stream: ChunkStream,
-    sae: SparseAutoencoder,
-    multipliers: tuple[float, ...] = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0),
-) -> dict:
-    """Sweep JumpReLU threshold multipliers and report FVE/L0/dead.
-
-    Each activation batch is encoded to preactivations once, then all threshold
-    multipliers are applied to that shared tensor. This preserves the same metrics
-    as separate passes while avoiding repeated disk scans.
-    """
-    n_mult = len(multipliers)
-    original_threshold = sae.jumprelu_threshold.detach().clone()
-    thresholds = [original_threshold * mult for mult in multipliers]
-
-    sq_resid = torch.zeros(n_mult, dtype=torch.float64)
-    sum_l0 = torch.zeros(n_mult, dtype=torch.float64)
-    firing = torch.zeros((n_mult, sae.d_dict), dtype=torch.long)
-    sq_total = 0.0
-    n_tokens = 0
-    colsum = None
-
-    for chunk_i, activations in enumerate(stream.iter_activations(), start=1):
-        for start in range(0, activations.size(0), stream.batch_size):
-            end = min(start + stream.batch_size, activations.size(0))
-            x = activations[start:end].to(stream.device, dtype=stream.dtype, non_blocking=True)
-
-            # Compute preactivations once and reuse them for every threshold.
-            with torch.no_grad():
-                h = sae.preactivations(x)
-                sq_total += float((x ** 2).sum().item())
-                xs = x.sum(dim=0).to(torch.float64).cpu()
-                colsum = xs if colsum is None else colsum + xs
-                n_tokens += x.size(0)
-
-                for i, threshold in enumerate(thresholds):
-                    features = h * (h > threshold).to(h.dtype)
-                    x_hat = sae.decode(features)
-                    sq_resid[i] += float(((x - x_hat) ** 2).sum().item())
-                    fired = features > 0
-                    sum_l0[i] += float(fired.float().sum().item())
-                    firing[i] += fired.sum(dim=0).long().cpu()
-                    del features, x_hat, fired
-
-            del x, h
-
-        if chunk_i == stream.n_chunks or chunk_i % 50 == 0:
-            LOG.info("Phase 6 threshold sweep: processed %d/%d chunks", chunk_i, stream.n_chunks)
-
-    # Centred FVE, consistent with Phase 1 (x is identical across multipliers,
-    # so the total sum of squares is too; only the residual changes).
-    ss_tot_centered = max(sq_total - float((colsum ** 2).sum().item()) / max(n_tokens, 1), 1e-12)
-    results = [
-        {
-            "multiplier": mult,
-            "fve": 1.0 - float(sq_resid[i].item()) / ss_tot_centered,
-            "l0_mean": float(sum_l0[i].item()) / max(n_tokens, 1),
-            "dead_pct": 100.0 * int((firing[i] == 0).sum().item()) / sae.d_dict,
-        }
-        for i, mult in enumerate(multipliers)
-    ]
-
-    sae.jumprelu_threshold.copy_(original_threshold)  # restore defensively
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    return {"sweep": results}
-
-
-# -----------------------------------------------------------------------------
-# Phase 7: Loss recovered (SAE substitution into InstaNovo)
-# -----------------------------------------------------------------------------
 def make_sae_substitution_hook(
     sae: SparseAutoencoder,
     ablate_features: torch.Tensor | None = None,
@@ -976,87 +1214,6 @@ def make_sae_substitution_hook(
         return _preserve_hook_output(output, x_hat.reshape(original_shape))
 
     return hook
-
-
-def phase_7_loss_recovered(
-    model, loader, sae: SparseAutoencoder, target_layer: int, device: str,
-    layer_mean: torch.Tensor, stream: ChunkStream | None = None, n_spectra_cap: int = 1024,
-) -> dict:
-    """Compute token-weighted CE in four modes -- clean, SAE-patched, zero-ablated,
-    mean-ablated -- and the loss recovered by the SAE substitution.
-
-    loss_recovered = (CE_zero - CE_sae) / (CE_zero - CE_clean): the fraction of the
-    layer's contribution (clean vs destroyed) that survives replacing the layer
-    with its SAE reconstruction. ~1 means the SAE preserves the model's behaviour;
-    ~0 means it is no better than deleting the layer. The clean baseline is the
-    right reference here (this is a reconstruction-fidelity check), unlike Phase 8
-    where per-feature effects use the SAE-full baseline.
-
-    If `stream` is given, the loader-computed clean CE is cross-checked per spectrum
-    against extract's cached baseline (clean_ce_alignment in the result): on aligned
-    runs the two agree to float precision, so a large discrepancy flags a re-run
-    loader that is misaligned with the chunks.
-    """
-    def tok_mean(ce_means: torch.Tensor, valids: torch.Tensor) -> float:
-        # token-weighted mean = sum_s(mean_ce_s * valid_s) / sum_s(valid_s)
-        n = min(ce_means.numel(), valids.numel())
-        if n == 0:
-            return float("nan")
-        return float((ce_means[:n] * valids[:n]).sum() / valids[:n].sum().clamp_min(1))
-
-    ce_clean_m, corr_clean, valid_clean = _ce_per_spectrum(
-        model, loader, target_layer, lambda: None, device, n_spectra_cap)
-    ce_sae_m, corr_sae, valid_sae = _ce_per_spectrum(
-        model, loader, target_layer, lambda: make_sae_substitution_hook(sae), device, n_spectra_cap)
-    ce_zero_m, _, valid_zero = _ce_per_spectrum(
-        model, loader, target_layer, _make_zero_hook, device, n_spectra_cap)
-    ce_mean_m, _, valid_mean = _ce_per_spectrum(
-        model, loader, target_layer, lambda: _make_mean_hook(layer_mean), device, n_spectra_cap)
-
-    ce_clean = tok_mean(ce_clean_m, valid_clean)
-    ce_sae = tok_mean(ce_sae_m, valid_sae)
-    ce_zero = tok_mean(ce_zero_m, valid_zero)
-    ce_mean = tok_mean(ce_mean_m, valid_mean)
-
-    denom = ce_zero - ce_clean
-    loss_recovered = (ce_zero - ce_sae) / denom if abs(denom) > 1e-12 else float("nan")
-    n_tokens = float(valid_clean.sum())
-    top1_clean = float(corr_clean.sum()) / max(n_tokens, 1.0)
-    top1_sae = float(corr_sae.sum()) / max(float(valid_sae.sum()), 1.0)
-
-    # Cross-check the re-run loader against extract's cached clean CE, per spectrum.
-    alignment = None
-    if stream is not None:
-        cached = _cached_clean_ce_per_spectrum(stream, n_spectra_cap)
-        if cached is not None and cached.numel() and ce_clean_m.numel():
-            n = min(cached.numel(), ce_clean_m.numel())
-            diff = (ce_clean_m[:n] - cached[:n]).abs()
-            cached_mean = float(cached[:n].mean())
-            mean_abs = float(diff.mean())
-            alignment = {
-                "n_spectra_compared": int(n),
-                "loader_clean_ce": float(ce_clean_m[:n].mean()),
-                "cached_clean_ce": cached_mean,
-                "max_abs_diff": float(diff.max()),
-                "mean_abs_diff": mean_abs,
-                # Heuristic: aligned runs agree to well under 1% of the CE scale; a
-                # reordered / differently-filtered loader differs on the CE scale.
-                "aligned": bool(mean_abs <= max(1e-2, 0.01 * abs(cached_mean))),
-            }
-
-    return {
-        "ce_clean": ce_clean,
-        "ce_sae": ce_sae,
-        "ce_zero": ce_zero,
-        "ce_mean": ce_mean,
-        "loss_recovered_vs_zero": loss_recovered,
-        "top1_acc_clean": top1_clean,
-        "top1_acc_sae": top1_sae,
-        "top1_drop_pp": 100.0 * (top1_clean - top1_sae),
-        "clean_ce_alignment": alignment,
-        "n_tokens": int(n_tokens),
-        "n_spectra": int(ce_clean_m.numel()),
-    }
 
 
 def _make_zero_hook():
@@ -1095,6 +1252,36 @@ def _compute_layer_mean(
     return (sums / max(n, 1)).to(device)
 
 
+def _ce_batch_stats(
+    model, batch, hook_factory, encoder_layer, device: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-spectrum (mean CE, correct-token count, valid-token count) for one batch.
+
+    A fresh hook is installed for this batch and removed in a finally block, so a
+    failure mid-forward cannot leave the model permanently patched.
+    """
+    import instanovo_io
+
+    factory_hook = hook_factory()
+    handle = encoder_layer.register_forward_hook(factory_hook) if factory_hook is not None else None
+    try:
+        with torch.no_grad():
+            logits = instanovo_io.model_forward_logits(model, batch, device)
+            ce, top1, targets, valid = instanovo_io.per_token_ce_and_top1(
+                logits, batch["peptides"], pad_index=instanovo_io.PAD_INDEX,
+            )
+    finally:
+        if handle is not None:
+            handle.remove()
+
+    v = valid.sum(dim=1)                                  # [B] valid tokens / spectrum
+    return (
+        (ce.sum(dim=1) / v.clamp_min(1)).cpu(),
+        ((top1 == targets) & valid).sum(dim=1).cpu(),
+        v.cpu(),
+    )
+
+
 def _ce_per_spectrum(
     model, loader, target_layer: int, hook_factory, device: str, max_spectra: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1103,8 +1290,7 @@ def _ce_per_spectrum(
     (mean_ce[S], correct[S], valid[S]) in global (shuffle=False) spectrum order.
 
     hook_factory() returns a forward hook to install on the target encoder layer,
-    or None for the clean (un-hooked) pass. A fresh hook is installed and removed
-    per batch.
+    or None for the clean (un-hooked) pass.
 
     ALIGNMENT CONTRACT. The loader reads the same spectra that extraction used,
     with shuffle=False and the same processor, so the i-th spectrum here is the
@@ -1132,22 +1318,13 @@ def _ce_per_spectrum(
     for batch in loader_iter:
         if seen >= max_spectra:
             break
-        factory_hook = hook_factory()
-        handle = encoder_layer.register_forward_hook(factory_hook) if factory_hook is not None else None
-        try:
-            with torch.no_grad():
-                logits = instanovo_io.model_forward_logits(model, batch, device)
-                ce, top1, targets, valid = instanovo_io.per_token_ce_and_top1(
-                    logits, batch["peptides"], pad_index=instanovo_io.PAD_INDEX,
-                )
-        finally:
-            if handle is not None:
-                handle.remove()
-        v = valid.sum(dim=1)                                  # [B] valid tokens / spectrum
-        ce_means.append((ce.sum(dim=1) / v.clamp_min(1)).cpu())
-        corrects.append(((top1 == targets) & valid).sum(dim=1).cpu())
-        valids.append(v.cpu())
-        seen += int(ce.shape[0])
+        ce_mean, correct, valid = _ce_batch_stats(
+            model, batch, hook_factory, encoder_layer, device,
+        )
+        ce_means.append(ce_mean)
+        corrects.append(correct)
+        valids.append(valid)
+        seen += int(ce_mean.shape[0])
 
     if not ce_means:
         z = torch.zeros(0)
@@ -1187,29 +1364,291 @@ def _cached_clean_ce_per_spectrum(stream: ChunkStream, max_spectra: int) -> torc
     return torch.cat(parts)[:max_spectra]
 
 
-def _prevalence_per_spectrum_flat(
-    stream: ChunkStream, n_concepts: int, max_spectra: int,
-) -> torch.Tensor:
-    """Per-spectrum concept prevalence over the stream, flat and in global order,
-    capped at max_spectra. Aligns by position with _ce_per_spectrum (same source,
-    same shuffle=False order). Shape [<=max_spectra, n_concepts]."""
-    parts = []
-    seen = 0
-    for meta, annotation in stream.iter_metadata_annotations():
-        if seen >= max_spectra:
+def _token_weighted_mean(ce_means: torch.Tensor, valids: torch.Tensor) -> float:
+    """Token-weighted CE: sum_s(mean_ce_s * valid_s) / sum_s(valid_s).
+
+    Weighting by valid tokens rather than averaging the per-spectrum means keeps
+    long peptides from being under-counted relative to short ones.
+    """
+    n = min(ce_means.numel(), valids.numel())
+    if n == 0:
+        return float("nan")
+    return float((ce_means[:n] * valids[:n]).sum() / valids[:n].sum().clamp_min(1))
+
+
+def _clean_ce_alignment(
+    ce_clean_m: torch.Tensor, stream: ChunkStream, n_spectra_cap: int,
+) -> dict | None:
+    """Cross-check the re-run loader's clean CE against extract's cached baseline.
+
+    Both were computed by the same code path on the same spectra, so on an aligned
+    run they agree to float precision. A discrepancy on the CE scale means the
+    loader is reordered or differently filtered relative to the chunks, which
+    would silently invalidate every Phase 8 selectivity contrast.
+    """
+    cached = _cached_clean_ce_per_spectrum(stream, n_spectra_cap)
+    if cached is None or not cached.numel() or not ce_clean_m.numel():
+        return None
+
+    n = min(cached.numel(), ce_clean_m.numel())
+    diff = (ce_clean_m[:n] - cached[:n]).abs()
+    cached_mean = float(cached[:n].mean())
+    mean_abs = float(diff.mean())
+    return {
+        "n_spectra_compared": int(n),
+        "loader_clean_ce": float(ce_clean_m[:n].mean()),
+        "cached_clean_ce": cached_mean,
+        "max_abs_diff": float(diff.max()),
+        "mean_abs_diff": mean_abs,
+        # Heuristic: aligned runs agree to well under 1% of the CE scale; a
+        # reordered / differently-filtered loader differs on the CE scale.
+        "aligned": bool(mean_abs <= max(1e-2, 0.01 * abs(cached_mean))),
+    }
+
+
+def phase_7_loss_recovered(
+    model, loader, sae: SparseAutoencoder, target_layer: int, device: str,
+    layer_mean: torch.Tensor, stream: ChunkStream | None = None, n_spectra_cap: int = 1024,
+) -> dict:
+    """Compute token-weighted CE in four modes -- clean, SAE-patched, zero-ablated,
+    mean-ablated -- and the loss recovered by the SAE substitution.
+
+    loss_recovered = (CE_zero - CE_sae) / (CE_zero - CE_clean): the fraction of the
+    layer's contribution (clean vs destroyed) that survives replacing the layer
+    with its SAE reconstruction. ~1 means the SAE preserves the model's behaviour;
+    ~0 means it is no better than deleting the layer. The clean baseline is the
+    right reference here (this is a reconstruction-fidelity check), unlike Phase 8
+    where per-feature effects use the SAE-full baseline.
+
+    If `stream` is given, the loader-computed clean CE is cross-checked per spectrum
+    against extract's cached baseline (clean_ce_alignment in the result).
+    """
+    ce_clean_m, corr_clean, valid_clean = _ce_per_spectrum(
+        model, loader, target_layer, lambda: None, device, n_spectra_cap)
+    ce_sae_m, corr_sae, valid_sae = _ce_per_spectrum(
+        model, loader, target_layer, lambda: make_sae_substitution_hook(sae), device, n_spectra_cap)
+    ce_zero_m, _, valid_zero = _ce_per_spectrum(
+        model, loader, target_layer, _make_zero_hook, device, n_spectra_cap)
+    ce_mean_m, _, valid_mean = _ce_per_spectrum(
+        model, loader, target_layer, lambda: _make_mean_hook(layer_mean), device, n_spectra_cap)
+
+    ce_clean = _token_weighted_mean(ce_clean_m, valid_clean)
+    ce_sae = _token_weighted_mean(ce_sae_m, valid_sae)
+    ce_zero = _token_weighted_mean(ce_zero_m, valid_zero)
+    ce_mean = _token_weighted_mean(ce_mean_m, valid_mean)
+
+    denom = ce_zero - ce_clean
+    loss_recovered = (ce_zero - ce_sae) / denom if abs(denom) > 1e-12 else float("nan")
+    n_tokens = float(valid_clean.sum())
+    top1_clean = float(corr_clean.sum()) / max(n_tokens, 1.0)
+    top1_sae = float(corr_sae.sum()) / max(float(valid_sae.sum()), 1.0)
+
+    alignment = (
+        _clean_ce_alignment(ce_clean_m, stream, n_spectra_cap)
+        if stream is not None else None
+    )
+
+    return {
+        "ce_clean": ce_clean,
+        "ce_sae": ce_sae,
+        "ce_zero": ce_zero,
+        "ce_mean": ce_mean,
+        "loss_recovered_vs_zero": loss_recovered,
+        "top1_acc_clean": top1_clean,
+        "top1_acc_sae": top1_sae,
+        "top1_drop_pp": 100.0 * (top1_clean - top1_sae),
+        "clean_ce_alignment": alignment,
+        "n_tokens": int(n_tokens),
+        "n_spectra": int(ce_clean_m.numel()),
+    }
+
+
+# =============================================================================
+# Thesis 4.5 (Table 4.7) -- cross-layer feature stability
+# =============================================================================
+
+def _encode_layer_sample(
+    extract_dir: Path,
+    manifest: dict,
+    layer: int,
+    sae: SparseAutoencoder,
+    n_tokens: int,
+    device: str,
+    batch_size: int,
+) -> torch.Tensor | None:
+    """Encode up to n_tokens of a layer's activations into SAE features.
+
+    Chunks are read in manifest order and every layer stops at the same token
+    count, so the returned matrices are row-aligned across layers -- which is what
+    makes the per-token correlation between layers meaningful.
+    """
+    collected = []
+    n_collected = 0
+    layer_key = str(layer)
+    sae_dtype = next(sae.parameters()).dtype
+
+    for chunk_info in manifest["chunks"]:
+        if layer_key not in chunk_info["activations"]:
+            continue
+        acts_obj = torch.load(
+            extract_dir / chunk_info["activations"][layer_key],
+            map_location="cpu", weights_only=False,
+        )
+        x_cpu = acts_obj["activations"]
+        for start in range(0, x_cpu.size(0), batch_size):
+            end = min(start + batch_size, x_cpu.size(0))
+            x = x_cpu[start:end].to(device=device, dtype=sae_dtype)
+            with torch.no_grad():
+                out = sae.forward_inference(x)
+            collected.append(out["features"].detach().cpu())
+            n_collected += end - start
+            del x, out
+            if n_collected >= n_tokens:
+                break
+        if n_collected >= n_tokens:
             break
-        parts.append(_per_spectrum_prevalence_from_tensors(
-            annotation["token_labels"], meta["token_to_spectrum"], meta["n_spectra"],
-        ))
-        seen += meta["n_spectra"]
-    if not parts:
-        return torch.zeros(0, n_concepts)
-    return torch.cat(parts)[:max_spectra]
+
+    if not collected:
+        return None
+    return torch.cat(collected, dim=0)[:n_tokens]
 
 
-# -----------------------------------------------------------------------------
-# Phase 8: Causal ablation
-# -----------------------------------------------------------------------------
+def _match_anchor_across_layers(
+    feat_idx: int,
+    target_acts_centred: torch.Tensor,
+    target_norms: torch.Tensor,
+    feature_acts: dict[int, torch.Tensor],
+    other_saes: dict[int, SparseAutoencoder],
+    target_layer: int,
+    top_k: int,
+) -> dict:
+    """Best Pearson correlates of one anchor feature at every other layer.
+
+    Correlation is the mean-centred dot product normalised by the product of
+    norms, computed over the shared token sample.
+    """
+    anchor_col = target_acts_centred[:, feat_idx]
+    anchor_norm = target_norms[feat_idx]
+
+    match_row = {"anchor_layer": target_layer, "anchor_feature": int(feat_idx)}
+    for L in other_saes:
+        if L not in feature_acts:
+            continue
+        other_acts = feature_acts[L]
+        other_centred = other_acts - other_acts.mean(dim=0, keepdim=True)
+        other_norms = other_centred.norm(dim=0).clamp_min(1e-12)
+        corrs = (other_centred * anchor_col.unsqueeze(1)).sum(dim=0) / (anchor_norm * other_norms)
+        k_use = min(top_k, corrs.numel())
+        top = torch.topk(corrs, k_use)
+        match_row[f"L{L}_best_feature"] = int(top.indices[0])
+        match_row[f"L{L}_best_corr"] = float(top.values[0])
+        match_row[f"L{L}_top{top_k}"] = ";".join(
+            f"F{int(top.indices[i])}:{float(top.values[i]):.3f}" for i in range(k_use)
+        )
+    return match_row
+
+
+def cross_layer_matching(
+    extract_dir: Path,
+    target_sae: SparseAutoencoder,
+    target_layer: int,
+    other_saes: dict[int, SparseAutoencoder],
+    anchor_features: torch.Tensor,
+    n_tokens: int,
+    top_k: int,
+    device: str,
+    batch_size: int,
+) -> dict:
+    """For each anchor feature at target_layer, find its best Pearson correlate
+    at every other available layer using activation co-firing on a token sample.
+    """
+    if not other_saes:
+        return {"matches": []}
+    if anchor_features.numel() == 0:
+        return {"matches": [], "n_anchors": 0, "other_layers": list(other_saes.keys())}
+
+    # Encode a token sample at every layer.
+    manifest = json.loads((extract_dir / "manifest.json").read_text())
+    feature_acts: dict[int, torch.Tensor] = {}
+    skipped_layers: list[int] = []
+
+    for L, sae in {target_layer: target_sae, **other_saes}.items():
+        acts = _encode_layer_sample(
+            extract_dir, manifest, L, sae, n_tokens, device, batch_size,
+        )
+        if acts is None:
+            LOG.warning("Cross-layer: no activation chunks collected at L%d; skipping matching", L)
+            skipped_layers.append(L)
+            continue
+        feature_acts[L] = acts
+        LOG.info("Cross-layer: encoded %d tokens at L%d", acts.size(0), L)
+
+    if target_layer not in feature_acts:
+        LOG.warning("Cross-layer: no activation chunks collected for anchor layer L%d", target_layer)
+        return {"matches": [], "n_anchors": 0, "other_layers": list(other_saes.keys())}
+
+    target_acts = feature_acts[target_layer]
+    target_acts_centred = target_acts - target_acts.mean(dim=0, keepdim=True)
+    target_norms = target_acts_centred.norm(dim=0).clamp_min(1e-12)
+
+    matches: list[dict] = []
+    for feat_idx in anchor_features.tolist():
+        match_row = _match_anchor_across_layers(
+            feat_idx, target_acts_centred, target_norms, feature_acts,
+            other_saes, target_layer, top_k,
+        )
+        # Two keys means no other layer produced a match for this anchor.
+        if len(match_row) > 2:
+            matches.append(match_row)
+
+    matched_layers = [L for L in other_saes if L in feature_acts]
+    return {
+        "matches": matches,
+        "n_anchors": len(matches),
+        "other_layers": matched_layers,
+        "skipped_layers": skipped_layers,
+    }
+
+
+def cross_seed_verification(
+    target_per_concept: dict,
+    other_seed_evaluations: list[dict],
+) -> dict:
+    """Compute Jaccard overlap of top-N features per concept across seed runs."""
+    if not other_seed_evaluations:
+        return {"results": [], "note": "No other seed evaluations available."}
+
+    results = []
+    for concept_name, info in target_per_concept.items():
+        target_top = {f["feature_idx"] for f in info[:CROSS_SEED_TOP_N]}
+        per_seed = []
+        for other in other_seed_evaluations:
+            other_top = {
+                f["feature_idx"] for f in other.get(concept_name, [])[:CROSS_SEED_TOP_N]
+            }
+            if not other_top:
+                continue
+            intersection = len(target_top & other_top)
+            union = len(target_top | other_top)
+            per_seed.append({
+                "intersection": intersection,
+                "union": union,
+                "jaccard": intersection / max(union, 1),
+            })
+        if per_seed:
+            results.append({
+                "concept": concept_name,
+                "mean_jaccard": float(np.mean([s["jaccard"] for s in per_seed])),
+                "per_seed": per_seed,
+            })
+
+    return {"results": results, "n_other_seeds": len(other_seed_evaluations)}
+
+
+# =============================================================================
+# Thesis 4.6 -- Phase 8: causal ablation
+# =============================================================================
+
 def stratified_feature_selection(
     f1_dom: torch.Tensor,
     firing_rate: torch.Tensor,
@@ -1253,130 +1692,6 @@ def stratified_feature_selection(
     return torch.tensor(chosen[:n_total], dtype=torch.long)
 
 
-def phase_8_causal_ablation(
-    stream: ChunkStream,
-    model,
-    loader,
-    sae: SparseAutoencoder,
-    target_layer: int,
-    phase_4_results: dict,
-    phi_matrix: torch.Tensor | None,
-    config: EvaluationConfig,
-) -> dict:
-    """Test whether BH-significant feature->concept associations are CAUSAL and
-    CONCEPT-SPECIFIC, not merely correlational. See the module header for the
-    methodology and its limits; in brief:
-
-      - Intervention: patch encoder.layers[L] with the SAE reconstruction and zero
-        the target feature(s) before decoding (a rank-k edit along their decoder
-        directions).
-      - Reference: the SAE reconstruction WITHOUT ablation, so the SAE's own
-        reconstruction error cancels and delta-CE isolates the feature's marginal
-        effect -- NOT the clean model, which would confound the two.
-      - A claim is retained only if the effect is (1) selective -- larger on
-        concept-bearing spectra than others; (2) above firing-rate-matched random
-        controls (selectivity_z); and (3) survives controlling for correlated
-        concepts (orthogonalised_selectivity). Any failure refutes or weakens it.
-      - Necessity, not sufficiency: a null is ambiguous (feature redundancy), which
-        the top-N group ablation partially addresses; a positive selective effect
-        is the strong result.
-    """
-    stats = phase_4_results["stats"]
-    rejected = phase_4_results["rejected"]
-    firing_rate = phase_4_results["marginal_f"] / max(phase_4_results["n_total_tokens"], 1)
-    firing_rate_t = torch.as_tensor(firing_rate, dtype=torch.float32)
-    n_concepts = len(stream.concept_names)
-    has_compatible_phi = (
-        phi_matrix is not None
-        and phi_matrix.ndim == 2
-        and phi_matrix.shape[0] >= n_concepts
-        and phi_matrix.shape[1] == n_concepts
-    )
-    if not has_compatible_phi:
-        LOG.warning(
-            "Phase 8: concept phi matrix missing or incompatible; "
-            "correlated-concept controls will be skipped"
-        )
-
-    # The SAE-full per-spectrum CE is the shared reference for every ablation, and
-    # yields the per-spectrum concept prevalence used for the selectivity contrast.
-    # Computed once so the per-feature loop does not recompute it.
-    ce_full, prevalence = _compute_sae_full_baseline(
-        model, loader, stream, sae, target_layer, n_concepts, config,
-    )
-    LOG.info(
-        "Phase 8: baseline ready for %d spectra, evaluating %d concepts "
-        "(top_n=%d, controls=%d, per_feature_top=%d)",
-        ce_full.numel(), n_concepts, config.ablation_top_n,
-        config.n_random_controls, config.ablation_per_feature_top,
-    )
-
-    per_concept_results: dict[str, dict] = {}
-    random_control_generator = torch.Generator(device="cpu").manual_seed(config.seed)
-    for ci, concept_name in enumerate(stream.concept_names):
-        f1_c = stats["f1_dom"][:, ci]
-        rejected_c = rejected[:, ci]
-        if not rejected_c.any():
-            per_concept_results[concept_name] = {
-                "concept": concept_name, "n_eligible_features": 0,
-                "causal": None, "per_feature_ablation": [],
-            }
-            continue
-
-        LOG.info(
-            "Phase 8: concept %d/%d %s (%d eligible features)",
-            ci + 1, n_concepts, concept_name, int(rejected_c.sum().item()),
-        )
-        top_n_features = stratified_feature_selection(
-            f1_c, firing_rate_t, rejected_c, config.ablation_top_n, config.n_firing_rate_deciles,
-        )
-        matched_random = _match_random_features(
-            top_n_features, firing_rate_t, n_replicates=config.n_random_controls,
-            generator=random_control_generator,
-        )
-        correlated = _find_correlated_concepts(ci, phi_matrix, stream.concept_names, threshold=0.3)
-
-        # Group ablation of the concept's top-N features and the matched controls.
-        delta_target = _ablation_deltas(model, loader, sae, target_layer, top_n_features, config, ce_full)
-        control_deltas = [
-            _ablation_deltas(model, loader, sae, target_layer, ctrl, config, ce_full)
-            for ctrl in matched_random
-        ]
-        causal = _causal_report(delta_target, prevalence, ci, correlated, control_deltas)
-
-        # Per-feature single ablation: necessity and selectivity of each feature.
-        per_feature_results = []
-        for feat in _select_per_feature_targets(rejected_c, f1_c, n=config.ablation_per_feature_top):
-            feat = int(feat)
-            d = _ablation_deltas(
-                model, loader, sae, target_layer, torch.tensor([feat]), config, ce_full,
-            )
-            per_feature_results.append({
-                "feature_idx": feat,
-                "mean_delta_ce": float(d.mean().item()) if d.numel() else float("nan"),
-                "selectivity": _selectivity(d, prevalence[:, ci]),
-                "f1_dom": float(f1_c[feat]),
-                "lift": float(stats["lift"][feat, ci]),
-            })
-
-        per_concept_results[concept_name] = {
-            "concept": concept_name,
-            "family": stream.family_of[concept_name],
-            "diagnostic": concept_name in stream.diagnostic_concepts,
-            "n_eligible_features": int(rejected_c.sum().item()),
-            "top_n_features": top_n_features.tolist(),
-            "matched_random_count": len(matched_random),
-            "n_correlated_concepts_controlled": len(correlated),
-            "causal": causal,
-            "per_feature_ablation": per_feature_results,
-        }
-
-    permutation_test = _permutation_test_top_features(
-        phase_4_results, config.permutation_n_features, config.permutation_n_shuffles,
-    )
-    return {"per_concept": per_concept_results, "permutation_test": permutation_test}
-
-
 def _match_random_features(
     target_features: torch.Tensor,
     firing_rate: torch.Tensor,
@@ -1399,7 +1714,10 @@ def _match_random_features(
         chosen: list[int] = []
         for lt in log_target:
             # Sample uniformly from features within +/-0.3 dex of the target rate.
-            close = ((log_all - lt).abs() < 0.3) & (~torch.isin(torch.arange(n_features), target_features))
+            close = (
+                ((log_all - lt).abs() < FIRING_RATE_MATCH_DEX)
+                & (~torch.isin(torch.arange(n_features), target_features))
+            )
             close_idx = close.nonzero(as_tuple=False).squeeze(-1)
             if close_idx.numel() == 0:
                 continue
@@ -1466,6 +1784,26 @@ def _per_spectrum_prevalence_from_tensors(
     return sums / counts.clamp_min(1.0)
 
 
+def _prevalence_per_spectrum_flat(
+    stream: ChunkStream, n_concepts: int, max_spectra: int,
+) -> torch.Tensor:
+    """Per-spectrum concept prevalence over the stream, flat and in global order,
+    capped at max_spectra. Aligns by position with _ce_per_spectrum (same source,
+    same shuffle=False order). Shape [<=max_spectra, n_concepts]."""
+    parts = []
+    seen = 0
+    for meta, annotation in stream.iter_metadata_annotations():
+        if seen >= max_spectra:
+            break
+        parts.append(_per_spectrum_prevalence_from_tensors(
+            annotation["token_labels"], meta["token_to_spectrum"], meta["n_spectra"],
+        ))
+        seen += meta["n_spectra"]
+    if not parts:
+        return torch.zeros(0, n_concepts)
+    return torch.cat(parts)[:max_spectra]
+
+
 def _compute_sae_full_baseline(
     model, loader, stream: ChunkStream, sae: SparseAutoencoder, target_layer: int,
     n_concepts: int, config: EvaluationConfig,
@@ -1524,7 +1862,7 @@ def _selectivity(delta_ce: torch.Tensor, prevalence_col: torch.Tensor) -> float:
     n = min(delta_ce.numel(), prevalence_col.numel())
     delta_ce = delta_ce[:n]
     prevalence_col = prevalence_col[:n]
-    if delta_ce.numel() < 6:
+    if delta_ce.numel() < MIN_SPECTRA_FOR_SELECTIVITY:
         return float("nan")
     lo_cut = torch.quantile(prevalence_col, 1.0 / 3.0)
     hi_cut = torch.quantile(prevalence_col, 2.0 / 3.0)
@@ -1542,6 +1880,28 @@ def _zscore(value: float, distribution: list[float]) -> float:
         return float("nan")
     mu, sd = float(np.mean(vals)), float(np.std(vals, ddof=1))
     return (value - mu) / sd if sd > 1e-12 else float("nan")
+
+
+def _orthogonalised_selectivity(
+    delta_target: torch.Tensor,
+    prevalence: torch.Tensor,
+    prev_col: torch.Tensor,
+    correlated_cis: list[int],
+) -> tuple[float, int]:
+    """Selectivity restricted to spectra free of every correlated concept.
+
+    This removes the possibility that the selectivity signal is borrowed from a
+    co-occurring concept rather than the target. When too few such spectra remain
+    the result is NaN -- reported honestly, since it means the concepts are not
+    separable in this data rather than that the test passed.
+    """
+    keep = torch.ones(delta_target.numel(), dtype=torch.bool)
+    for cci in correlated_cis:
+        keep &= prevalence[:, cci] <= 0.0
+    n_kept = int(keep.sum().item())
+    if n_kept < MIN_SPECTRA_FOR_SELECTIVITY:
+        return float("nan"), n_kept
+    return _selectivity(delta_target[keep], prev_col[keep]), n_kept
 
 
 def _causal_report(
@@ -1566,16 +1926,8 @@ def _causal_report(
     target_mean = float(delta_target.mean().item()) if delta_target.numel() else float("nan")
     sel = _selectivity(delta_target, prev_col)
 
-    # Orthogonalised: keep only spectra free of every correlated concept, so the
-    # selectivity cannot be borrowed from a co-occurring concept. When too few such
-    # spectra remain the result is NaN -- reported honestly, as it means the concepts
-    # are not separable in this data rather than that the test passed.
-    keep = torch.ones(delta_target.numel(), dtype=torch.bool)
-    for cci in correlated_cis:
-        keep &= prevalence[:, cci] <= 0.0
-    orth_sel = (
-        _selectivity(delta_target[keep], prev_col[keep])
-        if int(keep.sum().item()) >= 6 else float("nan")
+    orth_sel, n_orthogonal = _orthogonalised_selectivity(
+        delta_target, prevalence, prev_col, correlated_cis,
     )
 
     ctrl_means = [float(d.mean().item()) for d in control_deltas if d.numel()]
@@ -1590,25 +1942,49 @@ def _causal_report(
         "magnitude_z": _zscore(target_mean, ctrl_means),
         "selectivity_z": _zscore(sel, ctrl_sels),
         "n_spectra": int(delta_target.numel()),
-        "n_orthogonal_spectra": int(keep.sum().item()),
+        "n_orthogonal_spectra": n_orthogonal,
     }
+
+
+def _hypergeometric_null_chi2(
+    nf: float, nc: float, n_total: int, n_shuffles: int, rng,
+) -> list[float]:
+    """Chi-square values under the fixed-margin null for one feature-concept pair.
+
+    Holding both the feature's firing count and the concept's base rate fixed, the
+    co-occurrence count follows Hypergeometric(N, marginal_c, marginal_f). Sampling
+    it and recomputing chi-square gives a null that the marginal frequencies alone
+    cannot explain away.
+    """
+    null_n11 = rng.hypergeometric(
+        ngood=int(nc), nbad=int(n_total - nc), nsample=int(nf), size=n_shuffles,
+    )
+    null_chi2_values = []
+    for nn11 in null_n11:
+        nn10 = nf - nn11
+        nn01 = nc - nn11
+        nn00 = n_total - nn11 - nn10 - nn01
+        num = n_total * (nn11 * nn00 - nn10 * nn01) ** 2
+        denom = max((nn11 + nn10) * (nn00 + nn01) * (nn11 + nn01) * (nn00 + nn10), 1e-12)
+        null_chi2_values.append(num / denom)
+    return null_chi2_values
 
 
 def _permutation_test_top_features(
     phase_4_results: dict, n_features: int, n_shuffles: int,
 ) -> dict:
-    # Despite the historical "permutation" name, this samples the fixed-marginal
-    # hypergeometric null for each selected feature-concept pair.
     """Compare fixed-marginal null p-values to asymptotic chi-square p-values.
 
     A large discrepancy is a red flag that the asymptotic assumptions are breaking
     down for rare concepts or sparse features.
+
+    Despite the historical "permutation" name, this samples the fixed-marginal
+    hypergeometric null for each selected feature-concept pair.
     """
     stats = phase_4_results["stats"]
     rejected = phase_4_results["rejected"]
     marginal_f = phase_4_results["marginal_f"]
     marginal_c = phase_4_results["marginal_c"]
-    n11 = phase_4_results["n11"]
     n_total = phase_4_results["n_total_tokens"]
 
     f1_dom = stats["f1_dom"]
@@ -1624,31 +2000,16 @@ def _permutation_test_top_features(
     rng = np.random.default_rng(42)
     for f in feature_indices:
         f = int(f)
-        f1_row = f1_dom[f]
-        best_concept = int(f1_row.argmax().item())
+        best_concept = int(f1_dom[f].argmax().item())
         observed_chi2 = float(stats["chi2_stat"][f, best_concept].item())
 
-        # Permutation distribution: randomise the label column n_shuffles times,
-        # recompute n11 for this feature-concept pair, recompute chi^2.
         nf = float(marginal_f[f])
         nc = float(marginal_c[best_concept])
         if nf == 0 or nc == 0 or n_total == 0:
             results.append({"feature": f, "concept": best_concept, "empirical_p": float("nan")})
             continue
 
-        # Under H0, the co-occurrence count follows the fixed-marginal
-        # Hypergeometric(N, marginal_c, marginal_f) distribution.
-        null_n11 = rng.hypergeometric(
-            ngood=int(nc), nbad=int(n_total - nc), nsample=int(nf), size=n_shuffles,
-        )
-        null_chi2_values = []
-        for nn11 in null_n11:
-            nn10 = nf - nn11
-            nn01 = nc - nn11
-            nn00 = n_total - nn11 - nn10 - nn01
-            num = n_total * (nn11 * nn00 - nn10 * nn01) ** 2
-            denom = max((nn11 + nn10) * (nn00 + nn01) * (nn11 + nn01) * (nn00 + nn10), 1e-12)
-            null_chi2_values.append(num / denom)
+        null_chi2_values = _hypergeometric_null_chi2(nf, nc, n_total, n_shuffles, rng)
         empirical_p = float(np.mean(np.array(null_chi2_values) >= observed_chi2))
         asymptotic_p = float(1.0 - scipy_chi2.cdf(observed_chi2, df=1))
 
@@ -1664,145 +2025,178 @@ def _permutation_test_top_features(
     return {"n_tested": len(results), "results": results}
 
 
-# -----------------------------------------------------------------------------
-# Cross-layer feature matching
-# -----------------------------------------------------------------------------
-def cross_layer_matching(
-    extract_dir: Path,
-    target_sae: SparseAutoencoder,
-    target_layer: int,
-    other_saes: dict[int, SparseAutoencoder],
-    anchor_features: torch.Tensor,
-    n_tokens: int,
-    top_k: int,
-    device: str,
-    batch_size: int,
-) -> dict:
-    """For each anchor feature at target_layer, find its best Pearson correlate
-    at every other available layer using activation co-firing on a token sample.
+def _ablate_concept_group(
+    model, loader, sae: SparseAutoencoder, target_layer: int,
+    ci: int, f1_c: torch.Tensor, rejected_c: torch.Tensor,
+    firing_rate_t: torch.Tensor, phi_matrix: torch.Tensor | None,
+    concept_names: list[str], config: EvaluationConfig,
+    ce_full: torch.Tensor, prevalence: torch.Tensor,
+    random_control_generator: torch.Generator,
+) -> tuple[dict, torch.Tensor, list[torch.Tensor], list[int]]:
+    """Group-ablate a concept's top-N features against firing-rate-matched controls.
+
+    Returns the causal report plus the selected features, the control sets, and the
+    correlated-concept indices, so the caller can record what was tested.
     """
-    if not other_saes:
-        return {"matches": []}
-    if anchor_features.numel() == 0:
-        return {"matches": [], "n_anchors": 0, "other_layers": list(other_saes.keys())}
+    top_n_features = stratified_feature_selection(
+        f1_c, firing_rate_t, rejected_c, config.ablation_top_n, config.n_firing_rate_deciles,
+    )
+    matched_random = _match_random_features(
+        top_n_features, firing_rate_t, n_replicates=config.n_random_controls,
+        generator=random_control_generator,
+    )
+    correlated = _find_correlated_concepts(
+        ci, phi_matrix, concept_names, threshold=CORRELATED_CONCEPT_PHI,
+    )
 
-    # Encode a token sample at every layer.
-    manifest = json.loads((extract_dir / "manifest.json").read_text())
-    feature_acts: dict[int, torch.Tensor] = {}
-    skipped_layers: list[int] = []
-
-    for L, sae in {target_layer: target_sae, **other_saes}.items():
-        collected = []
-        n_collected = 0
-        layer_key = str(L)
-        sae_dtype = next(sae.parameters()).dtype
-        for chunk_info in manifest["chunks"]:
-            if layer_key not in chunk_info["activations"]:
-                continue
-            acts_obj = torch.load(
-                extract_dir / chunk_info["activations"][layer_key],
-                map_location="cpu", weights_only=False,
-            )
-            x_cpu = acts_obj["activations"]
-            for start in range(0, x_cpu.size(0), batch_size):
-                end = min(start + batch_size, x_cpu.size(0))
-                x = x_cpu[start:end].to(device=device, dtype=sae_dtype)
-                with torch.no_grad():
-                    out = sae.forward_inference(x)
-                collected.append(out["features"].detach().cpu())
-                n_collected += end - start
-                del x, out
-                if n_collected >= n_tokens:
-                    break
-            if n_collected >= n_tokens:
-                break
-        if not collected:
-            LOG.warning("Cross-layer: no activation chunks collected at L%d; skipping matching", L)
-            skipped_layers.append(L)
-            continue
-        feature_acts[L] = torch.cat(collected, dim=0)[:n_tokens]
-        LOG.info("Cross-layer: encoded %d tokens at L%d", feature_acts[L].size(0), L)
-
-    if target_layer not in feature_acts:
-        LOG.warning("Cross-layer: no activation chunks collected for anchor layer L%d", target_layer)
-        return {"matches": [], "n_anchors": 0, "other_layers": list(other_saes.keys())}
-
-    matches: list[dict] = []
-    target_acts = feature_acts[target_layer]
-    target_acts_centred = target_acts - target_acts.mean(dim=0, keepdim=True)
-    target_norms = target_acts_centred.norm(dim=0).clamp_min(1e-12)
-
-    for feat_idx in anchor_features.tolist():
-        anchor_col = target_acts_centred[:, feat_idx]
-        anchor_norm = target_norms[feat_idx]
-
-        match_row = {"anchor_layer": target_layer, "anchor_feature": int(feat_idx)}
-        for L in other_saes:
-            if L not in feature_acts:
-                continue
-            other_acts = feature_acts[L]
-            other_centred = other_acts - other_acts.mean(dim=0, keepdim=True)
-            other_norms = other_centred.norm(dim=0).clamp_min(1e-12)
-            corrs = (other_centred * anchor_col.unsqueeze(1)).sum(dim=0) / (anchor_norm * other_norms)
-            k_use = min(top_k, corrs.numel())
-            top = torch.topk(corrs, k_use)
-            match_row[f"L{L}_best_feature"] = int(top.indices[0])
-            match_row[f"L{L}_best_corr"] = float(top.values[0])
-            match_row[f"L{L}_top{top_k}"] = ";".join(
-                f"F{int(top.indices[i])}:{float(top.values[i]):.3f}" for i in range(k_use)
-            )
-        if len(match_row) > 2:
-            matches.append(match_row)
-
-    matched_layers = [L for L in other_saes if L in feature_acts]
-    return {
-        "matches": matches,
-        "n_anchors": len(matches),
-        "other_layers": matched_layers,
-        "skipped_layers": skipped_layers,
-    }
+    delta_target = _ablation_deltas(
+        model, loader, sae, target_layer, top_n_features, config, ce_full,
+    )
+    control_deltas = [
+        _ablation_deltas(model, loader, sae, target_layer, ctrl, config, ce_full)
+        for ctrl in matched_random
+    ]
+    causal = _causal_report(delta_target, prevalence, ci, correlated, control_deltas)
+    return causal, top_n_features, matched_random, correlated
 
 
-# -----------------------------------------------------------------------------
-# Cross-seed verification
-# -----------------------------------------------------------------------------
-def cross_seed_verification(
-    target_per_concept: dict,
-    other_seed_evaluations: list[dict],
-) -> dict:
-    """Compute Jaccard overlap of top-N features per concept across seed runs."""
-    if not other_seed_evaluations:
-        return {"results": [], "note": "No other seed evaluations available."}
+def _ablate_individual_features(
+    model, loader, sae: SparseAutoencoder, target_layer: int,
+    ci: int, f1_c: torch.Tensor, rejected_c: torch.Tensor, stats: dict,
+    config: EvaluationConfig, ce_full: torch.Tensor, prevalence: torch.Tensor,
+) -> list[dict]:
+    """Single-feature ablations: the necessity and selectivity of each feature alone.
 
+    A null here is ambiguous rather than negative -- a concept encoded redundantly
+    across many features survives losing any one of them -- which is why the group
+    ablation runs alongside.
+    """
     results = []
-    for concept_name, info in target_per_concept.items():
-        target_top = {f["feature_idx"] for f in info[:10]}
-        per_seed = []
-        for other in other_seed_evaluations:
-            other_top = {f["feature_idx"] for f in other.get(concept_name, [])[:10]}
-            if not other_top:
-                continue
-            intersection = len(target_top & other_top)
-            union = len(target_top | other_top)
-            per_seed.append({
-                "intersection": intersection,
-                "union": union,
-                "jaccard": intersection / max(union, 1),
-            })
-        if per_seed:
-            mean_jaccard = float(np.mean([s["jaccard"] for s in per_seed]))
-            results.append({
-                "concept": concept_name,
-                "mean_jaccard": mean_jaccard,
-                "per_seed": per_seed,
-            })
-
-    return {"results": results, "n_other_seeds": len(other_seed_evaluations)}
+    for feat in _select_per_feature_targets(
+        rejected_c, f1_c, n=config.ablation_per_feature_top,
+    ):
+        feat = int(feat)
+        d = _ablation_deltas(
+            model, loader, sae, target_layer, torch.tensor([feat]), config, ce_full,
+        )
+        results.append({
+            "feature_idx": feat,
+            "mean_delta_ce": float(d.mean().item()) if d.numel() else float("nan"),
+            "selectivity": _selectivity(d, prevalence[:, ci]),
+            "f1_dom": float(f1_c[feat]),
+            "lift": float(stats["lift"][feat, ci]),
+        })
+    return results
 
 
-# -----------------------------------------------------------------------------
+def phase_8_causal_ablation(
+    stream: ChunkStream,
+    model,
+    loader,
+    sae: SparseAutoencoder,
+    target_layer: int,
+    phase_4_results: dict,
+    phi_matrix: torch.Tensor | None,
+    config: EvaluationConfig,
+) -> dict:
+    """Test whether BH-significant feature->concept associations are CAUSAL and
+    CONCEPT-SPECIFIC, not merely correlational. See the module header for the
+    methodology and its limits; in brief:
+
+      - Intervention: patch encoder.layers[L] with the SAE reconstruction and zero
+        the target feature(s) before decoding (a rank-k edit along their decoder
+        directions).
+      - Reference: the SAE reconstruction WITHOUT ablation, so the SAE's own
+        reconstruction error cancels and delta-CE isolates the feature's marginal
+        effect -- NOT the clean model, which would confound the two.
+      - A claim is retained only if the effect is (1) selective -- larger on
+        concept-bearing spectra than others; (2) above firing-rate-matched random
+        controls (selectivity_z); and (3) survives controlling for correlated
+        concepts (orthogonalised_selectivity). Any failure refutes or weakens it.
+      - Necessity, not sufficiency: a null is ambiguous (feature redundancy), which
+        the top-N group ablation partially addresses; a positive selective effect
+        is the strong result.
+    """
+    stats = phase_4_results["stats"]
+    rejected = phase_4_results["rejected"]
+    firing_rate = phase_4_results["marginal_f"] / max(phase_4_results["n_total_tokens"], 1)
+    firing_rate_t = torch.as_tensor(firing_rate, dtype=torch.float32)
+    n_concepts = len(stream.concept_names)
+
+    has_compatible_phi = (
+        phi_matrix is not None
+        and phi_matrix.ndim == 2
+        and phi_matrix.shape[0] >= n_concepts
+        and phi_matrix.shape[1] == n_concepts
+    )
+    if not has_compatible_phi:
+        LOG.warning(
+            "Phase 8: concept phi matrix missing or incompatible; "
+            "correlated-concept controls will be skipped"
+        )
+
+    # The SAE-full per-spectrum CE is the shared reference for every ablation, and
+    # yields the per-spectrum concept prevalence used for the selectivity contrast.
+    # Computed once so the per-feature loop does not recompute it.
+    ce_full, prevalence = _compute_sae_full_baseline(
+        model, loader, stream, sae, target_layer, n_concepts, config,
+    )
+    LOG.info(
+        "Phase 8: baseline ready for %d spectra, evaluating %d concepts "
+        "(top_n=%d, controls=%d, per_feature_top=%d)",
+        ce_full.numel(), n_concepts, config.ablation_top_n,
+        config.n_random_controls, config.ablation_per_feature_top,
+    )
+
+    per_concept_results: dict[str, dict] = {}
+    random_control_generator = torch.Generator(device="cpu").manual_seed(config.seed)
+    for ci, concept_name in enumerate(stream.concept_names):
+        f1_c = stats["f1_dom"][:, ci]
+        rejected_c = rejected[:, ci]
+        if not rejected_c.any():
+            per_concept_results[concept_name] = {
+                "concept": concept_name, "n_eligible_features": 0,
+                "causal": None, "per_feature_ablation": [],
+            }
+            continue
+
+        LOG.info(
+            "Phase 8: concept %d/%d %s (%d eligible features)",
+            ci + 1, n_concepts, concept_name, int(rejected_c.sum().item()),
+        )
+
+        causal, top_n_features, matched_random, correlated = _ablate_concept_group(
+            model, loader, sae, target_layer, ci, f1_c, rejected_c, firing_rate_t,
+            phi_matrix, stream.concept_names, config, ce_full, prevalence,
+            random_control_generator,
+        )
+        per_feature_results = _ablate_individual_features(
+            model, loader, sae, target_layer, ci, f1_c, rejected_c, stats,
+            config, ce_full, prevalence,
+        )
+
+        per_concept_results[concept_name] = {
+            "concept": concept_name,
+            "family": stream.family_of[concept_name],
+            "diagnostic": concept_name in stream.diagnostic_concepts,
+            "n_eligible_features": int(rejected_c.sum().item()),
+            "top_n_features": top_n_features.tolist(),
+            "matched_random_count": len(matched_random),
+            "n_correlated_concepts_controlled": len(correlated),
+            "causal": causal,
+            "per_feature_ablation": per_feature_results,
+        }
+
+    permutation_test = _permutation_test_top_features(
+        phase_4_results, config.permutation_n_features, config.permutation_n_shuffles,
+    )
+    return {"per_concept": per_concept_results, "permutation_test": permutation_test}
+
+
+# =============================================================================
 # Evaluator orchestrator
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 class Evaluator:
     """Runs the full eight-phase evaluation and writes the report."""
 
@@ -1832,13 +2226,13 @@ class Evaluator:
     def _load_instanovo(self):
         """Load InstaNovo for Phase 7/8 ablation passes via the integration layer.
 
-    Uses instanovo_io.load_instanovo, which unpacks the (model, config)
+        Uses instanovo_io.load_instanovo, which unpacks the (model, config)
         tuple that InstaNovo.load returns and pulls residue_set off the model.
 
         Returns None (skipping Phases 7-8) if the model uses flash attention:
         flash attention bypasses the standard encoder stack, so the layer hook
         would never fire and the substitution/ablation would silently be a no-op
-    (loss_recovered ~1, all delta-CE ~0). This mirrors extract.py,
+        (loss_recovered ~1, all delta-CE ~0). This mirrors extract.py,
         which refuses to extract from a flash-attention checkpoint for the same
         reason. Load a non-flash checkpoint to enable the causal phases.
         """
@@ -1850,7 +2244,7 @@ class Evaluator:
         except ImportError as e:
             LOG.warning("InstaNovo import failed: %s; Phases 7 and 8 will be skipped", e)
             return None
-        if getattr(model, "use_flash_attention", False):
+        if instanovo_io.uses_flash_attention(model):
             LOG.warning(
                 "InstaNovo checkpoint uses flash attention, which bypasses the standard "
                 "encoder stack; the layer-%d hook would not fire and Phases 7-8 would "
@@ -1860,14 +2254,43 @@ class Evaluator:
             return None
         return model
 
+    def _resolve_n_peaks(self, ecfg: dict) -> int:
+        """Peaks per spectrum for the Phase 7/8 loader.
+
+        Taken from the extract manifest so the re-run loader reproduces exactly
+        the spectra extraction saw: n_peaks sets how many peak tokens each
+        spectrum contributes, and Phase 8 compares per-spectrum CE from this
+        loader against per-spectrum prevalence from those chunks by position. An
+        explicit config value overrides it, for manifests written before the
+        field existed.
+        """
+        if self.config.n_peaks is not None:
+            manifest_n_peaks = ecfg.get("n_peaks")
+            if manifest_n_peaks is not None and int(manifest_n_peaks) != self.config.n_peaks:
+                LOG.warning(
+                    "n_peaks override (%d) disagrees with the extract manifest (%d); "
+                    "Phase 7/8 per-spectrum alignment against the chunks may break.",
+                    self.config.n_peaks, int(manifest_n_peaks),
+                )
+            return self.config.n_peaks
+
+        manifest_n_peaks = ecfg.get("n_peaks")
+        if manifest_n_peaks is None:
+            raise ValueError(
+                "The extract manifest does not record n_peaks, so the Phase 7/8 "
+                "loader cannot be guaranteed to rebuild the same spectra. Re-run "
+                "extract.py, or pass --n-peaks with the value that extraction used."
+            )
+        return int(manifest_n_peaks)
+
     def _build_loader(self):
         """Build the shuffle=False DataLoader over the original spectra for Phase
         7/8 model forward passes, using the SAME processor and parameters as
         extraction so per-spectrum order matches the chunks.
 
         The spectra source is config.spectra_path, falling back to the dataset_path
-        recorded in the extract manifest. Loader params (batch_size, num_workers)
-        are read from the manifest's config so the run is reproducible.
+        recorded in the extract manifest. Loader params (batch_size, num_workers,
+        n_peaks) are read from the manifest's config so the run is reproducible.
         """
         import instanovo_io
         manifest = json.loads((self.config.extract_dir / "manifest.json").read_text())
@@ -1875,6 +2298,7 @@ class Evaluator:
         source = self.config.spectra_path or ecfg.get("dataset_path")
         if source is None:
             return None
+        n_peaks = self._resolve_n_peaks(ecfg)
         try:
             sdf = instanovo_io.load_spectrum_dataframe(source, annotated=True, shuffle=False)
             return instanovo_io.make_dataloader(
@@ -1882,7 +2306,7 @@ class Evaluator:
                 self.instanovo.residue_set,
                 batch_size=int(ecfg.get("batch_size", 32)),
                 num_workers=int(ecfg.get("num_workers", 4)),
-                n_peaks=self.config.n_peaks,
+                n_peaks=n_peaks,
                 annotated=True,
             )
         except Exception as e:  # noqa: BLE001 -- surface any data/loader failure clearly
@@ -1901,18 +2325,13 @@ class Evaluator:
             dtype=self.config.dtype,
         )
 
-    def run(self) -> dict:
-        """Run every enabled phase, write report.json plus the CSVs, and return the
-        in-memory report. Phases 7-8 are silently skipped when the model or spectra
-        are unavailable; all other phases need only the chunks and SAE checkpoint.
-        """
-        report: dict = {
-            "schema_version": SCHEMA_VERSION,
-            "config": self.config.as_jsonable(),
-        }
-        t0 = time.time()
+    def _model_phases_available(self) -> bool:
+        """Phases 7 and 8 need both the InstaNovo model and a spectra loader."""
+        return self.instanovo is not None and self.loader is not None
 
-        # -----------------------------------------------------------------------------
+    def _run_sae_quality_phases(self, report: dict) -> None:
+        """Phases 1+2, 5, and 6: everything measurable from the chunks and the SAE
+        checkpoint alone (thesis 4.1-4.2)."""
         if self.config.run_phase_1_2:
             LOG.info("Running Phase 1+2 (reconstruction + sparsity)")
             report["phase_1_2"] = phase_1_2_reconstruction_and_sparsity(
@@ -1927,8 +2346,11 @@ class Evaluator:
             LOG.info("Running Phase 6 (threshold sweep)")
             report["phase_6"] = phase_6_threshold_sweep(self._new_stream(), self.sae)
 
-        # -----------------------------------------------------------------------------
+    def _run_association_phases(self, report: dict) -> dict | None:
+        """Phases 3 and 4 (thesis 4.3). Returns the full Phase 4 result, which
+        Phase 8 and the cross-layer/seed checks consume."""
         phase_4_full: dict | None = None
+
         if self.config.run_phase_3:
             LOG.info("Running Phase 3 (top-K activating tokens)")
             phase_3_results = phase_3_top_activating(
@@ -1943,6 +2365,109 @@ class Evaluator:
             )
             report["phase_4"] = self._compact_phase_4(phase_4_full)
 
+        return phase_4_full
+
+    def _resume_phase_4_from_cache(self, report: dict) -> tuple[dict | None, bool]:
+        """Load a previous run's Phase 4 output so the phases that depend on it can
+        run without rescanning every chunk. Returns (phase_4_full, loaded_flag)."""
+        cache_dir = self.config.phase4_cache_dir or self.output_dir
+        try:
+            LOG.info("Loading Phase 4 cache from %s", cache_dir)
+            phase_4_full, cached_report = load_phase_4_cache(
+                cache_dir, self._new_stream(), self.sae,
+            )
+            # Carry forward the cached run's other phase blocks, but never its
+            # Phase 4-dependent results: those must be recomputed for this run.
+            for key, value in cached_report.items():
+                if key not in {
+                    "schema_version", "config", "elapsed_s",
+                    "phase_8", "cross_layer", "cross_seed",
+                } and key not in report:
+                    report[key] = value
+            LOG.info(
+                "Loaded Phase 4 cache: %d significant pairs across %d features",
+                phase_4_full["n_significant_pairs"],
+                phase_4_full["n_features_with_concept"],
+            )
+            return phase_4_full, True
+        except FileNotFoundError as e:
+            if self.config.phase4_cache_dir is not None:
+                raise
+            LOG.warning("%s; Phase 4-dependent phases will be skipped", e)
+            return None, False
+
+    def _run_task_preservation(self, report: dict) -> None:
+        """Phase 7 (thesis 4.4): how much sequencing behaviour survives patching
+        the SAE reconstruction into the forward pass."""
+        LOG.info("Running Phase 7 (loss recovered)")
+        layer_mean = _compute_layer_mean(
+            self._new_stream(), self.config.target_layer, self.config.device,
+            max_tokens=LAYER_MEAN_MAX_TOKENS,
+        )
+        report["phase_7"] = phase_7_loss_recovered(
+            self.instanovo, self.loader, self.sae,
+            self.config.target_layer, self.config.device, layer_mean,
+            stream=self._new_stream(), n_spectra_cap=self.config.ablation_spectra,
+        )
+
+    def _run_cross_layer(self, report: dict, phase_4_full: dict) -> None:
+        """Cross-layer feature stability (thesis 4.5)."""
+        LOG.info("Running cross-layer feature matching")
+        other_saes = {
+            L: load_sae_from_checkpoint(p, self.config.device)
+            for L, p in self.config.other_layer_checkpoints.items()
+        }
+        # Anchor features: top-100 by F1-dom across any concept.
+        f1_max = phase_4_full["stats"]["f1_dom"].max(dim=1).values
+        f1_max[~phase_4_full["rejected"].any(dim=1)] = -1.0
+        anchor_features = torch.topk(
+            f1_max, k=min(CROSS_LAYER_ANCHORS, int((f1_max > 0).sum().item())),
+        ).indices
+        report["cross_layer"] = cross_layer_matching(
+            extract_dir=self.config.extract_dir,
+            target_sae=self.sae,
+            target_layer=self.config.target_layer,
+            other_saes=other_saes,
+            anchor_features=anchor_features,
+            n_tokens=self.config.cross_layer_token_sample,
+            top_k=self.config.cross_layer_top_k,
+            device=self.config.device,
+            batch_size=self.config.batch_size,
+        )
+
+    def _run_cross_seed(self, report: dict, phase_4_full: dict) -> None:
+        """Top-feature agreement across independently seeded SAE runs."""
+        LOG.info("Running cross-seed verification")
+        other_seed_evals = []
+        for other_path in self.config.other_seed_checkpoints:
+            other_report_path = other_path.parent / "eval" / "report.json"
+            if other_report_path.exists():
+                other_report = json.loads(other_report_path.read_text())
+                other_seed_evals.append(
+                    other_report.get("phase_4", {}).get("per_concept_top", {})
+                )
+        report["cross_seed"] = cross_seed_verification(
+            phase_4_full["per_concept_top"], other_seed_evals,
+        )
+
+    def run(self) -> dict:
+        """Run every enabled phase, write report.json plus the CSVs, and return the
+        in-memory report. Phases 7-8 are silently skipped when the model or spectra
+        are unavailable; all other phases need only the chunks and SAE checkpoint.
+
+        Execution order differs from the thesis-ordered definitions above: Phase 8
+        and the cross-layer/cross-seed checks all consume Phase 4's output, so
+        Phase 4 must be computed (or loaded from cache) before them.
+        """
+        report: dict = {
+            "schema_version": EVAL_SCHEMA_VERSION,
+            "config": self.config.as_jsonable(),
+        }
+        t0 = time.time()
+
+        self._run_sae_quality_phases(report)
+        phase_4_full = self._run_association_phases(report)
+
         phase_4_loaded_from_cache = False
         phase_4_needed = (
             self.config.run_phase_8
@@ -1950,44 +2475,13 @@ class Evaluator:
             or self.config.run_cross_seed
         )
         if phase_4_full is None and phase_4_needed and not self.config.run_phase_4:
-            cache_dir = self.config.phase4_cache_dir or self.output_dir
-            try:
-                LOG.info("Loading Phase 4 cache from %s", cache_dir)
-                phase_4_full, cached_report = load_phase_4_cache(
-                    cache_dir, self._new_stream(), self.sae,
-                )
-                phase_4_loaded_from_cache = True
-                for key, value in cached_report.items():
-                    if key not in {
-                        "schema_version", "config", "elapsed_s",
-                        "phase_8", "cross_layer", "cross_seed",
-                    } and key not in report:
-                        report[key] = value
-                LOG.info(
-                    "Loaded Phase 4 cache: %d significant pairs across %d features",
-                    phase_4_full["n_significant_pairs"],
-                    phase_4_full["n_features_with_concept"],
-                )
-            except FileNotFoundError as e:
-                if self.config.phase4_cache_dir is not None:
-                    raise
-                LOG.warning("%s; Phase 4-dependent phases will be skipped", e)
+            phase_4_full, phase_4_loaded_from_cache = self._resume_phase_4_from_cache(report)
 
-        # -----------------------------------------------------------------------------
-        if self.config.run_phase_7 and self.instanovo is not None and self.loader is not None:
-            LOG.info("Running Phase 7 (loss recovered)")
-            layer_mean = _compute_layer_mean(
-                self._new_stream(), self.config.target_layer, self.config.device, max_tokens=200_000,
-            )
-            report["phase_7"] = phase_7_loss_recovered(
-                self.instanovo, self.loader, self.sae,
-                self.config.target_layer, self.config.device, layer_mean,
-                stream=self._new_stream(), n_spectra_cap=self.config.ablation_spectra,
-            )
+        if self.config.run_phase_7 and self._model_phases_available():
+            self._run_task_preservation(report)
 
-        # -----------------------------------------------------------------------------
-        if (self.config.run_phase_8 and self.instanovo is not None
-                and self.loader is not None and phase_4_full is not None):
+        if (self.config.run_phase_8 and self._model_phases_available()
+                and phase_4_full is not None):
             LOG.info("Running Phase 8 (causal ablation)")
             report["phase_8"] = phase_8_causal_ablation(
                 self._new_stream(), self.instanovo, self.loader, self.sae,
@@ -1996,43 +2490,13 @@ class Evaluator:
                 self.config,
             )
 
-        # -----------------------------------------------------------------------------
-        if self.config.run_cross_layer and self.config.other_layer_checkpoints and phase_4_full is not None:
-            LOG.info("Running cross-layer feature matching")
-            other_saes = {
-                L: load_sae_from_checkpoint(p, self.config.device)
-                for L, p in self.config.other_layer_checkpoints.items()
-            }
-            # Anchor features: top-100 by F1-dom across any concept.
-            f1_max = phase_4_full["stats"]["f1_dom"].max(dim=1).values
-            f1_max[~phase_4_full["rejected"].any(dim=1)] = -1.0
-            anchor_features = torch.topk(f1_max, k=min(100, int((f1_max > 0).sum().item()))).indices
-            report["cross_layer"] = cross_layer_matching(
-                extract_dir=self.config.extract_dir,
-                target_sae=self.sae,
-                target_layer=self.config.target_layer,
-                other_saes=other_saes,
-                anchor_features=anchor_features,
-                n_tokens=self.config.cross_layer_token_sample,
-                top_k=self.config.cross_layer_top_k,
-                device=self.config.device,
-                batch_size=self.config.batch_size,
-            )
+        if (self.config.run_cross_layer and self.config.other_layer_checkpoints
+                and phase_4_full is not None):
+            self._run_cross_layer(report, phase_4_full)
 
-        # -----------------------------------------------------------------------------
-        if self.config.run_cross_seed and self.config.other_seed_checkpoints and phase_4_full is not None:
-            LOG.info("Running cross-seed verification")
-            other_seed_evals = []
-            for other_path in self.config.other_seed_checkpoints:
-                other_report_path = other_path.parent / "eval" / "report.json"
-                if other_report_path.exists():
-                    other_report = json.loads(other_report_path.read_text())
-                    other_seed_evals.append(
-                        other_report.get("phase_4", {}).get("per_concept_top", {})
-                    )
-            report["cross_seed"] = cross_seed_verification(
-                phase_4_full["per_concept_top"], other_seed_evals,
-            )
+        if (self.config.run_cross_seed and self.config.other_seed_checkpoints
+                and phase_4_full is not None):
+            self._run_cross_seed(report, phase_4_full)
 
         report["elapsed_s"] = time.time() - t0
         self._write_report(report, None if phase_4_loaded_from_cache else phase_4_full)
@@ -2040,7 +2504,6 @@ class Evaluator:
 
     def _compact_phase_3(self, results: dict) -> dict:
         """Reduce Phase 3 output to a JSON-safe summary; full data goes to CSV."""
-        # Write per-feature top-K to CSV.
         csv_path = self.output_dir / "top_activating_tokens.csv"
         with open(csv_path, "w", newline="") as fp:
             writer = csv.writer(fp)
@@ -2057,7 +2520,6 @@ class Evaluator:
 
     def _compact_phase_4(self, results: dict) -> dict:
         """Reduce Phase 4 output to a JSON-safe summary; full data goes to CSV."""
-        # Write significant pairs to CSV.
         rejected = results["rejected"]
         stats = results["stats"]
         p_values = results["p_values"]
@@ -2088,6 +2550,70 @@ class Evaluator:
             "csv": csv_path.name,
         }
 
+    def _write_per_feature_csv(self, phase_4_full: dict) -> None:
+        """Per-feature firing rate and best-scoring concept."""
+        f1_max = phase_4_full["stats"]["f1_dom"].max(dim=1)
+        firing_rate = phase_4_full["marginal_f"] / max(phase_4_full["n_total_tokens"], 1)
+        csv_path = self.output_dir / "per_feature_stats.csv"
+        with open(csv_path, "w", newline="") as fp:
+            writer = csv.writer(fp)
+            writer.writerow([
+                "feature_idx", "firing_rate", "max_f1_dom", "best_concept",
+                "n_significant_concepts",
+            ])
+            for f in range(phase_4_full["stats"]["f1_dom"].size(0)):
+                best_idx = int(f1_max.indices[f])
+                writer.writerow([
+                    f,
+                    float(firing_rate[f]),
+                    float(f1_max.values[f]),
+                    phase_4_full["concept_names"][best_idx],
+                    int(phase_4_full["rejected"][f].sum().item()),
+                ])
+
+    def _write_causal_csv(self, report: dict) -> None:
+        """Per-concept causal-ablation summary.
+
+        The headline columns are the selectivity metrics (concept-specificity),
+        not raw delta-CE, which shows importance alone.
+        """
+        csv_path = self.output_dir / "causal_ablation.csv"
+        with open(csv_path, "w", newline="") as fp:
+            writer = csv.writer(fp)
+            writer.writerow([
+                "concept", "family", "diagnostic", "n_eligible",
+                "mean_delta_ce", "selectivity", "selectivity_z",
+                "orthogonalised_selectivity", "control_mean_selectivity",
+                "magnitude_z", "n_correlated_controlled",
+            ])
+            for concept, info in report["phase_8"]["per_concept"].items():
+                causal = info.get("causal")
+                if causal is None:
+                    continue
+                writer.writerow([
+                    concept,
+                    info.get("family", ""),
+                    info.get("diagnostic", False),
+                    info["n_eligible_features"],
+                    causal["mean_delta_ce"],
+                    causal["selectivity"],
+                    causal["selectivity_z"],
+                    causal["orthogonalised_selectivity"],
+                    causal["control_mean_selectivity"],
+                    causal["magnitude_z"],
+                    info.get("n_correlated_concepts_controlled", 0),
+                ])
+
+    def _write_cross_layer_csv(self, report: dict) -> None:
+        """One row per anchor feature, with its best match at every other layer."""
+        csv_path = self.output_dir / "cross_layer_matches.csv"
+        with open(csv_path, "w", newline="") as fp:
+            rows = report["cross_layer"]["matches"]
+            if rows:
+                writer = csv.DictWriter(fp, fieldnames=list(rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(rows)
+
     def _write_report(self, report: dict, phase_4_full: dict | None) -> None:
         """Write report.json (tensor-free summary) and the per-feature / association /
         causal / cross-layer CSVs. Heavy tensor data lives only in the CSVs.
@@ -2098,73 +2624,16 @@ class Evaluator:
         report_path.write_text(json.dumps(compact, indent=2, default=str))
         LOG.info("Wrote report to %s", report_path)
 
-        # Per-feature stats CSV.
         if phase_4_full is not None:
-            f1_max = phase_4_full["stats"]["f1_dom"].max(dim=1)
-            firing_rate = (
-                phase_4_full["marginal_f"] / max(phase_4_full["n_total_tokens"], 1)
-            )
-            csv_path = self.output_dir / "per_feature_stats.csv"
-            with open(csv_path, "w", newline="") as fp:
-                writer = csv.writer(fp)
-                writer.writerow([
-                    "feature_idx", "firing_rate", "max_f1_dom", "best_concept",
-                    "n_significant_concepts",
-                ])
-                for f in range(phase_4_full["stats"]["f1_dom"].size(0)):
-                    best_idx = int(f1_max.indices[f])
-                    writer.writerow([
-                        f,
-                        float(firing_rate[f]),
-                        float(f1_max.values[f]),
-                        phase_4_full["concept_names"][best_idx],
-                        int(phase_4_full["rejected"][f].sum().item()),
-                    ])
-
-        # Causal ablation CSV. The headline columns are the selectivity metrics
-        # (concept-specificity), not raw delta-CE (mere importance).
+            self._write_per_feature_csv(phase_4_full)
         if "phase_8" in report and report["phase_8"]:
-            csv_path = self.output_dir / "causal_ablation.csv"
-            with open(csv_path, "w", newline="") as fp:
-                writer = csv.writer(fp)
-                writer.writerow([
-                    "concept", "family", "diagnostic", "n_eligible",
-                    "mean_delta_ce", "selectivity", "selectivity_z",
-                    "orthogonalised_selectivity", "control_mean_selectivity",
-                    "magnitude_z", "n_correlated_controlled",
-                ])
-                for concept, info in report["phase_8"]["per_concept"].items():
-                    causal = info.get("causal")
-                    if causal is None:
-                        continue
-                    writer.writerow([
-                        concept,
-                        info.get("family", ""),
-                        info.get("diagnostic", False),
-                        info["n_eligible_features"],
-                        causal["mean_delta_ce"],
-                        causal["selectivity"],
-                        causal["selectivity_z"],
-                        causal["orthogonalised_selectivity"],
-                        causal["control_mean_selectivity"],
-                        causal["magnitude_z"],
-                        info.get("n_correlated_concepts_controlled", 0),
-                    ])
-
-        # Cross-layer CSV.
+            self._write_causal_csv(report)
         if "cross_layer" in report:
-            csv_path = self.output_dir / "cross_layer_matches.csv"
-            with open(csv_path, "w", newline="") as fp:
-                rows = report["cross_layer"]["matches"]
-                if rows:
-                    writer = csv.DictWriter(fp, fieldnames=list(rows[0].keys()))
-                    writer.writeheader()
-                    writer.writerows(rows)
+            self._write_cross_layer_csv(report)
 
 
-# -----------------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------------
+# --- CLI ----------------------------------------------------------------------
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for a single-(layer, seed) evaluation run."""
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -2183,8 +2652,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--spectra-path", type=Path, default=None,
                    help="Spectra source for Phase 7/8 CE; defaults to the extract "
                         "manifest's dataset_path. Must be the same spectra used for extraction.")
-    p.add_argument("--n-peaks", type=int, default=200,
-                   help="Peaks per spectrum; must match extraction's make_dataloader.")
+    p.add_argument("--n-peaks", type=int, default=None,
+                   help="Override peaks per spectrum for the Phase 7/8 loader. "
+                        "Defaults to the value recorded in the extract manifest, "
+                        "which is what keeps the re-run loader aligned with the chunks.")
 
     p.add_argument("--other-layer-checkpoint", type=str, nargs="*", default=[],
                    help="Format: layer_idx=path/to/checkpoint.pt")

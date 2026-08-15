@@ -1,13 +1,16 @@
 """train.py -- sparse autoencoder training for InstaNovo interpretability.
 
 Trains one SAE on the cached activations of a single encoder layer, reading the
-v4 per-layer files written by extract.py.
+per-layer files written by extract.py.
 
 Architecture:
-  - BatchTopK + AuxK during training (Bussmann et al. 2024): the top (k * batch)
-    pre-activations are kept across the whole batch (k active per token on
-    average); AuxK reconstructs the residual from the next-best features to keep
-    dead features alive.
+  - BatchTopK (Bussmann et al. 2024) during training: the top (k * batch)
+    pre-activations are kept across the whole batch, giving k active features per
+    token on average. Selecting across the batch rather than per token keeps
+    rarely-winning features receiving gradient.
+  - AuxK (Gao et al. 2024) reconstructs the main pass's residual from the
+    next-best features, so features that lose the BatchTopK competition still
+    receive gradient and do not go permanently dormant.
   - JumpReLU at inference with a single global threshold, calibrated to the
     BatchTopK selection boundary so the average L0 at inference matches k
     (Bussmann's BatchTopK->JumpReLU conversion).
@@ -50,14 +53,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-SCHEMA_VERSION = 4          # SAE checkpoint schema (global JumpReLU threshold)
-EXTRACT_SCHEMA_VERSION = 4  # extract.py manifest/layout this trainer reads
+from schema import EXTRACT_SCHEMA_VERSION, SAE_SCHEMA_VERSION
+
+# Re-exported under its historical name because evaluate.py imports
+# `SCHEMA_VERSION` from this module to tag its own report.
+SCHEMA_VERSION = SAE_SCHEMA_VERSION
+
 LOG = logging.getLogger("train")
 
+# Batches used by a mid-training (non-full) validation pass. Capped so periodic
+# validation stays cheap relative to training; the final pass uses full=True.
+QUICK_VALIDATION_BATCHES = 8
 
-# -----------------------------------------------------------------------------
-# Configuration
-# -----------------------------------------------------------------------------
+
 @dataclasses.dataclass
 class TrainingConfig:
     """All hyperparameters for one SAE training run."""
@@ -71,7 +79,7 @@ class TrainingConfig:
     d_dict: int = 12_288               # number of features (16x d_model=768)
     k: int = 32                        # avg active features per token under BatchTopK
     k_aux: int = 512                   # aux features for dead-feature recovery
-    alpha_aux: float = 1.0 / 32.0      # aux loss weight (Bussmann et al.)
+    alpha_aux: float = 1.0 / 32.0      # aux loss weight (Gao et al. 2024)
 
     # Decoder normalization
     normalize_decoder: bool = True             # enforce ||W_dec[f]|| = 1
@@ -116,9 +124,6 @@ class TrainingConfig:
         return out
 
 
-# -----------------------------------------------------------------------------
-# Sparse autoencoder
-# -----------------------------------------------------------------------------
 class SparseAutoencoder(nn.Module):
     """BatchTopK + AuxK at training, JumpReLU at inference, decoder unit-norm.
 
@@ -167,7 +172,8 @@ class SparseAutoencoder(nn.Module):
         self.register_buffer("firing_count", torch.zeros(d_dict, dtype=torch.long))
         self.register_buffer("tokens_seen", torch.zeros(1, dtype=torch.long))
 
-    # Encoder / decoder primitives.
+    # --- Encoder / decoder primitives ----------------------------------------
+
     def preactivations(self, x: torch.Tensor) -> torch.Tensor:
         """Compute encoder pre-activations: h = (x - b_dec) @ W_enc + b_enc."""
         return (x - self.b_dec) @ self.W_enc + self.b_enc
@@ -179,55 +185,63 @@ class SparseAutoencoder(nn.Module):
         out = features @ self.W_dec
         return out + self.b_dec if add_bias else out
 
-    # Training-mode forward (BatchTopK + AuxK).
+    def _batch_topk_mask(self, h_relu: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Select the top (k * batch_size) pre-activations across the whole batch.
+
+        Returns the selection mask and the boundary value (the smallest kept
+        pre-activation), which calibrates the inference JumpReLU threshold. The
+        boundary is None when the batch is too small to fill k * batch_size, in
+        which case every positive pre-activation is kept.
+        """
+        k_total = self.k * h_relu.size(0)
+        flat = h_relu.reshape(-1)
+        if k_total >= flat.numel():
+            return h_relu > 0, None
+        kth_value = torch.topk(flat, k_total, sorted=False).values.min()
+        return h_relu >= kth_value, kth_value.detach()
+
+    def _auxk_features(self, h_relu: torch.Tensor, main_mask: torch.Tensor) -> torch.Tensor:
+        """Densify the top-k_aux pre-activations NOT selected by the main pass.
+
+        These reconstruct the main pass's residual, so features that lost the
+        BatchTopK competition keep receiving gradient instead of going dormant.
+        """
+        unselected = h_relu.masked_fill(main_mask, 0.0)
+        k_aux_use = min(self.k_aux, self.d_dict)
+        top_vals, top_idx = torch.topk(unselected, k_aux_use, dim=-1)
+        features_aux = torch.zeros_like(h_relu)
+        features_aux.scatter_(-1, top_idx, top_vals)
+        return features_aux
+
     def forward_train(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """One training-mode forward pass producing main and aux reconstructions."""
         h = self.preactivations(x)
         h_relu = F.relu(h)
-        batch_size = x.size(0)
 
-        # BatchTopK selection across the whole batch.
-        # Keep the top (k * batch_size) pre-activations globally; everything else
-        # is zero. kth_value is the selection boundary -- the smallest kept value,
-        # used to calibrate the inference JumpReLU threshold.
-        k_total = self.k * batch_size
-        flat = h_relu.reshape(-1)
-        out: dict[str, torch.Tensor] = {}
-        if k_total < flat.numel():
-            kth_value = torch.topk(flat, k_total, sorted=False).values.min()
-            main_mask = (h_relu >= kth_value)
-            out["batch_threshold"] = kth_value.detach()
-        else:
-            main_mask = (h_relu > 0)
+        main_mask, batch_threshold = self._batch_topk_mask(h_relu)
         features_main = h_relu * main_mask.to(h_relu.dtype)
         x_hat_main = self.decode(features_main)
 
-        out.update({
+        out: dict[str, torch.Tensor] = {
             "x_hat_main": x_hat_main,
             "features_main": features_main,
             "main_mask": main_mask,
             "h": h,
-        })
+        }
+        if batch_threshold is not None:
+            out["batch_threshold"] = batch_threshold
 
-        # AuxK reconstructs the residual using the top-k_aux unselected features.
         if self.k_aux > 0:
-            unselected = h_relu.masked_fill(main_mask, 0.0)
-            k_aux_use = min(self.k_aux, self.d_dict)
-            top_vals, top_idx = torch.topk(unselected, k_aux_use, dim=-1)
-            features_aux = torch.zeros_like(h_relu)
-            features_aux.scatter_(-1, top_idx, top_vals)
+            features_aux = self._auxk_features(h_relu, main_mask)
             # Target the main-pass residual (detached so gradients don't flow into
             # the main reconstruction). Decode WITHOUT b_dec: the residual already
             # has b_dec removed, so re-adding it here would double-count the bias.
-            x_residual = (x - x_hat_main).detach()
-            x_hat_aux = self.decode(features_aux, add_bias=False)
-            out["x_hat_aux"] = x_hat_aux
-            out["x_residual"] = x_residual
+            out["x_hat_aux"] = self.decode(features_aux, add_bias=False)
+            out["x_residual"] = (x - x_hat_main).detach()
             out["features_aux"] = features_aux
 
         return out
 
-    # Inference-mode forward (JumpReLU).
     @torch.no_grad()
     def forward_inference(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """One inference-mode forward pass: JumpReLU with the global threshold."""
@@ -236,7 +250,8 @@ class SparseAutoencoder(nn.Module):
         features = h * gate.to(h.dtype)
         return {"x_hat": self.decode(features), "features": features, "h": h}
 
-    # Decoder normalization.
+    # --- Decoder normalization ------------------------------------------------
+
     @torch.no_grad()
     def renormalize_decoder(self) -> None:
         """Re-project each W_dec row to unit L2 norm (called after optimizer step)."""
@@ -260,7 +275,8 @@ class SparseAutoencoder(nn.Module):
         dot = (self.W_dec.grad * self.W_dec).sum(dim=1, keepdim=True)
         self.W_dec.grad -= dot * self.W_dec
 
-    # JumpReLU threshold calibration.
+    # --- Running statistics ---------------------------------------------------
+
     @torch.no_grad()
     def update_threshold_ema(self, batch_threshold: torch.Tensor, decay: float) -> None:
         """EMA the per-batch BatchTopK boundary into a PROVISIONAL global threshold.
@@ -299,11 +315,8 @@ class SparseAutoencoder(nn.Module):
         return int((self.firing_count < min_firings).sum().item())
 
 
-# -----------------------------------------------------------------------------
-# Activation loading -- v4 per-layer files for one target layer
-# -----------------------------------------------------------------------------
 def _load_layer_activations(path: Path) -> torch.Tensor:
-    """Read one layer's [total_tokens, d_model] tensor from a v4
+    """Read one layer's [total_tokens, d_model] tensor from an
     acts_L{layer}_{chunk}.pt file. Reads the same payload extract.py
     writes via save_layer_activations (and that its load_layer_activations reads);
     duplicated here so the trainer needs no import of the model-dependent
@@ -321,8 +334,8 @@ class SAETokenDataset:
       - cache_in_ram=False: stream one chunk file per step, shuffling within each
         chunk and across chunk order (not a global shuffle). For tight-RAM boxes.
 
-    Reads the v4 layout from extract.py: each manifest chunk entry
-    carries a per-layer activation path and a meta path.
+    Reads the layout from extract.py: each manifest chunk entry carries a
+    per-layer activation path and a meta path.
     """
 
     def __init__(
@@ -346,13 +359,37 @@ class SAETokenDataset:
         self.rng = torch.Generator().manual_seed(seed)
         self._cached: torch.Tensor | None = None
 
+        manifest = self._read_manifest(extract_dir)
+        self.act_paths, self.meta_paths = self._resolve_chunk_paths(
+            extract_dir, manifest, target_layer,
+        )
+        self.chunk_token_counts = [
+            int(torch.load(self.meta_paths[ci], map_location="cpu",
+                           weights_only=False)["total_tokens"])
+            for ci in self.chunk_indices
+        ]
+
+    @staticmethod
+    def _read_manifest(extract_dir: Path) -> dict:
+        """Load the extraction manifest, rejecting an incompatible schema.
+
+        Stale chunks from an earlier extraction would silently pair the wrong
+        activations with this run's metadata, so a mismatch is fatal.
+        """
         manifest = json.loads((extract_dir / "manifest.json").read_text())
         if manifest["schema_version"] != EXTRACT_SCHEMA_VERSION:
             raise ValueError(
                 f"Extraction schema mismatch: manifest={manifest['schema_version']}, "
                 f"trainer expects {EXTRACT_SCHEMA_VERSION}. Re-run extract.py."
             )
+        return manifest
 
+    @staticmethod
+    def _resolve_chunk_paths(
+        extract_dir: Path, manifest: dict, target_layer: int
+    ) -> tuple[list[Path], list[Path]]:
+        """Map every manifest chunk to its activation file for this layer and its
+        meta file, failing early if the layer was never extracted."""
         layer_key = str(target_layer)
         chunks = manifest["chunks"]
         if not chunks or layer_key not in chunks[0]["activations"]:
@@ -360,13 +397,9 @@ class SAETokenDataset:
             raise KeyError(
                 f"Layer {target_layer} has no activation files; available: {available}"
             )
-        self.act_paths = [extract_dir / c["activations"][layer_key] for c in chunks]
-        self.meta_paths = [extract_dir / c["meta"] for c in chunks]
-        self.chunk_token_counts = [
-            int(torch.load(self.meta_paths[ci], map_location="cpu",
-                           weights_only=False)["total_tokens"])
-            for ci in self.chunk_indices
-        ]
+        act_paths = [extract_dir / c["activations"][layer_key] for c in chunks]
+        meta_paths = [extract_dir / c["meta"] for c in chunks]
+        return act_paths, meta_paths
 
     def n_tokens(self) -> int:
         """Exact number of activation rows in this train/validation split."""
@@ -414,18 +447,18 @@ class SAETokenDataset:
         )
         return buf
 
-    def __iter__(self) -> Iterator[torch.Tensor]:
-        if self.cache_in_ram:
-            if self._cached is None:
-                self._cached = self._load_split_into_ram()
-            n = self._cached.size(0)
-            order = (torch.randperm(n, generator=self.rng) if self.shuffle
-                     else torch.arange(n))
-            for start in range(0, n, self.batch_size):
-                yield self._cached[order[start:start + self.batch_size]]
-            return
+    def _iter_cached(self) -> Iterator[torch.Tensor]:
+        """Batch the RAM-cached split under one global shuffle per epoch."""
+        if self._cached is None:
+            self._cached = self._load_split_into_ram()
+        n = self._cached.size(0)
+        order = (torch.randperm(n, generator=self.rng) if self.shuffle
+                 else torch.arange(n))
+        for start in range(0, n, self.batch_size):
+            yield self._cached[order[start:start + self.batch_size]]
 
-        # Streaming fallback: one chunk file at a time.
+    def _iter_streaming(self) -> Iterator[torch.Tensor]:
+        """Batch one chunk file at a time, shuffling within and across chunks."""
         chunk_order = list(self.chunk_indices)
         if self.shuffle:
             perm = torch.randperm(len(chunk_order), generator=self.rng).tolist()
@@ -438,10 +471,10 @@ class SAETokenDataset:
             for start in range(0, n, self.batch_size):
                 yield acts[start:start + self.batch_size]
 
+    def __iter__(self) -> Iterator[torch.Tensor]:
+        return self._iter_cached() if self.cache_in_ram else self._iter_streaming()
 
-# -----------------------------------------------------------------------------
-# Learning-rate schedule
-# -----------------------------------------------------------------------------
+
 def cosine_with_warmup_lr(
     step: int,
     total_steps: int,
@@ -458,13 +491,10 @@ def cosine_with_warmup_lr(
     return lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * progress))
 
 
-# -----------------------------------------------------------------------------
-# JumpReLU threshold calibration (post-training)
-# -----------------------------------------------------------------------------
 @torch.no_grad()
 def calibrate_threshold(
     model: SparseAutoencoder,
-    dataset: "SAETokenDataset",
+    dataset: SAETokenDataset,
     device: str,
     dtype: torch.dtype,
     n_batches: int,
@@ -496,12 +526,184 @@ def calibrate_threshold(
     return thr
 
 
-# -----------------------------------------------------------------------------
-# Training loop
-# -----------------------------------------------------------------------------
+# --- Training setup -----------------------------------------------------------
+
+def _seed_everything(seed: int) -> None:
+    """Seed every RNG the run touches, for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _split_chunks(manifest: dict, val_fraction: float, seed: int) -> tuple[list[int], list[int]]:
+    """Partition chunk indices into train and validation splits.
+
+    Splitting by chunk rather than by token keeps a validation spectrum's tokens
+    out of training entirely. At least one chunk is always held out.
+    """
+    n_chunks = manifest["n_chunks"]
+    n_val_chunks = max(1, int(round(val_fraction * n_chunks)))
+    rng = random.Random(seed)
+    all_chunk_indices = list(range(n_chunks))
+    rng.shuffle(all_chunk_indices)
+    return sorted(all_chunk_indices[n_val_chunks:]), sorted(all_chunk_indices[:n_val_chunks])
+
+
+def _infer_d_model(extract_dir: Path, manifest: dict, target_layer: int, chunk_idx: int) -> int:
+    """Read the activation width from one chunk, so d_model never has to be
+    passed in and can never disagree with the extracted files."""
+    chunk_entry = manifest["chunks"][chunk_idx]
+    acts_path = extract_dir / chunk_entry["activations"][str(target_layer)]
+    acts = _load_layer_activations(acts_path)
+    d_model = acts.size(1)
+    del acts
+    return d_model
+
+
+def _build_datasets(
+    config: TrainingConfig, train_chunks: list[int], val_chunks: list[int]
+) -> tuple[SAETokenDataset, SAETokenDataset]:
+    """Build the train and validation loaders once, so any RAM cache they hold
+    is populated a single time and reused across every epoch and validation."""
+    def make(chunks: list[int], shuffle: bool) -> SAETokenDataset:
+        return SAETokenDataset(
+            extract_dir=config.extract_dir,
+            target_layer=config.target_layer,
+            batch_size=config.batch_size,
+            chunk_indices=chunks,
+            shuffle=shuffle,
+            seed=config.seed,
+            dtype=config.dtype,
+            cache_in_ram=config.cache_in_ram,
+        )
+
+    return make(train_chunks, shuffle=True), make(val_chunks, shuffle=False)
+
+
+def _compute_losses(
+    model_out: dict[str, torch.Tensor],
+    x: torch.Tensor,
+    config: TrainingConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Main reconstruction loss, AuxK loss, and their weighted total."""
+    recon_loss = F.mse_loss(model_out["x_hat_main"], x)
+    aux_loss = torch.tensor(0.0, device=config.device, dtype=config.dtype)
+    if "x_hat_aux" in model_out:
+        aux_loss = F.mse_loss(model_out["x_hat_aux"], model_out["x_residual"])
+    return recon_loss, aux_loss, recon_loss + config.alpha_aux * aux_loss
+
+
+def _optimizer_step(
+    model: SparseAutoencoder,
+    optimizer: torch.optim.Optimizer,
+    loss: torch.Tensor,
+    config: TrainingConfig,
+) -> None:
+    """Backward pass, optional decoder-gradient projection, clip, step, and the
+    unit-norm re-projection that enforces ||W_dec[f]|| = 1."""
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+
+    if config.project_grad_to_tangent:
+        model.project_grad_to_tangent_space()
+    if config.grad_clip_norm > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
+
+    optimizer.step()
+    model.renormalize_decoder()
+
+
+class _EpochAccumulator:
+    """Running per-epoch loss totals."""
+
+    def __init__(self) -> None:
+        self.main_loss = 0.0
+        self.aux_loss = 0.0
+        self.n_batches = 0
+
+    def add(self, recon_loss: torch.Tensor, aux_loss: torch.Tensor) -> None:
+        self.main_loss += float(recon_loss.detach())
+        self.aux_loss += float(aux_loss.detach())
+        self.n_batches += 1
+
+    def mean_main(self) -> float:
+        return self.main_loss / max(1, self.n_batches)
+
+    def mean_aux(self) -> float:
+        return self.aux_loss / max(1, self.n_batches)
+
+
+def _run_epoch(
+    epoch: int,
+    step: int,
+    model: SparseAutoencoder,
+    optimizer: torch.optim.Optimizer,
+    config: TrainingConfig,
+    train_dataset: SAETokenDataset,
+    val_dataset: SAETokenDataset,
+    total_steps: int,
+    log_file,
+    t0: float,
+) -> tuple[int, _EpochAccumulator]:
+    """Train for one pass over the train split. Returns the updated global step
+    counter and the epoch's loss accumulator."""
+    model.reset_firing_count()
+    acc = _EpochAccumulator()
+
+    for batch in train_dataset:
+        x = batch.to(config.device, dtype=config.dtype, non_blocking=True)
+
+        lr_now = cosine_with_warmup_lr(
+            step, total_steps, config.lr, config.lr_min_ratio, config.warmup_steps,
+        )
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr_now
+
+        out = model.forward_train(x)
+        recon_loss, aux_loss, loss = _compute_losses(out, x, config)
+        _optimizer_step(model, optimizer, loss, config)
+
+        # Firing counts and the provisional threshold EMA used only for
+        # mid-training validation (calibrate_threshold sets the final threshold
+        # after training). The EMA needs the BatchTopK boundary, which is absent
+        # only for batches too small to fill k * batch_size.
+        with torch.no_grad():
+            model.update_firing_count(out["main_mask"])
+            if "batch_threshold" in out:
+                model.update_threshold_ema(
+                    out["batch_threshold"], config.threshold_ema_decay,
+                )
+
+        acc.add(recon_loss, aux_loss)
+        step += 1
+
+        if step % config.log_every == 0:
+            log_file.write(json.dumps({
+                "step": step,
+                "epoch": epoch,
+                "lr": lr_now,
+                "recon_loss": float(recon_loss.detach()),
+                "aux_loss": float(aux_loss.detach()),
+                "elapsed_s": time.time() - t0,
+            }) + "\n")
+
+        if step % config.val_every == 0:
+            val_metrics = _validate(model, config, val_dataset)
+            LOG.info(
+                "Step %d (epoch %d): recon=%.4f aux=%.4f "
+                "val_FVE_uncentered=%.4f val_FVE_centered=%.4f val_L0=%.1f dead=%d",
+                step, epoch, recon_loss.item(), aux_loss.item(),
+                val_metrics["fve_uncentered"], val_metrics["fve_centered"],
+                val_metrics["l0_mean"], val_metrics["dead_features"],
+            )
+
+    return step, acc
+
+
 def train_one_sae(config: TrainingConfig) -> dict:
     """Run one full SAE training session and write the checkpoint to disk."""
-    # Setup.
     out_dir = config.output_subdir()
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "config.json").write_text(json.dumps(config.as_jsonable(), indent=2))
@@ -511,38 +713,20 @@ def train_one_sae(config: TrainingConfig) -> dict:
         log_path.unlink()  # restart fresh -- checkpoints carry their own resume info
     log_file = open(log_path, "a", buffering=1)
 
-    # Seed everything for reproducibility.
-    random.seed(config.seed)
-    np.random.seed(config.seed)
-    torch.manual_seed(config.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(config.seed)
+    _seed_everything(config.seed)
 
-    # Train / validation split by chunk index.
     manifest = json.loads((config.extract_dir / "manifest.json").read_text())
-    n_chunks = manifest["n_chunks"]
-    n_val_chunks = max(1, int(round(config.val_fraction * n_chunks)))
-    rng = random.Random(config.seed)
-    all_chunk_indices = list(range(n_chunks))
-    rng.shuffle(all_chunk_indices)
-    val_chunks = sorted(all_chunk_indices[:n_val_chunks])
-    train_chunks = sorted(all_chunk_indices[n_val_chunks:])
-
+    train_chunks, val_chunks = _split_chunks(manifest, config.val_fraction, config.seed)
     LOG.info(
         "Layer %d, seed %d: %d train chunks, %d val chunks",
         config.target_layer, config.seed, len(train_chunks), len(val_chunks),
     )
 
-    # Determine d_model and first-chunk token count from the v4 layout.
-    first_chunk_meta = manifest["chunks"][train_chunks[0]]
-    layer_key = str(config.target_layer)
-    first_acts_path = config.extract_dir / first_chunk_meta["activations"][layer_key]
-    first_acts = _load_layer_activations(first_acts_path)
-    d_model = first_acts.size(1)
-    del first_acts
+    d_model = _infer_d_model(
+        config.extract_dir, manifest, config.target_layer, train_chunks[0],
+    )
     LOG.info("d_model = %d, d_dict = %d, k = %d", d_model, config.d_dict, config.k)
 
-    # Model and optimizer.
     model = SparseAutoencoder(
         d_model=d_model,
         d_dict=config.d_dict,
@@ -558,27 +742,7 @@ def train_one_sae(config: TrainingConfig) -> dict:
         weight_decay=config.weight_decay,
     )
 
-    # Build loaders once and re-iterate per epoch (the cache, if any, persists).
-    train_dataset = SAETokenDataset(
-        extract_dir=config.extract_dir,
-        target_layer=config.target_layer,
-        batch_size=config.batch_size,
-        chunk_indices=train_chunks,
-        shuffle=True,
-        seed=config.seed,
-        dtype=config.dtype,
-        cache_in_ram=config.cache_in_ram,
-    )
-    val_dataset = SAETokenDataset(
-        extract_dir=config.extract_dir,
-        target_layer=config.target_layer,
-        batch_size=config.batch_size,
-        chunk_indices=val_chunks,
-        shuffle=False,
-        seed=config.seed,
-        dtype=config.dtype,
-        cache_in_ram=config.cache_in_ram,
-    )
+    train_dataset, val_dataset = _build_datasets(config, train_chunks, val_chunks)
 
     # Exact planned step count for the LR scheduler. This uses per-chunk token
     # counts from meta files, so short final chunks and small smoke-test splits
@@ -591,105 +755,28 @@ def train_one_sae(config: TrainingConfig) -> dict:
         train_tokens, steps_per_epoch, total_steps,
     )
 
-    # Training loop.
     step = 0
     training_history: list[dict] = []
     t0 = time.time()
 
     try:
         for epoch in range(config.n_epochs):
-            model.reset_firing_count()
-            epoch_main_loss = 0.0
-            epoch_aux_loss = 0.0
-            epoch_n_batches = 0
+            step, acc = _run_epoch(
+                epoch, step, model, optimizer, config,
+                train_dataset, val_dataset, total_steps, log_file, t0,
+            )
 
-            for batch in train_dataset:
-                x = batch.to(config.device, dtype=config.dtype, non_blocking=True)
-
-                # Update LR.
-                lr_now = cosine_with_warmup_lr(
-                    step, total_steps, config.lr, config.lr_min_ratio, config.warmup_steps,
-                )
-                for pg in optimizer.param_groups:
-                    pg["lr"] = lr_now
-
-                # Forward + loss.
-                out = model.forward_train(x)
-                recon_loss = F.mse_loss(out["x_hat_main"], x)
-                aux_loss = torch.tensor(0.0, device=config.device, dtype=config.dtype)
-                if "x_hat_aux" in out:
-                    aux_loss = F.mse_loss(out["x_hat_aux"], out["x_residual"])
-                loss = recon_loss + config.alpha_aux * aux_loss
-
-                # Backward + step.
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-
-                # Decoder gradient projection (optional) before step.
-                if config.project_grad_to_tangent:
-                    model.project_grad_to_tangent_space()
-
-                # Gradient clipping for stability.
-                if config.grad_clip_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
-
-                optimizer.step()
-
-                # Decoder re-projection to unit norm.
-                model.renormalize_decoder()
-
-                # Stats updates: firing counts and the provisional threshold EMA used
-                # only for mid-training validation (calibrate_threshold sets the final
-                # threshold after training). The EMA needs the BatchTopK boundary,
-                # which is absent only for batches too small to fill k * batch_size.
-                with torch.no_grad():
-                    model.update_firing_count(out["main_mask"])
-                    if "batch_threshold" in out:
-                        model.update_threshold_ema(
-                            out["batch_threshold"], config.threshold_ema_decay,
-                        )
-
-                epoch_main_loss += float(recon_loss.detach())
-                epoch_aux_loss += float(aux_loss.detach())
-                epoch_n_batches += 1
-                step += 1
-
-                # Per-batch logging.
-                if step % config.log_every == 0:
-                    row = {
-                        "step": step,
-                        "epoch": epoch,
-                        "lr": lr_now,
-                        "recon_loss": float(recon_loss.detach()),
-                        "aux_loss": float(aux_loss.detach()),
-                        "elapsed_s": time.time() - t0,
-                    }
-                    log_file.write(json.dumps(row) + "\n")
-
-                # Periodic validation pass.
-                if step % config.val_every == 0:
-                    val_metrics = _validate(model, config, val_dataset)
-                    LOG.info(
-                        "Step %d (epoch %d): recon=%.4f aux=%.4f "
-                        "val_FVE_uncentered=%.4f val_FVE_centered=%.4f val_L0=%.1f dead=%d",
-                        step, epoch, recon_loss.item(), aux_loss.item(),
-                        val_metrics["fve_uncentered"], val_metrics["fve_centered"],
-                        val_metrics["l0_mean"], val_metrics["dead_features"],
-                    )
-
-            # End-of-epoch summary and full validation.
             val_metrics = _validate(model, config, val_dataset)
-            dead = model.dead_feature_count()
             epoch_summary = {
                 "epoch": epoch,
-                "train_recon_loss": epoch_main_loss / max(1, epoch_n_batches),
-                "train_aux_loss": epoch_aux_loss / max(1, epoch_n_batches),
+                "train_recon_loss": acc.mean_main(),
+                "train_aux_loss": acc.mean_aux(),
                 "val_fve": val_metrics["fve"],
                 "val_fve_uncentered": val_metrics["fve_uncentered"],
                 "val_fve_centered": val_metrics["fve_centered"],
                 "val_l0_mean": val_metrics["l0_mean"],
                 "val_dead_features": val_metrics["dead_features"],
-                "train_dead_features": dead,
+                "train_dead_features": model.dead_feature_count(),
                 "elapsed_s": time.time() - t0,
             }
             training_history.append(epoch_summary)
@@ -716,82 +803,89 @@ def train_one_sae(config: TrainingConfig) -> dict:
         log_file.close()
 
 
-# -----------------------------------------------------------------------------
-# Validation
-# -----------------------------------------------------------------------------
+class _ValidationAccumulator:
+    """Streaming accumulators for the validation metrics.
+
+    Sums are kept over all tokens and dimensions so the metrics are exact for any
+    batching, rather than an average of per-batch ratios.
+    """
+
+    def __init__(self, d_dict: int, device: str):
+        self.sq_resid = 0.0
+        self.sq_total = 0.0   # uncentered second moment: sum_{t,d} x^2
+        self.colsum = None    # sum_t x, per hidden dimension, for centered FVE
+        self.sum_l0 = 0.0
+        self.n_tokens = 0
+        self.n_batches = 0
+        self.feature_fire = torch.zeros(d_dict, device=device)
+
+    def add(self, x: torch.Tensor, x_hat: torch.Tensor, features: torch.Tensor) -> None:
+        self.sq_resid += float(((x - x_hat) ** 2).sum().item())
+        self.sq_total += float((x ** 2).sum().item())
+        xs = x.sum(dim=0).to(torch.float64)
+        self.colsum = xs if self.colsum is None else self.colsum + xs
+
+        fired = (features > 0)
+        self.sum_l0 += float(fired.float().sum().item())
+        self.feature_fire += fired.float().sum(dim=0)
+        self.n_tokens += x.size(0)
+        self.n_batches += 1
+
+    def metrics(self) -> dict:
+        """Finalise into the metric dict, including both FVE conventions.
+
+        `fve` is kept as the legacy uncentered fraction of variance explained:
+        1 - SSE / sum(x^2). `fve_centered` is also reported for direct comparison
+        to evaluate.py's phase_1_2["fve_overall"], which uses the centered total
+        sum of squares around the per-dimension validation mean.
+        """
+        mean_energy = (
+            float((self.colsum ** 2).sum().item()) / max(self.n_tokens, 1)
+            if self.colsum is not None else 0.0
+        )
+        ss_tot_centered = max(self.sq_total - mean_energy, 1e-12)
+        fve_uncentered = 1.0 - self.sq_resid / max(self.sq_total, 1e-12)
+
+        return {
+            "fve": fve_uncentered,
+            "fve_uncentered": fve_uncentered,
+            "fve_centered": 1.0 - self.sq_resid / ss_tot_centered,
+            "fve_definition": "legacy_uncentered: 1 - SSE/sum(x^2)",
+            "fve_centered_definition": "1 - SSE/sum((x - mean_validation_activation)^2)",
+            "l0_mean": self.sum_l0 / max(self.n_tokens, 1),
+            "dead_features": int((self.feature_fire == 0).sum().item()),
+            "n_tokens": self.n_tokens,
+        }
+
+
 @torch.no_grad()
 def _validate(
     model: SparseAutoencoder,
     config: TrainingConfig,
-    val_dataset: "SAETokenDataset",
+    val_dataset: SAETokenDataset,
     full: bool = False,
 ) -> dict:
     """Run inference-mode validation and return reconstruction + sparsity metrics.
 
     Takes a prebuilt loader so the (optionally cached) validation activations are
-    loaded once and reused across every validation call.
-
-    `fve` is kept as the legacy uncentered fraction of variance explained:
-    1 - SSE / sum(x^2). `fve_centered` is also reported for direct comparison to
-    evaluate.py's phase_1_2["fve_overall"], which uses the centered total sum of
-    squares around the per-dimension validation mean.
+    loaded once and reused across every validation call. Mid-training calls are
+    capped at QUICK_VALIDATION_BATCHES; pass full=True for the whole split.
     """
     model.eval()
-
-    sq_resid = 0.0
-    sq_total = 0.0  # uncentered second moment: sum_{t,d} x^2
-    colsum = None   # sum_t x, per hidden dimension, for centered FVE
-    sum_l0 = 0.0
-    n_tokens = 0
-    n_batches = 0
-    feature_fire = torch.zeros(model.d_dict, device=config.device)
+    acc = _ValidationAccumulator(model.d_dict, config.device)
 
     for batch in val_dataset:
         x = batch.to(config.device, dtype=config.dtype, non_blocking=True)
         out = model.forward_inference(x)
-        x_hat = out["x_hat"]
-        features = out["features"]
+        acc.add(x, out["x_hat"], out["features"])
 
-        # FVE accumulators: sum over all tokens and dimensions.
-        sq_resid += float(((x - x_hat) ** 2).sum().item())
-        sq_total += float((x ** 2).sum().item())
-        xs = x.sum(dim=0).to(torch.float64)
-        colsum = xs if colsum is None else colsum + xs
-
-        # L0 and firing counts.
-        fired = (features > 0)
-        sum_l0 += float(fired.float().sum().item())
-        feature_fire += fired.float().sum(dim=0)
-        n_tokens += x.size(0)
-        n_batches += 1
-
-        if not full and n_batches >= 8:
-            # Quick validation during training: cap at 8 batches.
+        if not full and acc.n_batches >= QUICK_VALIDATION_BATCHES:
             break
 
     model.train()
-    mean_energy = float((colsum ** 2).sum().item()) / max(n_tokens, 1) if colsum is not None else 0.0
-    ss_tot_centered = max(sq_total - mean_energy, 1e-12)
-    fve_uncentered = 1.0 - sq_resid / max(sq_total, 1e-12)
-    fve_centered = 1.0 - sq_resid / ss_tot_centered
-    l0_mean = sum_l0 / max(n_tokens, 1)
-    dead_features = int((feature_fire == 0).sum().item())
-
-    return {
-        "fve": fve_uncentered,
-        "fve_uncentered": fve_uncentered,
-        "fve_centered": fve_centered,
-        "fve_definition": "legacy_uncentered: 1 - SSE/sum(x^2)",
-        "fve_centered_definition": "1 - SSE/sum((x - mean_validation_activation)^2)",
-        "l0_mean": l0_mean,
-        "dead_features": dead_features,
-        "n_tokens": n_tokens,
-    }
+    return acc.metrics()
 
 
-# -----------------------------------------------------------------------------
-# Checkpoint
-# -----------------------------------------------------------------------------
 def _save_checkpoint(
     model: SparseAutoencoder,
     config: TrainingConfig,
@@ -799,9 +893,9 @@ def _save_checkpoint(
     final_metrics: dict,
     out_dir: Path,
 ) -> None:
-    """Write the final SAE state to checkpoint.pt (schema v4: global JumpReLU threshold)."""
+    """Write the final SAE state to checkpoint.pt."""
     ckpt = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": SAE_SCHEMA_VERSION,
         "config": config.as_jsonable(),
         "target_layer": config.target_layer,
         "seed": config.seed,
@@ -833,18 +927,15 @@ def _save_checkpoint(
     )
 
 
-# -----------------------------------------------------------------------------
-# Checkpoint loading (for downstream consumers)
-# -----------------------------------------------------------------------------
 def load_sae_from_checkpoint(
     checkpoint_path: Path,
     device: str = "cuda",
 ) -> SparseAutoencoder:
-    """Reconstruct an SAE module from a v4 checkpoint, ready for inference."""
+    """Reconstruct an SAE module from a checkpoint, ready for inference."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    if ckpt["schema_version"] != SCHEMA_VERSION:
+    if ckpt["schema_version"] != SAE_SCHEMA_VERSION:
         raise ValueError(
-            f"Schema mismatch: checkpoint={ckpt['schema_version']}, loader={SCHEMA_VERSION}"
+            f"Schema mismatch: checkpoint={ckpt['schema_version']}, loader={SAE_SCHEMA_VERSION}"
         )
 
     model = SparseAutoencoder(
@@ -866,9 +957,8 @@ def load_sae_from_checkpoint(
     return model
 
 
-# -----------------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------------
+# --- CLI ----------------------------------------------------------------------
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--extract-dir", type=Path, required=True,

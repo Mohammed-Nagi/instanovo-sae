@@ -1,129 +1,97 @@
 # Sparse Autoencoders for Interpretability of InstaNovo
 
-Code for the MSc thesis *Sparse Autoencoders for Interpretability of InstaNovo* (Nagi, AIMS South Africa / InstaDeep, 2026).
+Code for the MSc thesis *Sparse Autoencoders for Interpretability of InstaNovo* (Mohammed Esameldin Adam Nagi, AIMS South Africa / InstaDeep, 2026).
 
-Trains sparse autoencoders on the residual-stream activations of [InstaNovo](https://github.com/instadeepai/InstaNovo)'s encoder at four depths, labels every spectral peak with chemical concepts derived from first-principles fragment-ion theory, and tests which learned features correspond to which chemical events — correlationally and causally.
+Sparse autoencoders are trained on the residual-stream activations of [InstaNovo](https://github.com/instadeepai/InstaNovo)'s encoder at four depths. Every spectral peak is labelled with chemical concepts derived from first-principles fragment-ion theory, allowing us to ask which learned features correspond to which chemical events — both correlationally and causally.
 
----
-
-## Pipeline
-
-Four stages. The first two are expensive and reusable across every layer, seed, and SAE width.
-
-```
-                   ┌──────────────────────────────┐
-  spectra ────────▶│ 1. extract.py                │  one forward pass,
-                   │    layers 2, 4, 6, 8         │  all four layers at once
-                   └──────────────┬───────────────┘
-                                  │  activations + metadata   [REUSABLE]
-                   ┌──────────────┴───────────────┐
-                   │                              │
-     ┌─────────────▼──────────────┐  ┌────────────▼─────────────┐
-     │ 2. annotate.py             │  │ 3. train.py              │
-     │    50 concepts, 14 families│  │    one SAE per layer     │
-     │    metadata only, no acts  │  │    BatchTopK + AuxK      │
-     └─────────────┬──────────────┘  └────────────┬─────────────┘
-                   │  concept labels   [REUSABLE]  │  checkpoints
-                   └──────────────┬───────────────┘
-                   ┌──────────────▼───────────────┐
-                   │ 4. evaluate.py               │
-                   │    eight evaluation phases   │
-                   └──────────────────────────────┘
-```
+## Contents
 
 | File | Role | Thesis |
 |---|---|---|
-| `extract.py` | Multi-layer activation extraction, chunked with resume | §3.2 |
-| `annotate.py` | Per-peak fragment-ion annotation, 50 concepts / 14 families | §3.4 |
-| `train.py` | SAE: BatchTopK training, AuxK recovery, JumpReLU inference | §3.3 |
+| `extract.py` | Multi-layer activation extraction (layers 2, 4, 6, 8) | §3.2 |
+| `annotate.py` | Per-peak fragment-ion annotation: 50 concepts, 14 families | §3.4 |
+| `train.py` | Sparse autoencoder: BatchTopK training, AuxK recovery, JumpReLU inference | §3.3 |
 | `evaluate.py` | Eight-phase evaluation suite | §3.5 |
 | `instanovo_io.py` | The single boundary against the InstaNovo API | §3.2 |
-| `run_pipeline.sh` | Orchestration, resume, artefact reuse | Fig. 3.1 |
+| `run_pipeline.sh` | Orchestration with resume and artefact reuse | Fig. 3.1 |
 
----
+InstaNovo itself is installed from PyPI and is not vendored here. Only four upstream symbols are used — `InstaNovo`, `TransformerDataProcessor`, `SpectrumDataFrame`, and `LEGACY_PTM_TO_UNIMOD` — all reached through `instanovo_io.py`.
 
-## Install
+## Pipeline
 
-Requires Python 3.10–3.13. Note the upper bound: `instanovo` declares `<3.14`.
+```
+extract.py  ──▶  one forward pass, all four layers        [reusable]
+                        │
+        ┌───────────────┴───────────────┐
+        ▼                               ▼
+annotate.py                         train.py
+concept labels     [reusable]       one SAE per layer
+        │                               │
+        └───────────────┬───────────────┘
+                        ▼
+                   evaluate.py
+              eight evaluation phases
+```
+
+Extraction and annotation are the expensive stages and are reused across every layer, seed, and SAE width. Every step is idempotent and skips if its output already exists, so the pipeline is safe to interrupt and resume.
+
+## Setup
+
+Requires Python 3.10–3.13. The upper bound matters: `instanovo` declares `<3.14`.
 
 ```bash
-git clone https://github.com/<you>/instanovo-sae.git
+git clone <repository-url>
 cd instanovo-sae
 
-# GPU
-uv sync --extra cu126
-
-# CPU only (Phases 1-6 and annotation; extraction will be very slow)
-uv sync --extra cpu
+uv python install 3.13
+uv sync --extra cu126     # GPU;  use --extra cpu for CPU-only
 ```
 
-With pip instead of uv:
+Verify the install:
 
 ```bash
-pip install -e ".[cu126]"
+uv run python -c "import instanovo_io, extract, annotate, train, evaluate; print('imports OK')"
 ```
 
-`instanovo` is installed from PyPI — this repository deliberately does not vendor it. The only upstream symbols used are `InstaNovo`, `TransformerDataProcessor`, `SpectrumDataFrame`, and `LEGACY_PTM_TO_UNIMOD`, all reached through `instanovo_io.py`.
+You also need an InstaNovo model checkpoint. Obtain it from the [InstaNovo project](https://github.com/instadeepai/InstaNovo) and point `MODEL_PATH` at it; the pipeline defaults to `./instanovo_v1.1.0.ckpt`.
 
-### Model checkpoint
+## Running
 
-Download the InstaNovo v1.1.0 checkpoint from the [InstaNovo releases](https://github.com/instadeepai/InstaNovo) and point `MODEL_PATH` at it. The pipeline defaults to `./instanovo_v1.1.0.ckpt`.
+`run_pipeline.sh` is a bash script. On Windows, use WSL or Git Bash.
 
----
-
-## Run
-
-Start with the smoke test — a few hundred spectra, end to end, in minutes:
+Smoke test first — a few hundred spectra, end to end, in minutes:
 
 ```bash
 SMOKE_TEST=1 MODEL_PATH=/path/to/instanovo_v1.1.0.ckpt ./run_pipeline.sh
 ```
 
-Full run over the nine-species benchmark (all four layers):
+Full run over the nine-species benchmark:
 
 ```bash
 MODEL_PATH=/path/to/instanovo_v1.1.0.ckpt ./run_pipeline.sh
 ```
 
-Useful variants:
+Common variants:
 
 ```bash
-LAYERS_OVERRIDE="8"   MODEL_PATH=... ./run_pipeline.sh   # single layer
-DATASET_PATH=/data/combined.parquet MODEL_PATH=... ./run_pipeline.sh   # skip the merge
-SKIP_TRAIN=1          MODEL_PATH=... ./run_pipeline.sh   # evaluate existing checkpoints
-OUTPUT_ROOT=/mnt/ssd/sae MODEL_PATH=... ./run_pipeline.sh
+LAYERS_OVERRIDE="8"                  # single layer
+DATASET_PATH=/data/combined.parquet  # skip the dataset merge
+SKIP_TRAIN=1                         # evaluate existing checkpoints
+OUTPUT_ROOT=/mnt/ssd/sae             # write artefacts elsewhere
+KEEP_CHUNKS=0                        # delete activations after the run
 ```
 
-`run_pipeline.sh` is a bash script. On Windows use WSL or Git Bash.
+### Which phases need the model
 
-### What needs the model, and what doesn't
-
-| Phase | Needs `MODEL_PATH` |
-|---|---|
-| 1–2 Reconstruction, sparsity | No |
-| 3 Top-activating tokens | No |
-| 4 Feature–concept associations | No |
-| 5 Dictionary geometry | No |
-| 6 Threshold sweep | No |
-| 7 Loss recovered | **Yes** |
-| 8 Causal ablation | **Yes** |
-
-Phases 1–6 run from cached chunks alone, so a collaborator can do substantial work without the checkpoint. `evaluate.py` imports `instanovo_io` lazily for exactly this reason.
-
----
+Phases 1–6 (reconstruction, sparsity, top-activating tokens, feature–concept associations, dictionary geometry, threshold sweep) run from cached chunks alone. Phases 7 and 8 (loss recovered, causal ablation) require `MODEL_PATH`. `evaluate.py` imports the model lazily so the earlier phases work without it.
 
 ## Scale
 
-The nine-species benchmark is 639,286 spectra, giving roughly 67.5 million encoder tokens **per layer**.
+The nine-species benchmark contains 639,286 spectra, giving roughly 67.5 million encoder tokens per layer.
 
-- Disk: allow ~1.5 TB SSD for activation chunks across four layers.
-- Extraction is the dominant cost and runs once. `KEEP_CHUNKS=1` (the default) preserves it; set `KEEP_CHUNKS=0` only if genuinely short on disk.
-- Annotation is layer-independent and dataset-fixed. `KEEP_ANNOTATION=1` by default.
-- SAE training: `F = 12,288` features (16× expansion of `d_model = 768`), `k = 32`, 3 epochs.
-
-Every step is idempotent and skips if its sentinel output exists, so the pipeline is safe to kill and resume.
-
----
+- Allow about 1.5 TB of SSD for activation chunks across four layers.
+- SAE configuration: `F = 12,288` features (16× expansion of `d_model = 768`), `k = 32`, 3 epochs.
+- Extraction dominates runtime and runs once; `KEEP_CHUNKS=1` (the default) preserves it.
 
 ## Outputs
 
@@ -140,8 +108,6 @@ $OUTPUT_ROOT/
 ```
 
 None of this is committed; see `.gitignore`.
-
----
 
 ## Citation
 

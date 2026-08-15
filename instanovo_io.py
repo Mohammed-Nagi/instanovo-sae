@@ -2,18 +2,20 @@
 the InstaNovo repository.
 
 Every repo-facing call lives here, so there is exactly ONE place to keep in
-sync with InstaNovo's Python API. This exists because the pipeline scripts were
-originally written against an assumed API that did not match the real repo;
-this module is the corrected, repo-grounded version.
+sync with InstaNovo's Python API. The rest of the pipeline imports this module
+and never touches `instanovo.*` directly, which is what lets the pipeline live
+outside the InstaNovo repo and depend on it as an ordinary package.
 
-All function bodies below are grounded in the InstaNovo-internal source:
+Only four upstream symbols are used, all imported below:
+    InstaNovo, TransformerDataProcessor, SpectrumDataFrame, LEGACY_PTM_TO_UNIMOD
+
+All function bodies below are grounded in the InstaNovo source:
   - transformer/model.py   InstaNovo.load / from_pretrained / forward / encoder
   - transformer/data.py    TransformerDataProcessor
   - transformer/train.py   the canonical loss computation
   - utils/data_handler.py  SpectrumDataFrame.load / to_dataset
   - common/dataset.py      DataProcessor.collate_fn
   - utils/residues.py      ResidueSet (PAD/SOS/EOS, decode)
-
 """
 from __future__ import annotations
 
@@ -44,10 +46,57 @@ LOG = logging.getLogger("instanovo_io")
 # PAD index is 0 in the residue vocabulary; train.py uses CrossEntropyLoss(ignore_index=0).
 PAD_INDEX = 0
 
+# Peaks retained per spectrum by TransformerDataProcessor. Extraction and the
+# Phase 7/8 re-run loader MUST agree on this: it determines how many peak tokens
+# each spectrum contributes, so a mismatch silently misaligns per-spectrum CE
+# against the per-spectrum concept prevalence computed from the chunks.
+DEFAULT_N_PEAKS = 200
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Model loading
-# ─────────────────────────────────────────────────────────────────────────────
+
+# --- Model loading ------------------------------------------------------------
+
+def _disable_nested_tensor_fastpath(model: InstaNovo) -> None:
+    """Turn off the encoder's nested-tensor fast path.
+
+    In eval mode with a padding mask, nn.TransformerEncoder otherwise packs the
+    batch into a NestedTensor, so every encoder layer outputs a NestedTensor with
+    padding stripped — it has no .shape and breaks the SAE hook's [B, seq, D]
+    per-token assumption (capture in extract, substitution in evaluate). The fast
+    path is a pure optimisation, so disabling it leaves the real-token
+    activations numerically identical.
+    """
+    encoder = getattr(model, "encoder", None)
+    if encoder is None:
+        return
+    for attr in ("enable_nested_tensor", "use_nested_tensor"):
+        if hasattr(encoder, attr):
+            setattr(encoder, attr, False)
+
+
+def _apply_residue_remapping(model: InstaNovo, config: Any) -> None:
+    """Teach the residue set the dataset's modification notation.
+
+    The nine-species benchmark writes mods as "(+15.99)" etc., which the bare
+    ResidueSet vocabulary does not contain, so encoding a modified peptide would
+    raise KeyError. InstaNovo's own inference path does the same step
+    (common/predictor.py:107: residue_set.update_remapping(...)). The legacy
+    (+mass) table is applied plus any remapping carried in the checkpoint config.
+    """
+    if not hasattr(model.residue_set, "update_remapping"):
+        return
+
+    remapping: dict[str, str] = dict(LEGACY_PTM_TO_UNIMOD)
+    try:
+        cfg_remap = config.get("residue_remapping", None) if hasattr(config, "get") else None
+        if cfg_remap:
+            remapping.update(dict(cfg_remap))
+    except Exception:  # pragma: no cover - config shape varies across versions
+        pass
+
+    if remapping:
+        model.residue_set.update_remapping(remapping)
+
+
 def load_instanovo(
     source: str | Path,
     device: str = "cuda",
@@ -77,36 +126,21 @@ def load_instanovo(
         model, config = InstaNovo.load(str(source))
     model.eval().to(device)
 
-    # Disable the encoder's nested-tensor fast path. In eval mode with a padding
-    # mask, nn.TransformerEncoder otherwise packs the batch into a NestedTensor, so
-    # every encoder layer outputs a NestedTensor with padding stripped — it has no
-    # .shape and breaks the SAE hook's [B, seq, D] per-token assumption (capture in
-    # extract, substitution in evaluate). The fast path is a pure optimisation, so
-    # disabling it leaves the real-token activations numerically identical.
-    encoder = getattr(model, "encoder", None)
-    if encoder is not None:
-        for attr in ("enable_nested_tensor", "use_nested_tensor"):
-            if hasattr(encoder, attr):
-                setattr(encoder, attr, False)
-
-    # Make the residue set able to encode dataset peptide notations. The
-    # nine-species benchmark writes mods as "(+15.99)" etc., which the bare
-    # ResidueSet vocabulary does not contain, so encoding a modified peptide
-    # would raise KeyError. InstaNovo's own inference path does the same step
-    # (common/predictor.py:107: residue_set.update_remapping(...)). We apply the
-    # legacy (+mass) table plus any remapping carried in the checkpoint config.
-    if hasattr(model.residue_set, "update_remapping"):
-        remapping: dict[str, str] = dict(LEGACY_PTM_TO_UNIMOD)
-        try:
-            cfg_remap = config.get("residue_remapping", None) if hasattr(config, "get") else None
-            if cfg_remap:
-                remapping.update(dict(cfg_remap))
-        except Exception:  # pragma: no cover - config shape varies across versions
-            pass
-        if remapping:
-            model.residue_set.update_remapping(remapping)
+    _disable_nested_tensor_fastpath(model)
+    _apply_residue_remapping(model, config)
 
     return model, config, model.residue_set
+
+
+def uses_flash_attention(model: InstaNovo) -> bool:
+    """Whether this checkpoint bypasses the standard encoder stack.
+
+    Flash attention does not run nn.TransformerEncoder's layer modules, so the
+    SAE hooks would never fire: extraction would capture nothing, and Phase 7/8
+    substitution would silently be a no-op (loss_recovered ~1, all delta-CE ~0)
+    rather than an error. Both extract.py and evaluate.py check this before use.
+    """
+    return bool(getattr(model, "use_flash_attention", False))
 
 
 def get_encoder_layer(model: InstaNovo, layer_idx: int) -> torch.nn.Module:
@@ -120,9 +154,8 @@ def get_encoder_layer(model: InstaNovo, layer_idx: int) -> torch.nn.Module:
     return model.encoder.layers[layer_idx]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Data loading
-# ─────────────────────────────────────────────────────────────────────────────
+# --- Data loading -------------------------------------------------------------
+
 def load_spectrum_dataframe(
     source: str | Path,
     annotated: bool = True,
@@ -154,7 +187,7 @@ def make_dataloader(
     residue_set: Any,
     batch_size: int = 64,
     num_workers: int = 4,
-    n_peaks: int = 200,
+    n_peaks: int = DEFAULT_N_PEAKS,
     annotated: bool = True,
     in_memory: bool = True,
     metadata_columns: list[str] | None = None,
@@ -171,6 +204,12 @@ def make_dataloader(
     Batches are dicts with the keys InstaNovo.forward expects:
         spectra, precursors, peptides, spectra_mask, peptides_mask
     (see transformer/train.py:149-155).
+
+    n_peaks caps the peaks kept per spectrum and therefore the number of peak
+    tokens each spectrum contributes. Every consumer in the pipeline must use
+    the SAME value: extraction's token count is what the annotation labels and
+    SAE activations are indexed against, and Phase 7/8 compare per-spectrum CE
+    from a re-run loader against per-spectrum prevalence from those chunks.
 
     NOTE: TransformerDataProcessor reverses the peptide by default
     (reverse_peptide=True, data.py:36) because InstaNovo decodes C->N. The
@@ -198,9 +237,8 @@ def make_dataloader(
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Forward pass + loss (the computation from transformer/train.py)
-# ─────────────────────────────────────────────────────────────────────────────
+# --- Forward pass + loss (the computation from transformer/train.py) ----------
+
 def model_forward_logits(
     model: InstaNovo,
     batch: dict,
@@ -244,16 +282,20 @@ def per_token_ce_and_top1(
     per-token cross-entropy (0 where PAD), valid_mask marks non-PAD targets.
     """
     targets = peptides.to(logits.device)
-    B, Tp1, V = logits.shape
+    vocab_size = logits.shape[-1]
     preds = logits[:, :-1, :]                       # [B, T, V] — drop trailing position
+
+    # Defensive length alignment: truncate both sides to the shorter length so a
+    # collator that pads targets differently degrades to a shorter aligned
+    # prefix rather than a silent off-by-one against the residues.
     T = preds.shape[1]
-    if targets.shape[1] != T:                       # defensive length alignment
+    if targets.shape[1] != T:
         T = min(T, targets.shape[1])
         preds = preds[:, :T, :]
         targets = targets[:, :T]
 
     ce_flat = F.cross_entropy(
-        preds.reshape(-1, V),
+        preds.reshape(-1, vocab_size),
         targets.reshape(-1),
         ignore_index=pad_index,
         reduction="none",
@@ -265,26 +307,3 @@ def per_token_ce_and_top1(
     # at 0 already, but make it explicit for safe summation downstream).
     ce = ce * valid
     return ce, top1, targets, valid
-
-
-def sequence_ce_and_correct(
-    model: InstaNovo,
-    batch: dict,
-    device: str,
-    pad_index: int = PAD_INDEX,
-) -> tuple[float, int, int]:
-    """Convenience: forward a batch and return
-    (summed per-token CE over valid tokens, #correct top-1, #valid tokens).
-
-    This is the building block for Phase 7 (loss recovered) and Phase 8
-    (causal ablation) once a SAE-substitution hook is installed on
-    get_encoder_layer(model, target_layer). Install the hook, call this,
-    remove the hook; the difference vs the un-hooked baseline is the effect.
-    """
-    with torch.no_grad():
-        logits = model_forward_logits(model, batch, device)
-        ce, top1, targets, valid = per_token_ce_and_top1(logits, batch["peptides"], pad_index)
-        ce_sum = float(ce.sum().item())
-        correct = int(((top1 == targets) & valid).sum().item())
-        n_valid = int(valid.sum().item())
-    return ce_sum, correct, n_valid

@@ -12,31 +12,16 @@ Sparse autoencoders are trained on the residual-stream activations of [InstaNovo
 | `annotate.py` | Per-peak fragment-ion annotation: 50 concepts, 14 families | §3.4 |
 | `train.py` | Sparse autoencoder: BatchTopK training, AuxK recovery, JumpReLU inference | §3.3 |
 | `evaluate.py` | Eight-phase evaluation suite | §3.5 |
+| `interpret.py` | LLM-assisted feature description, validated by held-out activation prediction | §5.3.1 |
 | `instanovo_io.py` | The single boundary against the InstaNovo API | §3.2 |
-| `schema.py` | On-disk schema versions shared by all four stages | — |
+| `schema.py` | On-disk schema versions shared across the pipeline | — |
 | `run_pipeline.sh` | Orchestration with resume and artefact reuse | Fig. 3.1 |
+
+The pipeline runs in four stages — extract, annotate, train, evaluate — orchestrated by `run_pipeline.sh`. Extraction and annotation are the expensive one-off stages and are reused across every layer, seed, and SAE width. Every step is idempotent and skips if its output already exists, so the pipeline is safe to interrupt and resume. `interpret.py` is a separate step run after evaluation.
 
 InstaNovo itself is installed from PyPI and is not vendored here. Only four upstream symbols are used — `InstaNovo`, `TransformerDataProcessor`, `SpectrumDataFrame`, and `LEGACY_PTM_TO_UNIMOD` — all reached through `instanovo_io.py`.
 
-Each stage records a schema version in the artefacts it writes, and each consumer rejects an artefact whose version it does not expect. Because the pipeline caches expensive intermediates and reuses them across runs, this is what turns a stale-artefact mistake into an error rather than silently wrong numbers.
-
-## Pipeline
-
-```
-extract.py  ──▶  one forward pass, all four layers        [reusable]
-                        │
-        ┌───────────────┴───────────────┐
-        ▼                               ▼
-annotate.py                         train.py
-concept labels     [reusable]       one SAE per layer
-        │                               │
-        └───────────────┬───────────────┘
-                        ▼
-                   evaluate.py
-              eight evaluation phases
-```
-
-Extraction and annotation are the expensive one-off stages and are reused across every layer, seed, and SAE width. Every step is idempotent and skips if its output already exists, so the pipeline is safe to interrupt and resume.
+Each stage records a schema version in the artefacts it writes, and each consumer rejects an artefact whose version it does not expect. Because the pipeline caches expensive intermediates and reuses them across runs, this turns a stale-artefact mistake into an error rather than silently wrong numbers.
 
 ## Setup
 
@@ -56,22 +41,31 @@ Verify the install:
 uv run python -c "import instanovo_io, extract, annotate, train, evaluate; print('imports OK')"
 ```
 
-You also need an InstaNovo model checkpoint. Obtain it from the [InstaNovo project](https://github.com/instadeepai/InstaNovo) and point `MODEL_PATH` at it; the pipeline defaults to `./instanovo_v1.1.0.ckpt`.
+`MODEL_PATH` accepts either a local `.ckpt` path or a pretrained model id, which InstaNovo resolves and caches on first use:
+
+```bash
+MODEL_PATH=instanovo-v1.1.0        # downloaded automatically
+MODEL_PATH=/path/to/model.ckpt     # local checkpoint
+```
+
+Ids come from InstaNovo's `models.json` — `instanovo-v1.1.0` (used for the thesis), `instanovo-v1.2.0`, and `instanovo-phospho-v1.0.0`. Anything ending in `.ckpt` or containing a path separator is treated as a file; everything else as an id.
+
+Copy `.env.example` to `.env` for the optional settings and, if you plan to run `interpret.py`, the API key. `.env` is gitignored and must never be committed.
 
 ## Running
 
-`run_pipeline.sh` is a bash script. On Windows, use WSL or Git Bash.
+`run_pipeline.sh` is a bash script. On Windows, use Git Bash or WSL.
 
 Smoke test first — a few thousand spectra, end to end, in minutes:
 
 ```bash
-SMOKE_TEST=1 MODEL_PATH=/path/to/instanovo_v1.1.0.ckpt ./run_pipeline.sh
+SMOKE_TEST=1 MODEL_PATH=instanovo-v1.1.0 ./run_pipeline.sh
 ```
 
 Full run over the nine-species benchmark:
 
 ```bash
-MODEL_PATH=/path/to/instanovo_v1.1.0.ckpt ./run_pipeline.sh
+MODEL_PATH=instanovo-v1.1.0 ./run_pipeline.sh
 ```
 
 Common variants:
@@ -88,7 +82,7 @@ Layers are independent. Once extraction and annotation are done, training and ev
 
 ### Evaluation phases
 
-Phases 1–6 (reconstruction, sparsity, top-activating tokens, feature–concept associations, dictionary geometry, threshold sweep) run from the cached chunks alone. Phases 7 and 8 need `MODEL_PATH`, and `evaluate.py` imports the model lazily so the earlier phases work without it.
+Phases 1–6 run from the cached chunks alone. Phases 7 and 8 need `MODEL_PATH`, and `evaluate.py` imports the model lazily so the earlier phases work without it.
 
 Phase definitions in `evaluate.py` are ordered to follow the thesis results chapter:
 
@@ -112,6 +106,32 @@ RUN_PHASE_8=1 ABLATION_PER_FEATURE_TOP=20 MODEL_PATH=... ./run_pipeline.sh
 ```
 
 `ABLATION_PER_FEATURE_TOP` accounts for ~94% of Phase 8; lowering it trades per-feature resolution for wall-clock and leaves the group-level causal metrics unchanged.
+
+### LLM-assisted interpretation
+
+`interpret.py` adapts the automated feature-description pipeline of InterPLM (Simon and Zou, 2025) to this setting. It reads an existing evaluation directory and needs `OPENAI_API_KEY` in `.env` or the environment; no other stage needs an API key.
+
+```bash
+uv add openai
+
+python interpret.py \
+  --eval-dir        $OUTPUT_ROOT/sae/layer_2/seed_0/eval \
+  --extract-dir     $OUTPUT_ROOT/extract \
+  --annotation-dir  $OUTPUT_ROOT/annotation \
+  --sae-checkpoint  $OUTPUT_ROOT/sae/layer_2/seed_0/checkpoint.pt \
+  --output-dir      $OUTPUT_ROOT/interpret/layer_2 \
+  --target-layer    2
+```
+
+`--dry-run` builds the prompts without calling the API. Three feature strata are interpreted, selected with `--strata`:
+
+| Stratum | Features | Purpose |
+|---|---|---|
+| `concept` | strongest BH-significant concept association | Positive control: the chemistry is already known, so recovering it validates the pipeline |
+| `unlabelled` | no significant concept at all | Discovery set: the features the registry cannot describe |
+| `causal` | implicated by the Phase 8 ablations | Asks whether causally necessary features have describable structure |
+
+Concept labels are withheld from the prompt by default, so any chemistry the model names is inferred from the spectra alone; `--include-concept-labels` overrides this. Each description is scored the way InterPLM scores them: a held-out set of examples is shown without activations, the model predicts each one, and the Pearson correlation against the measured values is reported. The `causal` stratum requires Phase 8 to have run.
 
 ## Scale
 
@@ -137,17 +157,21 @@ $OUTPUT_ROOT/
 │   ├── annotation_manifest.json     registry, base rates, vocabularies
 │   ├── concept_phi.pt               concept–concept correlation matrix
 │   └── labels/                      one LabelChunkData per chunk
-└── sae/
-    └── layer_{L}/seed_{S}/
-        ├── checkpoint.pt
-        ├── training_log.jsonl
-        └── eval/
-            ├── report.json                     all phase outputs
-            ├── per_feature_stats.csv
-            ├── feature_label_associations.csv
-            ├── top_activating_tokens.csv
-            ├── causal_ablation.csv
-            └── cross_layer_matches.csv
+├── sae/
+│   └── layer_{L}/seed_{S}/
+│       ├── checkpoint.pt
+│       ├── training_log.jsonl
+│       └── eval/
+│           ├── report.json          all phase outputs
+│           ├── per_feature_stats.csv
+│           ├── feature_label_associations.csv
+│           ├── top_activating_tokens.csv
+│           ├── causal_ablation.csv
+│           └── cross_layer_matches.csv
+└── interpret/
+    └── layer_{L}/
+        ├── feature_descriptions.csv    stratum, summary, prediction r
+        └── feature_descriptions.json   full descriptions and predictions
 ```
 
 The run ends with a cross-layer summary table printed to the log. None of these artefacts is committed; see `.gitignore`.
@@ -163,7 +187,7 @@ The run ends with a cross-layer summary table printed to the log. None of these 
 }
 ```
 
-Built on InstaNovo (Eloff et al., *Nature Machine Intelligence* 7:565–579, 2025) and evaluated on the nine-species benchmark (Wen and Noble, *Scientific Data* 11, 2024).
+Built on InstaNovo (Eloff et al., *Nature Machine Intelligence* 7:565–579, 2025) and evaluated on the nine-species benchmark (Wen and Noble, *Scientific Data* 11, 2024). The interpretation step follows InterPLM (Simon and Zou, *Nature Methods* 22:2107–2117, 2025).
 
 ## License
 

@@ -210,11 +210,23 @@ for f in "$EXTRACT_PY" "$ANNOTATE_PY" "$TRAIN_PY" "$EVALUATE_PY"; do
     [[ -f "$f" ]] || { echo "ERROR: Missing pipeline script: $f" >&2; exit 1; }
 done
 
-if [[ ! -f "$MODEL_PATH" ]]; then
-    echo "ERROR: MODEL_PATH not found: $MODEL_PATH" >&2
-    echo "       Set MODEL_PATH=/path/to/instanovo.ckpt before running." >&2
-    exit 1
-fi
+# MODEL_PATH may be a local .ckpt path OR a pretrained model id (e.g.
+# "instanovo-v1.1.0"), which instanovo_io resolves via InstaNovo.from_pretrained
+# and downloads into InstaNovo's cache on first use. Only the path form is
+# checked here, using the same path-vs-id rule instanovo_io applies.
+case "$MODEL_PATH" in
+    *.ckpt|*/*|*\\*)
+        if [[ ! -f "$MODEL_PATH" ]]; then
+            echo "ERROR: MODEL_PATH not found: $MODEL_PATH" >&2
+            echo "       Set MODEL_PATH=/path/to/instanovo.ckpt, or use a model id" >&2
+            echo "       such as MODEL_PATH=instanovo-v1.1.0 to download automatically." >&2
+            exit 1
+        fi
+        ;;
+    *)
+        log_model_note="(pretrained id -- resolved and cached by InstaNovo on first use)"
+        ;;
+esac
 if [[ "$MAX_SPECTRA" != "0" && $((MAX_SPECTRA % EXTRACT_BATCH_SIZE)) -ne 0 ]]; then
     echo "ERROR: MAX_SPECTRA ($MAX_SPECTRA) must be 0 or a multiple of EXTRACT_BATCH_SIZE ($EXTRACT_BATCH_SIZE)." >&2
     echo "       Extraction processes whole DataLoader batches; choose a batch-aligned cap." >&2
@@ -340,7 +352,7 @@ log "  Script dir      : $SCRIPT_DIR"
 log "  Output root     : $OUTPUT_ROOT"
 log "  Layers          : ${LAYERS[*]}  (seed $SEED)"
 log "  Dataset         : ${DATASET_PATH:-$DATASET_HF_ID (all splits merged)}"
-log "  Model           : $MODEL_PATH"
+log "  Model           : $MODEL_PATH ${log_model_note:-}"
 log "  Extract dtype   : $EXTRACT_DTYPE  (chunk $CHUNK_SIZE, batch $EXTRACT_BATCH_SIZE, n_peaks $N_PEAKS)"
 log "  Annotate        : ion_types=$ION_TYPES, tol=${FRAGMENT_TOL} ${FRAGMENT_TOL_MODE}"
 log "  SAE config      : d_dict=$D_DICT (${EXPANSION_FACTOR}x), k=$K, k_aux=$K_AUX"

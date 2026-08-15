@@ -97,10 +97,21 @@ def _apply_residue_remapping(model: InstaNovo, config: Any) -> None:
         model.residue_set.update_remapping(remapping)
 
 
+def looks_like_model_id(source: str | Path) -> bool:
+    """Whether `source` is a pretrained model id rather than a checkpoint path.
+
+    Mirrors InstaNovo.from_pretrained's own rule (transformer/model.py): anything
+    containing a path separator or ending in .ckpt is a local file; everything
+    else (e.g. "instanovo-v1.1.0") is an id to resolve and download.
+    """
+    s = str(source)
+    return not (s.endswith(".ckpt") or "/" in s or "\\" in s)
+
+
 def load_instanovo(
     source: str | Path,
     device: str = "cuda",
-    by_id: bool = False,
+    by_id: bool | None = None,
 ) -> tuple[InstaNovo, Any, Any]:
     """Load InstaNovo and return (model, config, residue_set).
 
@@ -115,12 +126,19 @@ def load_instanovo(
         residue_set property                                          (line 114)
 
     Args:
-        source:  local checkpoint path (by_id=False) or a model id like
-                 "instanovo-v1.1.0" (by_id=True).
+        source:  local checkpoint path, or a model id like "instanovo-v1.1.0"
+                 which from_pretrained resolves against InstaNovo's models.json
+                 and downloads into its cache on first use.
         device:  torch device string.
-        by_id:   use from_pretrained() instead of load().
+        by_id:   force the id (True) or path (False) route. The default, None,
+                 detects it from `source` the same way InstaNovo itself does,
+                 so callers can accept either form without branching.
     """
+    if by_id is None:
+        by_id = looks_like_model_id(source)
+
     if by_id:
+        LOG.info("Resolving pretrained InstaNovo model id %r", str(source))
         model, config = InstaNovo.from_pretrained(str(source))
     else:
         model, config = InstaNovo.load(str(source))

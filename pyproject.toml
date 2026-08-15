@@ -22,6 +22,7 @@ dependencies = [
     "scipy>=1.11",            # scipy.stats.chi2            (evaluate.py)
     "spectrum-utils>=0.4.2",  # theoretical fragment ions   (annotate.py)
     "datasets>=3.5.0",        # nine-species split merge    (run_pipeline.sh)
+    "openai>=3.1.0",
 ]
 
 # torch is exposed through mutually exclusive extras so a CPU install does not

@@ -8,14 +8,14 @@ Sparse autoencoders are trained on the residual-stream activations of [InstaNovo
 
 | File | Role | Thesis |
 |---|---|---|
+| `run_pipeline.sh` | Orchestration with resume and artefact reuse | Fig. 3.1 |
+| `instanovo_io.py` | The single boundary against the InstaNovo API | §3.2 |
 | `extract.py` | Multi-layer activation extraction (layers 2, 4, 6, 8) | §3.2 |
-| `annotate.py` | Per-peak fragment-ion annotation: 50 concepts, 14 families | §3.4 |
 | `train.py` | Sparse autoencoder: BatchTopK training, AuxK recovery, JumpReLU inference | §3.3 |
+| `annotate.py` | Per-peak fragment-ion annotation: 50 concepts, 14 families | §3.4 |
 | `evaluate.py` | Eight-phase evaluation suite | §3.5 |
 | `interpret.py` | LLM-assisted feature description, validated by held-out activation prediction | §5.3.1 |
-| `instanovo_io.py` | The single boundary against the InstaNovo API | §3.2 |
 | `schema.py` | On-disk schema versions shared across the pipeline | — |
-| `run_pipeline.sh` | Orchestration with resume and artefact reuse | Fig. 3.1 |
 
 The pipeline runs in four stages — extract, annotate, train, evaluate — orchestrated by `run_pipeline.sh`. Extraction and annotation are the expensive one-off stages and are reused across every layer, seed, and SAE width. Every step is idempotent and skips if its output already exists, so the pipeline is safe to interrupt and resume. `interpret.py` is a separate step run after evaluation.
 

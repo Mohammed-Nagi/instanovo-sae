@@ -1,21 +1,19 @@
-# Sparse Autoencoders for Interpretability of InstaNovo
-
-Code for the MSc thesis *Sparse Autoencoders for Interpretability of InstaNovo* (Mohammed Esameldin Adam Nagi, AIMS South Africa / InstaDeep, 2026).
+# Sparse Autoencoder Interpretability Pipeline for InstaNovo
 
 Sparse autoencoders are trained on the residual-stream activations of [InstaNovo](https://github.com/instadeepai/InstaNovo)'s encoder at four depths. Every spectral peak is labelled with chemical concepts derived from first-principles fragment-ion theory, allowing us to ask which learned features correspond to which chemical events — both correlationally and causally.
 
 ## Contents
 
-| File | Role | Thesis |
-|---|---|---|
-| `run_pipeline.sh` | Orchestration with resume and artefact reuse | Fig. 3.1 |
-| `instanovo_io.py` | The single boundary against the InstaNovo API | §3.2 |
-| `extract.py` | Multi-layer activation extraction (layers 2, 4, 6, 8) | §3.2 |
-| `train.py` | Sparse autoencoder: BatchTopK training, AuxK recovery, JumpReLU inference | §3.3 |
-| `annotate.py` | Per-peak fragment-ion annotation: 50 concepts, 14 families | §3.4 |
-| `evaluate.py` | Eight-phase evaluation suite | §3.5 |
-| `interpret.py` | LLM-assisted feature description, validated by held-out activation prediction | §5.3.1 |
-| `schema.py` | On-disk schema versions shared across the pipeline | — |
+| File | Role |
+|---|---|
+| `run_pipeline.sh` | Orchestration with resume and artefact reuse |
+| `instanovo_io.py` | The single boundary against the InstaNovo API |
+| `extract.py` | Multi-layer activation extraction (layers 2, 4, 6, 8) |
+| `train.py` | Sparse autoencoder: BatchTopK training, AuxK recovery, JumpReLU inference |
+| `annotate.py` | Per-peak fragment-ion annotation: 50 concepts, 14 families |
+| `evaluate.py` | Eight-phase evaluation suite |
+| `interpret.py` | LLM-assisted feature description, validated by held-out activation prediction |
+| `schema.py` | On-disk schema versions shared across the pipeline |
 
 The pipeline runs in four stages — extract, annotate, train, evaluate — orchestrated by `run_pipeline.sh`. Extraction and annotation are the expensive one-off stages and are reused across every layer, seed, and SAE width. Every step is idempotent and skips if its output already exists, so the pipeline is safe to interrupt and resume. `interpret.py` is a separate step run after evaluation.
 
@@ -48,7 +46,7 @@ MODEL_PATH=instanovo-v1.1.0        # downloaded automatically
 MODEL_PATH=/path/to/model.ckpt     # local checkpoint
 ```
 
-Ids come from InstaNovo's `models.json` — `instanovo-v1.1.0` (used for the thesis), `instanovo-v1.2.0`, and `instanovo-phospho-v1.0.0`. Anything ending in `.ckpt` or containing a path separator is treated as a file; everything else as an id.
+Ids come from InstaNovo's `models.json` — `instanovo-v1.1.0` (used in our experiments), `instanovo-v1.2.0`, and `instanovo-phospho-v1.0.0`. Anything ending in `.ckpt` or containing a path separator is treated as a file; everything else as an id.
 
 Copy `.env.example` to `.env` for the optional settings and, if you plan to run `interpret.py`, the API key. `.env` is gitignored and must never be committed.
 
@@ -84,18 +82,18 @@ Layers are independent. Once extraction and annotation are done, training and ev
 
 Phases 1–6 run from the cached chunks alone. Phases 7 and 8 need `MODEL_PATH`, and `evaluate.py` imports the model lazily so the earlier phases work without it.
 
-Phase definitions in `evaluate.py` are ordered to follow the thesis results chapter:
+Phase definitions in `evaluate.py` are ordered to follow the results section of the accompanying paper:
 
-| Phase | Thesis |
-|---|---|
-| 1+2 reconstruction and sparsity | §4.1.1, §4.2.1 |
-| 6 threshold sweep | §4.1.2 (Figure 4.1) |
-| 5 dictionary geometry | §4.2.2 (Table 4.3) |
-| 3 top-activating tokens | §4.3 |
-| 4 feature–concept associations | §4.3 (Tables 4.4–4.5) |
-| 7 loss recovered | §4.4 (Table 4.6) |
-| cross-layer matching | §4.5 (Table 4.7) |
-| 8 causal ablation | §4.6 |
+| Phase |
+|---|
+| 1+2 reconstruction and sparsity |
+| 6 threshold sweep |
+| 5 dictionary geometry |
+| 3 top-activating tokens |
+| 4 feature–concept associations |
+| 7 loss recovered |
+| cross-layer matching |
+| 8 causal ablation |
 
 Execution order differs: Phase 8 and the cross-layer/cross-seed checks all consume Phase 4's output, so Phase 4 runs before them.
 
@@ -178,14 +176,7 @@ The run ends with a cross-layer summary table printed to the log. None of these 
 
 ## Citation
 
-```bibtex
-@mastersthesis{nagi2026sae,
-  title  = {Sparse Autoencoders for Interpretability of InstaNovo},
-  author = {Nagi, Mohammed Esameldin Adam},
-  school = {African Institute for Mathematical Sciences (AIMS) South Africa},
-  year   = {2026}
-}
-```
+Citation details withheld for anonymous review.
 
 Built on InstaNovo (Eloff et al., *Nature Machine Intelligence* 7:565–579, 2025) and evaluated on the nine-species benchmark (Wen and Noble, *Scientific Data* 11, 2024). The interpretation step follows InterPLM (Simon and Zou, *Nature Methods* 22:2107–2117, 2025).
 

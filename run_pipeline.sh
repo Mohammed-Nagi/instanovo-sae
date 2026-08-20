@@ -394,6 +394,9 @@ sizes = {k: len(v) for k, v in dd.items()}
 print("Splits found:", sizes)
 combined = concatenate_datasets([dd[k] for k in dd.keys()])
 print(f"Combined total: {len(combined):,} spectra across {len(sizes)} split(s)")
+if "spectrum_id" not in combined.column_names:
+    combined = combined.add_column("spectrum_id", [str(i) for i in range(len(combined))])
+    print("Added synthetic spectrum_id column (row index)")
 out.parent.mkdir(parents=True, exist_ok=True)
 combined.to_parquet(str(out))
 print(f"Wrote merged dataset -> {out}")

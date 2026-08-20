@@ -478,17 +478,25 @@ class ChunkStream:
         return meta_paths, acts_paths
 
     def _encode_chunk(self, activations: torch.Tensor) -> torch.Tensor:
-        """Stream the SAE forward pass over activations, batched to fit memory."""
-        out_parts = []
+        """Stream the SAE forward pass over activations, batched to fit memory.
+
+        Writes each mini-batch directly into a pre-allocated output tensor
+        rather than collecting a list and torch.cat-ing at the end. A
+        list-then-cat holds both the list of parts and the freshly allocated
+        concatenated tensor at once -- roughly double the final tensor's
+        memory -- which matters here since a full chunk's dense feature
+        matrix (n_tokens x d_dict) can already be several GB on its own.
+        """
         n_tokens = activations.size(0)
+        out = torch.empty((n_tokens, self.sae.d_dict), dtype=self.dtype)
         for start in range(0, n_tokens, self.batch_size):
             end = min(start + self.batch_size, n_tokens)
             x = activations[start:end].to(self.device, dtype=self.dtype, non_blocking=True)
             with torch.no_grad():
-                out = self.sae.forward_inference(x)
-            out_parts.append(out["features"].detach().to(self.dtype).cpu())
-            del x, out
-        return torch.cat(out_parts, dim=0)
+                batch_out = self.sae.forward_inference(x)
+            out[start:end] = batch_out["features"].detach().to(self.dtype).cpu()
+            del x, batch_out
+        return out
 
     def __iter__(self) -> Iterator[JoinedChunk]:
         for ci in range(self.n_chunks):
@@ -879,11 +887,15 @@ def phase_3_top_activating(
 
 def _accumulate_contingency(
     stream: ChunkStream, n_features: int, n_concepts: int,
+    row_batch: int = 8192,  # caps peak memory of the dense feat_bool cast below
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Stream the feature x concept co-occurrence table over every chunk.
 
     Accumulators are float64: summing indicator products over ~67.5M tokens
-    would lose precision in float32.
+    would lose precision in float32. The float64 cast and matmul are done in
+    row_batch-sized slices rather than over a whole chunk at once, since a
+    dense [n_tokens_in_chunk, n_features] float64 cast of a large chunk can
+    exceed available RAM (a ~130k-token chunk needs ~13 GB just for that cast).
     """
     n11 = torch.zeros((n_features, n_concepts), dtype=torch.float64)
     marginal_f = torch.zeros(n_features, dtype=torch.float64)
@@ -891,13 +903,16 @@ def _accumulate_contingency(
     n_total = 0
 
     for chunk in stream:
-        feat_bool = (chunk.features > 0).to(torch.float64)
-        labels_f = chunk.labels.to(torch.float64)
+        n_tokens = chunk.features.size(0)
+        for start in range(0, n_tokens, row_batch):
+            end = min(start + row_batch, n_tokens)
+            feat_bool = (chunk.features[start:end] > 0).to(torch.float64)
+            labels_f = chunk.labels[start:end].to(torch.float64)
 
-        n11 += feat_bool.t() @ labels_f
-        marginal_f += feat_bool.sum(dim=0)
-        marginal_c += labels_f.sum(dim=0)
-        n_total += feat_bool.size(0)
+            n11 += feat_bool.t() @ labels_f
+            marginal_f += feat_bool.sum(dim=0)
+            marginal_c += labels_f.sum(dim=0)
+            n_total += feat_bool.size(0)
 
     return n11, marginal_f, marginal_c, n_total
 
@@ -1482,10 +1497,10 @@ def _encode_layer_sample(
     count, so the returned matrices are row-aligned across layers -- which is what
     makes the per-token correlation between layers meaningful.
     """
-    collected = []
     n_collected = 0
     layer_key = str(layer)
     sae_dtype = next(sae.parameters()).dtype
+    out = torch.empty((n_tokens, sae.d_dict), dtype=sae_dtype)
 
     for chunk_info in manifest["chunks"]:
         if layer_key not in chunk_info["activations"]:
@@ -1496,48 +1511,56 @@ def _encode_layer_sample(
         )
         x_cpu = acts_obj["activations"]
         for start in range(0, x_cpu.size(0), batch_size):
-            end = min(start + batch_size, x_cpu.size(0))
+            remaining = n_tokens - n_collected
+            if remaining <= 0:
+                break
+            end = min(start + batch_size, x_cpu.size(0), start + remaining)
             x = x_cpu[start:end].to(device=device, dtype=sae_dtype)
             with torch.no_grad():
-                out = sae.forward_inference(x)
-            collected.append(out["features"].detach().cpu())
-            n_collected += end - start
-            del x, out
+                batch_out = sae.forward_inference(x)
+            take = end - start
+            out[n_collected:n_collected + take] = batch_out["features"].detach().cpu()
+            n_collected += take
+            del x, batch_out
             if n_collected >= n_tokens:
                 break
         if n_collected >= n_tokens:
             break
 
-    if not collected:
+    if n_collected == 0:
         return None
-    return torch.cat(collected, dim=0)[:n_tokens]
+    return out[:n_collected]
 
 
 def _match_anchor_across_layers(
     feat_idx: int,
     target_acts_centred: torch.Tensor,
     target_norms: torch.Tensor,
-    feature_acts: dict[int, torch.Tensor],
-    other_saes: dict[int, SparseAutoencoder],
+    other_centred_norms: dict[int, tuple[torch.Tensor, torch.Tensor]],
     target_layer: int,
     top_k: int,
 ) -> dict:
     """Best Pearson correlates of one anchor feature at every other layer.
 
     Correlation is the mean-centred dot product normalised by the product of
-    norms, computed over the shared token sample.
+    norms, computed over the shared token sample. Centring/norms for the
+    other layers are precomputed once by the caller (see cross_layer_matching)
+    rather than recomputed here: recomputing a full [n_tokens, d_dict] centred
+    copy per anchor feature -- potentially hundreds of times, once per anchor
+    -- both wastes compute and repeatedly allocates/frees multi-GB tensors,
+    which fragments memory on memory-constrained machines. The dot product
+    itself is computed as a matrix-vector product (anchor_col @ other_centred)
+    rather than an explicit elementwise multiply followed by a sum: the
+    elementwise form materialises a full [n_tokens, d_dict] intermediate
+    (identical in size to other_centred) on every call, whereas the matmul
+    form never allocates more than its [d_dict]-sized output.
     """
     anchor_col = target_acts_centred[:, feat_idx]
     anchor_norm = target_norms[feat_idx]
 
     match_row = {"anchor_layer": target_layer, "anchor_feature": int(feat_idx)}
-    for L in other_saes:
-        if L not in feature_acts:
-            continue
-        other_acts = feature_acts[L]
-        other_centred = other_acts - other_acts.mean(dim=0, keepdim=True)
-        other_norms = other_centred.norm(dim=0).clamp_min(1e-12)
-        corrs = (other_centred * anchor_col.unsqueeze(1)).sum(dim=0) / (anchor_norm * other_norms)
+    for L, (other_centred, other_norms) in other_centred_norms.items():
+        corrs = (anchor_col @ other_centred) / (anchor_norm * other_norms)
         k_use = min(top_k, corrs.numel())
         top = torch.topk(corrs, k_use)
         match_row[f"L{L}_best_feature"] = int(top.indices[0])
@@ -1587,21 +1610,34 @@ def cross_layer_matching(
         LOG.warning("Cross-layer: no activation chunks collected for anchor layer L%d", target_layer)
         return {"matches": [], "n_anchors": 0, "other_layers": list(other_saes.keys())}
 
-    target_acts = feature_acts[target_layer]
+    target_acts = feature_acts.pop(target_layer)
     target_acts_centred = target_acts - target_acts.mean(dim=0, keepdim=True)
     target_norms = target_acts_centred.norm(dim=0).clamp_min(1e-12)
+    del target_acts  # raw copy no longer needed once centred
+
+    # Centre/normalise every other layer once up front instead of once per
+    # anchor feature, and drop each raw tensor as soon as it's consumed --
+    # both cut peak memory substantially when several layers' token samples
+    # (each several GB) would otherwise all be resident at once.
+    other_centred_norms: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    for L in list(feature_acts.keys()):
+        other_acts = feature_acts.pop(L)
+        other_centred = other_acts - other_acts.mean(dim=0, keepdim=True)
+        other_norms = other_centred.norm(dim=0).clamp_min(1e-12)
+        del other_acts
+        other_centred_norms[L] = (other_centred, other_norms)
 
     matches: list[dict] = []
     for feat_idx in anchor_features.tolist():
         match_row = _match_anchor_across_layers(
-            feat_idx, target_acts_centred, target_norms, feature_acts,
-            other_saes, target_layer, top_k,
+            feat_idx, target_acts_centred, target_norms, other_centred_norms,
+            target_layer, top_k,
         )
         # Two keys means no other layer produced a match for this anchor.
         if len(match_row) > 2:
             matches.append(match_row)
 
-    matched_layers = [L for L in other_saes if L in feature_acts]
+    matched_layers = [L for L in other_saes if L in other_centred_norms]
     return {
         "matches": matches,
         "n_anchors": len(matches),

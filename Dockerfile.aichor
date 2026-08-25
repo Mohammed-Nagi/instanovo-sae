@@ -39,12 +39,19 @@ RUN uv sync --no-dev --frozen --no-install-project --extra cu126
 
 COPY --chown=$USER:$GID . .
 
-# Restore the executable bit. `aichor experiments submit local` ships the working
-# directory as a zip, and a zip built on Windows carries no POSIX permissions, so
-# run_pipeline.sh arrives non-executable and the container dies immediately with
-# "./run_pipeline.sh: Permission denied". Git records mode 100755, but that only
-# helps a clone-based build (submit commit-sha), not this path.
-RUN chmod +x run_pipeline.sh
+# Undo two things a Windows working tree does to a shell script, both of which
+# survive into the zip that `aichor experiments submit local` uploads:
+#
+#   CRLF line endings   bash reads the trailing \r as part of each token and
+#                       fails on the shebang with "$'\r': command not found".
+#                       .gitattributes pins *.sh to LF, but that governs git,
+#                       and submit local never consults git.
+#   no executable bit   a zip built on Windows carries no POSIX permissions, so
+#                       the script arrives non-executable and the container dies
+#                       with "./run_pipeline.sh: Permission denied".
+#
+# Both are corrected here so the image is correct whatever the upload contained.
+RUN sed -i 's/\r$//' run_pipeline.sh && chmod +x run_pipeline.sh
 
 RUN uv sync --frozen --no-dev --extra cu126
 

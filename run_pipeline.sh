@@ -290,7 +290,23 @@ fi
 # The sibling modules must be importable from SCRIPT_DIR.
 export PYTHONPATH="$SCRIPT_DIR:${PYTHONPATH:-}"
 
-mkdir -p "$OUTPUT_ROOT"
+# Create and prove writability before anything expensive starts. On a cluster
+# the output root is usually a mounted volume, and a volume owned by root is
+# unwritable to an image that drops to an unprivileged user -- a failure that
+# otherwise surfaces as a bare "mkdir: permission denied" partway through
+# setup, after a queue wait. Name the uid and the offending path instead.
+if ! mkdir -p "$OUTPUT_ROOT" 2>/dev/null || ! touch "$OUTPUT_ROOT/.write_probe" 2>/dev/null; then
+    echo "ERROR: cannot write to OUTPUT_ROOT: $OUTPUT_ROOT" >&2
+    echo "       running as uid=$(id -u) gid=$(id -g)" >&2
+    parent="$OUTPUT_ROOT"
+    while [[ ! -e "$parent" && "$parent" != "/" ]]; do parent="$(dirname "$parent")"; done
+    echo "       nearest existing path: $parent" >&2
+    ls -ld "$parent" 2>/dev/null | sed 's/^/         /' >&2
+    echo "       If this is a mounted volume, it is owned by another user: set an" >&2
+    echo "       fsGroup on the pod, or point OUTPUT_ROOT somewhere writable." >&2
+    exit 1
+fi
+rm -f "$OUTPUT_ROOT/.write_probe"
 OUTPUT_ROOT="$(cd "$OUTPUT_ROOT" && pwd)"
 PIPELINE_LOG="$OUTPUT_ROOT/pipeline.log"
 

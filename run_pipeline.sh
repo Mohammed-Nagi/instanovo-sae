@@ -184,9 +184,12 @@ EVAL_SKIP_PHASES="${EVAL_SKIP_PHASES:-}"     # optional explicit evaluate.py --s
 ABLATION_SPECTRA="${ABLATION_SPECTRA:-5000}"
 ABLATION_TOP_N="${ABLATION_TOP_N:-10}"
 # Single-feature ablations per concept. This is the dominant Phase 8 cost: each
-# one is a full model pass over ABLATION_SPECTRA spectra. The evaluate.py default
-# is 100; lower it to trade per-feature resolution for wall-clock.
-ABLATION_PER_FEATURE_TOP="${ABLATION_PER_FEATURE_TOP:-100}"
+# one is a full model pass over ABLATION_SPECTRA spectra, so the per-concept cost
+# is 1 group + N_RANDOM_CONTROLS + this. At 20 that is 26 passes per concept
+# rather than the 106 the old default of 100 implied -- a ~4x saving on the
+# phase, for coarser per-feature resolution. The group-level causal metrics
+# (selectivity, selectivity_z) are unaffected: they come from the group ablation.
+ABLATION_PER_FEATURE_TOP="${ABLATION_PER_FEATURE_TOP:-20}"
 CROSS_LAYER_TOKENS="${CROSS_LAYER_TOKENS:-100000}"
 
 # -----------------------------------------------------------------------------

@@ -101,13 +101,15 @@ Phase definitions in `evaluate.py` are ordered to follow the results section of 
 
 Phase *numbers* are a stable cross-file contract — they key `report.json`, the `--skip` CLI, and the Phase 4 resume cache — so they stay fixed even though execution order differs: Phases 3 and 4 run as a single streaming pass, and Phase 8 and the cross-layer/cross-seed checks all consume Phase 4's output, so Phase 4 runs before them.
 
-**Phase 8 is off by default** (`RUN_PHASE_8=0`) because it dominates the runtime — its cost is `n_concepts × (1 + controls + ABLATION_PER_FEATURE_TOP)` model passes over `ABLATION_SPECTRA` spectra, per layer. At the defaults that is 50 × 106 passes over 5,000 spectra. To enable it at a lower cost:
+**Phase 8 is off by default** (`RUN_PHASE_8=0`) because it dominates the runtime — its cost is `n_concepts × (1 + controls + ABLATION_PER_FEATURE_TOP)` model passes over `ABLATION_SPECTRA` spectra, per layer. At the defaults that is 50 × 26 passes over 5,000 spectra:
 
 ```bash
-RUN_PHASE_8=1 ABLATION_PER_FEATURE_TOP=20 MODEL_PATH=... ./run_pipeline.sh
+RUN_PHASE_8=1 MODEL_PATH=... ./run_pipeline.sh
 ```
 
-`ABLATION_PER_FEATURE_TOP` accounts for ~94% of Phase 8; lowering it trades per-feature resolution for wall-clock and leaves the group-level causal metrics unchanged.
+`ABLATION_PER_FEATURE_TOP` (default 20) is the dominant term; raising it buys per-feature resolution at a proportional cost in wall-clock and leaves the group-level causal metrics unchanged, since those come from the group ablation. Identical feature sets are ablated once and reused, so concepts sharing top features cost only one pass between them.
+
+Progress is checkpointed after each concept to `eval/phase8_partial.json`. A run killed part-way resumes from there and produces exactly the results an uninterrupted run would have, since each concept's random draws are keyed on its own index rather than on how many ran before it. The file is removed once the phase completes, and ignored if the settings that define an ablation have changed.
 
 ### LLM-assisted interpretation
 

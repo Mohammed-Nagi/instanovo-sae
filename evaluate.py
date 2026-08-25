@@ -59,6 +59,7 @@ import dataclasses
 import json
 import logging
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -175,7 +176,7 @@ class EvaluationConfig:
     # Causal ablation.
     ablation_spectra: int = 5_000             # spectra per ablation pass
     ablation_top_n: int = 10                  # group ablation: features per concept
-    ablation_per_feature_top: int = 100       # single-feature ablations per concept
+    ablation_per_feature_top: int = 20        # single-feature ablations per concept
     n_random_controls: int = 5                # matched random controls per concept
     n_firing_rate_deciles: int = 5            # stratification bins for selection
 
@@ -1861,6 +1862,7 @@ def _match_random_features(
     firing_rate: torch.Tensor,
     n_replicates: int,
     generator: torch.Generator,
+    label: str = "",
 ) -> list[torch.Tensor]:
     """Control feature sets matched to the targets by firing rate.
 
@@ -1872,30 +1874,46 @@ def _match_random_features(
     log_target = torch.log10(target_rates.clamp_min(1e-12))
     log_all = torch.log10(firing_rate.clamp_min(1e-12))
 
-    matched_sets: list[torch.Tensor] = []
     n_features = firing_rate.numel()
     all_idx = torch.arange(n_features)
+    # Invariant across every replicate and target, so computed once rather than
+    # as an O(features x targets) isin inside the inner loop.
+    not_target = ~torch.isin(all_idx, target_features)
+
+    matched_sets: list[torch.Tensor] = []
+    n_short = 0
     for _ in range(n_replicates):
+        # Excludes the targets and anything already picked in THIS replicate --
+        # otherwise one feature can be drawn for two targets, leaving the
+        # replicate ablating fewer distinct features than the target group.
+        available = not_target.clone()
         chosen: list[int] = []
-        chosen_t = torch.empty(0, dtype=torch.long)
         for lt in log_target:
-            # Uniform over features within the matching window, excluding the
-            # targets and anything already picked in this replicate -- otherwise
-            # one feature can be drawn for two targets, leaving the replicate
-            # ablating fewer distinct features than the target group.
-            close = (
-                ((log_all - lt).abs() < FIRING_RATE_MATCH_DEX)
-                & (~torch.isin(all_idx, target_features))
-                & (~torch.isin(all_idx, chosen_t))
-            )
+            close = ((log_all - lt).abs() < FIRING_RATE_MATCH_DEX) & available
             close_idx = close.nonzero(as_tuple=False).squeeze(-1)
             if close_idx.numel() == 0:
                 continue
-            pick = close_idx[torch.randint(close_idx.numel(), (1,), generator=generator)]
-            chosen.append(int(pick))
-            chosen_t = torch.tensor(chosen, dtype=torch.long)
+            pick = int(close_idx[torch.randint(close_idx.numel(), (1,), generator=generator)])
+            chosen.append(pick)
+            available[pick] = False
+        if len(chosen) < int(target_features.numel()):
+            n_short += 1
         if chosen:
-            matched_sets.append(chosen_t)
+            matched_sets.append(torch.tensor(chosen, dtype=torch.long))
+
+    # A control that ablates fewer features than the target group understates the
+    # comparison, and one that yields no replicates at all leaves magnitude_z and
+    # selectivity_z as NaN -- the headline metrics -- with nothing in the log to
+    # say why. Both happen when the targets sit in a sparsely populated part of
+    # the firing-rate range.
+    if n_short or len(matched_sets) < n_replicates:
+        LOG.warning(
+            "Firing-rate matching short%s: %d/%d replicates built, %d of them with "
+            "fewer than %d features (window +/-%g dex). magnitude_z and "
+            "selectivity_z will be weak or NaN here.",
+            f" for {label}" if label else "", len(matched_sets), n_replicates,
+            n_short, int(target_features.numel()), FIRING_RATE_MATCH_DEX,
+        )
     return matched_sets
 
 
@@ -1986,8 +2004,18 @@ def _compute_sae_full_baseline(
     prevalence = _prevalence_per_spectrum_flat(stream, n_concepts, config.ablation_spectra)
     n = min(ce_full.shape[0], prevalence.shape[0])
     if ce_full.shape[0] != prevalence.shape[0]:
+        # Truncating to the shorter side is correct only because both sides walk
+        # the same spectra in the same order, so the shorter one is a prefix of
+        # the longer -- which is the case when the loader reads the full dataset
+        # while extraction was capped. It does NOT rescue a genuine ordering
+        # difference: there the rows would still be misaligned after truncation.
+        # Phase 7's clean_ce_alignment check is what catches that, by comparing
+        # loader CE against the CE cached during extraction, so keep Phase 7
+        # enabled whenever Phase 8 runs.
         LOG.warning(
-            "Phase 8 length mismatch (model CE=%d, chunk prevalence=%d); using aligned prefix of %d",
+            "Phase 8 length mismatch (model CE=%d, chunk prevalence=%d); truncating "
+            "both to %d. Valid only if the two share a spectrum order -- check that "
+            "Phase 7 reported aligned=true.",
             ce_full.shape[0], prevalence.shape[0], n,
         )
     return ce_full[:n], prevalence[:n]
@@ -2011,6 +2039,43 @@ def _ablation_deltas(
     )
     n = min(ce_ablated.shape[0], ce_full.shape[0])
     return ce_ablated[:n] - ce_full[:n]
+
+
+class _AblationDeltaCache:
+    """Memoises per-spectrum delta-CE by ablated feature set.
+
+    delta-CE depends only on which features are zeroed: the concept enters later,
+    through the prevalence column the selectivity contrast uses. So the same
+    feature set ablated under two concepts is the same model pass run twice, and
+    features are BH-significant for many concepts at once, which makes their
+    top-N sets overlap heavily. Skipping those repeats is the largest avoidable
+    cost in Phase 8.
+
+    Each entry is one float32 vector of ablation_spectra, so the cache stays in
+    the tens of MB even if nothing repeats. Callers only read the tensors --
+    _causal_report and the per-feature summaries slice and reduce, never mutate
+    in place -- so handing out the cached object is safe.
+    """
+
+    def __init__(self, model, loader, sae, target_layer, config, ce_full):
+        self._call = (model, loader, sae, target_layer, config, ce_full)
+        self._cache: dict[tuple[int, ...], torch.Tensor] = {}
+        self.hits = 0
+        self.misses = 0
+
+    def __call__(self, features: torch.Tensor) -> torch.Tensor:
+        key = tuple(sorted(int(f) for f in features.reshape(-1).tolist()))
+        cached = self._cache.get(key)
+        if cached is not None:
+            self.hits += 1
+            return cached
+        self.misses += 1
+        model, loader, sae, target_layer, config, ce_full = self._call
+        delta = _ablation_deltas(
+            model, loader, sae, target_layer, features, config, ce_full,
+        )
+        self._cache[key] = delta
+        return delta
 
 
 def _selectivity(delta_ce: torch.Tensor, prevalence_col: torch.Tensor) -> float:
@@ -2185,11 +2250,11 @@ def _permutation_test_top_features(
 
 
 def _ablate_concept_group(
-    model, loader, sae: SparseAutoencoder, target_layer: int,
+    delta_fn: _AblationDeltaCache,
     ci: int, f1_c: torch.Tensor, rejected_c: torch.Tensor,
     firing_rate_t: torch.Tensor, phi_matrix: torch.Tensor | None,
     concept_names: list[str], config: EvaluationConfig,
-    ce_full: torch.Tensor, prevalence: torch.Tensor,
+    prevalence: torch.Tensor,
     random_control_generator: torch.Generator,
     selection_generator: torch.Generator,
 ) -> tuple[dict, torch.Tensor, list[torch.Tensor], list[int]]:
@@ -2206,27 +2271,22 @@ def _ablate_concept_group(
     )
     matched_random = _match_random_features(
         top_n_features, firing_rate_t, n_replicates=config.n_random_controls,
-        generator=random_control_generator,
+        generator=random_control_generator, label=concept_names[ci],
     )
     correlated = _find_correlated_concepts(
         ci, phi_matrix, concept_names, threshold=CORRELATED_CONCEPT_PHI,
     )
 
-    delta_target = _ablation_deltas(
-        model, loader, sae, target_layer, top_n_features, config, ce_full,
-    )
-    control_deltas = [
-        _ablation_deltas(model, loader, sae, target_layer, ctrl, config, ce_full)
-        for ctrl in matched_random
-    ]
+    delta_target = delta_fn(top_n_features)
+    control_deltas = [delta_fn(ctrl) for ctrl in matched_random]
     causal = _causal_report(delta_target, prevalence, ci, correlated, control_deltas)
     return causal, top_n_features, matched_random, correlated
 
 
 def _ablate_individual_features(
-    model, loader, sae: SparseAutoencoder, target_layer: int,
+    delta_fn: _AblationDeltaCache,
     ci: int, f1_c: torch.Tensor, rejected_c: torch.Tensor, stats: dict,
-    config: EvaluationConfig, ce_full: torch.Tensor, prevalence: torch.Tensor,
+    config: EvaluationConfig, prevalence: torch.Tensor,
 ) -> list[dict]:
     """Single-feature ablations: each feature's necessity and selectivity alone.
 
@@ -2238,9 +2298,7 @@ def _ablate_individual_features(
         rejected_c, f1_c, n=config.ablation_per_feature_top,
     ):
         feat = int(feat)
-        d = _ablation_deltas(
-            model, loader, sae, target_layer, torch.tensor([feat]), config, ce_full,
-        )
+        d = delta_fn(torch.tensor([feat]))
         results.append({
             "feature_idx": feat,
             "mean_delta_ce": float(d.mean().item()) if d.numel() else float("nan"),
@@ -2249,6 +2307,82 @@ def _ablate_individual_features(
             "lift": float(stats["lift"][feat, ci]),
         })
     return results
+
+
+PHASE_8_PARTIAL_NAME = "phase8_partial.json"
+
+
+def _phase_8_fingerprint(config: EvaluationConfig) -> dict:
+    """The settings that change what an ablation result means.
+
+    A partial file is only safe to resume from when every one of these matches:
+    each alters which features are ablated, over how many spectra, or against
+    which controls, so mixing two runs' concepts would produce a report whose
+    rows were computed under different conditions.
+    """
+    return {
+        "target_layer": config.target_layer,
+        "seed": config.seed,
+        "ablation_spectra": config.ablation_spectra,
+        "ablation_top_n": config.ablation_top_n,
+        "ablation_per_feature_top": config.ablation_per_feature_top,
+        "n_random_controls": config.n_random_controls,
+        "n_firing_rate_deciles": config.n_firing_rate_deciles,
+        "sae_checkpoint": str(config.sae_checkpoint),
+    }
+
+
+def _load_phase_8_partial(config: EvaluationConfig) -> dict[str, dict]:
+    """Concepts already ablated by an interrupted run, or {}.
+
+    Phase 8 is the longest phase in the pipeline and preemption on a shared
+    cluster is routine, so losing 40 completed concepts to a kill at concept 41
+    is the difference between a rerun costing minutes and costing a day.
+    """
+    path = config.output_subdir() / PHASE_8_PARTIAL_NAME
+    if not path.exists():
+        return {}
+    try:
+        blob = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        LOG.warning("Ignoring unreadable Phase 8 partial %s: %s", path, e)
+        return {}
+    if blob.get("fingerprint") != _phase_8_fingerprint(config):
+        LOG.warning(
+            "Ignoring Phase 8 partial from a run with different settings (%s); "
+            "starting the phase from scratch.", path,
+        )
+        return {}
+    done = blob.get("per_concept", {})
+    if done:
+        LOG.info("Resuming Phase 8: %d concepts already done in %s", len(done), path)
+    return done
+
+
+def _save_phase_8_partial(config: EvaluationConfig, per_concept: dict[str, dict]) -> None:
+    """Persist progress after each concept, atomically."""
+    path = config.output_subdir() / PHASE_8_PARTIAL_NAME
+    tmp = path.with_suffix(".json.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(
+            {"fingerprint": _phase_8_fingerprint(config), "per_concept": per_concept},
+            default=str,
+        ))
+        os.replace(tmp, path)
+    except OSError as e:
+        # Losing the checkpoint costs time on a restart; failing the phase over it
+        # would cost the work already done.
+        LOG.warning("Could not write Phase 8 partial %s: %s", path, e)
+
+
+def _clear_phase_8_partial(config: EvaluationConfig) -> None:
+    """Remove the partial once the phase has completed."""
+    path = config.output_subdir() / PHASE_8_PARTIAL_NAME
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as e:
+        LOG.warning("Could not remove Phase 8 partial %s: %s", path, e)
 
 
 def phase_8_causal_ablation(
@@ -2304,12 +2438,22 @@ def phase_8_causal_ablation(
         ce_full.numel(), n_concepts, config.ablation_top_n,
         config.n_random_controls, config.ablation_per_feature_top,
     )
+    delta_fn = _AblationDeltaCache(model, loader, sae, target_layer, config, ce_full)
 
-    per_concept_results: dict[str, dict] = {}
-    # Two streams from config.seed, so neither's draw count shifts the other's.
-    random_control_generator = torch.Generator(device="cpu").manual_seed(config.seed)
-    selection_generator = torch.Generator(device="cpu").manual_seed(config.seed + 1)
+    per_concept_results: dict[str, dict] = dict(_load_phase_8_partial(config))
     for ci, concept_name in enumerate(stream.concept_names):
+        if concept_name in per_concept_results:
+            continue
+
+        # Seeded per concept rather than once for the phase. A single sequential
+        # generator would make every draw depend on how many concepts ran before
+        # it, so a run resumed from the partial file would diverge from a fresh
+        # one. Keying on (seed, ci) makes each concept's draw independent of the
+        # order, and the two streams stay distinct so neither shifts the other.
+        base = config.seed * 1_000_003 + ci
+        selection_generator = torch.Generator(device="cpu").manual_seed(2 * base)
+        random_control_generator = torch.Generator(device="cpu").manual_seed(2 * base + 1)
+
         f1_c = stats["f1_dom"][:, ci]
         rejected_c = rejected[:, ci]
         if not rejected_c.any():
@@ -2325,13 +2469,12 @@ def phase_8_causal_ablation(
         )
 
         causal, top_n_features, matched_random, correlated = _ablate_concept_group(
-            model, loader, sae, target_layer, ci, f1_c, rejected_c, firing_rate_t,
-            phi_matrix, stream.concept_names, config, ce_full, prevalence,
+            delta_fn, ci, f1_c, rejected_c, firing_rate_t,
+            phi_matrix, stream.concept_names, config, prevalence,
             random_control_generator, selection_generator,
         )
         per_feature_results = _ablate_individual_features(
-            model, loader, sae, target_layer, ci, f1_c, rejected_c, stats,
-            config, ce_full, prevalence,
+            delta_fn, ci, f1_c, rejected_c, stats, config, prevalence,
         )
 
         per_concept_results[concept_name] = {
@@ -2345,11 +2488,19 @@ def phase_8_causal_ablation(
             "causal": causal,
             "per_feature_ablation": per_feature_results,
         }
+        _save_phase_8_partial(config, per_concept_results)
+
+    total = delta_fn.hits + delta_fn.misses
+    LOG.info(
+        "Phase 8: %d model passes run, %d reused from cache (%.0f%% of %d requests)",
+        delta_fn.misses, delta_fn.hits, 100 * delta_fn.hits / max(total, 1), total,
+    )
 
     permutation_test = _permutation_test_top_features(
         phase_4_results, config.permutation_n_features, config.permutation_n_shuffles,
         seed=config.seed,
     )
+    _clear_phase_8_partial(config)
     return {"per_concept": per_concept_results, "permutation_test": permutation_test}
 
 
@@ -2384,8 +2535,25 @@ class Evaluator:
             self.instanovo = self._load_instanovo()
             if self.instanovo is not None:
                 self.loader = self._build_loader()
-                if self.loader is None:
-                    LOG.warning("No spectra source for Phases 7-8; they will be skipped")
+
+        # Fail here, before any phase runs, rather than skipping the requested
+        # work and exiting 0. Every path that leaves these None only warns, so a
+        # long GPU run would otherwise finish "successfully" with no phase_8 in
+        # report.json and no causal_ablation.csv -- discoverable only by noticing
+        # the absence. The requested phases are named so the cause is obvious.
+        wanted = [n for n, on in (("7", config.run_phase_7), ("8", config.run_phase_8)) if on]
+        if wanted and not (self.instanovo is not None and self.loader is not None):
+            if not config.instanovo_path:
+                reason = "--instanovo-path was not given"
+            elif self.instanovo is None:
+                reason = "the InstaNovo model could not be loaded (see the warning above)"
+            else:
+                reason = "the spectra loader could not be built (see the warning above)"
+            raise RuntimeError(
+                f"Phase(s) {', '.join(wanted)} were requested but cannot run: {reason}. "
+                f"Re-run with --skip {' '.join(wanted)} to proceed without them, or fix "
+                f"the model/spectra source."
+            )
 
     def _load_instanovo(self):
         """Load InstaNovo for the Phase 7/8 passes, or None to skip them.
@@ -2905,7 +3073,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fdr-q", type=float, default=0.05)
     p.add_argument("--ablation-spectra", type=int, default=5000)
     p.add_argument("--ablation-top-n", type=int, default=10)
-    p.add_argument("--ablation-per-feature-top", type=int, default=100)
+    p.add_argument("--ablation-per-feature-top", type=int, default=20)
     p.add_argument("--cross-layer-tokens", type=int, default=100_000)
     p.add_argument("--device", default="cuda")
     p.add_argument("--batch-size", type=int, default=4096)

@@ -125,15 +125,18 @@ python interpret.py \
   --target-layer    2
 ```
 
-`--dry-run` builds the prompts without calling the API. Three feature strata are interpreted, selected with `--strata`:
+`--dry-run` builds the prompts without calling the API. Four feature strata are interpreted, selected with `--strata`; each feature is assigned to exactly one, in this order:
 
 | Stratum | Features | Purpose |
 |---|---|---|
-| `concept` | strongest BH-significant concept association | Positive control: the chemistry is already known, so recovering it validates the pipeline |
-| `unlabelled` | no significant concept at all | Discovery set: the features the registry cannot describe |
 | `causal` | implicated by the Phase 8 ablations | Asks whether causally necessary features have describable structure |
+| `unexplained` | activation mass concentrated on peaks the theory cannot label, ranked by `unexplained_mass_fraction` above a firing floor | Discovery set |
+| `concept` | strongest BH-significant chemical association | Positive control: the chemistry is already known, so recovering it validates the pipeline |
+| `unlabelled` | no significant concept at all, sampled uniformly | The features the evaluation is silent about |
 
-Concept labels are withheld from the prompt by default, so any chemistry the model names is inferred from the spectra alone; `--include-concept-labels` overrides this. Each description is scored the way InterPLM scores them: a held-out set of examples is shown without activations, the model predicts each one, and the Pearson correlation against the measured values is reported. The `causal` stratum requires Phase 8 to have run.
+`unexplained` and `unlabelled` sound alike but need not overlap: a feature whose best concept is `is_noise_peak` is excluded from `unlabelled` by construction, yet is the clearest possible unexplained-peak specialist. Both pools and their overlap are logged per run. The `concept` ranking skips features whose best concept is structural rather than chemical (`is_noise_peak`, `is_latent_token`), since neither validates inferring chemistry.
+
+Concept labels are withheld from the prompt by default, so any chemistry the model names is inferred from the spectra alone; `--include-concept-labels` overrides this. Each description is scored the way InterPLM scores them: a held-out set of examples is shown without activations, the model predicts each one, and the Pearson correlation against the measured values is reported. The `causal` stratum requires Phase 8 to have run, and `unexplained` requires a Phase 4 that was not restored from cache.
 
 ## Scale
 

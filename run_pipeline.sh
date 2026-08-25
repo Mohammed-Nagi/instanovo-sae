@@ -642,13 +642,28 @@ spectra, n_layers, width = float(sys.argv[1]), float(sys.argv[2]), float(sys.arg
 print(round(104.0 * (spectra / 639286.0) * (width / 2.0) * n_layers, 1))
 " "$spectra" "${#LAYERS[@]}" "$bytes_per_elem")"
             avail_gb="$(awk -v k="$avail_kb" 'BEGIN {printf "%.1f", k / 1048576}')"
-            log "Disk preflight   : ${avail_gb} GB free at $OUTPUT_ROOT, ~${need_gb} GB needed"
+            per_layer_gb="$(awk -v n="$need_gb" -v l="${#LAYERS[@]}" 'BEGIN {printf "%.1f", n / l}')"
+            log "Disk preflight   : ${avail_gb} GB free at $OUTPUT_ROOT, ~${need_gb} GB needed" \
+                "(~${per_layer_gb} GB/layer x ${#LAYERS[@]})"
             if awk -v a="$avail_gb" -v n="$need_gb" 'BEGIN {exit !(a < n)}'; then
+                # Say what would fit, not just that this does not. The PVC's size
+                # is not visible from inside the job and the CLI cannot report it,
+                # so this message is often the only way to find out how much room
+                # there actually is -- make it enough to act on.
+                fits="$(awk -v a="$avail_gb" -v p="$per_layer_gb" 'BEGIN {n=int(a/p); print (n<0?0:n)}')"
                 echo "ERROR: not enough free space for extraction." >&2
-                echo "       ${avail_gb} GB available, ~${need_gb} GB needed for ${#LAYERS[@]} layer(s)" >&2
-                echo "       of $spectra spectra at $EXTRACT_DTYPE." >&2
-                echo "       Free space, enlarge the volume, cut LAYERS_OVERRIDE or MAX_SPECTRA," >&2
-                echo "       or set SKIP_DISK_CHECK=1 to override this estimate." >&2
+                echo "       ${avail_gb} GB free, ~${need_gb} GB needed for ${#LAYERS[@]} layer(s)" >&2
+                echo "       of $spectra spectra at $EXTRACT_DTYPE (~${per_layer_gb} GB per layer)." >&2
+                if [[ "$fits" -ge 1 ]]; then
+                    echo "       This volume holds about ${fits} layer(s) at a time. Run them in" >&2
+                    echo "       batches, deleting each batch's activations before the next:" >&2
+                    echo "         LAYERS_OVERRIDE=\"2\" KEEP_CHUNKS=0 ... ./run_pipeline.sh" >&2
+                    echo "       Each batch repeats the extraction forward pass, so prefer the" >&2
+                    echo "       largest batch that fits." >&2
+                else
+                    echo "       Not even one layer fits; the volume needs to be enlarged." >&2
+                fi
+                echo "       Or set SKIP_DISK_CHECK=1 to override this estimate." >&2
                 exit 1
             fi
         fi

@@ -1,0 +1,12 @@
+*
+!pyproject.toml
+!uv.lock
+!*.py
+!run_pipeline.sh
+!Dockerfile.aichor
+!manifest.yaml
+
+.venv/
+__pycache__/
+.mypy_cache/
+evaluation_results/

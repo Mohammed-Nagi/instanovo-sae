@@ -1,0 +1,45 @@
+kind: AIchorManifest
+apiVersion: 0.2.3
+builder:
+  image: instanovo-sae
+  dockerfile: ./Dockerfile.aichor
+  context: .
+  buildArgs:
+    USE_CUDA: "true"
+spec:
+  operator: pytorch
+  image: instanovo-sae
+  # RUN_CAUSAL=1 enables Phase 7 (loss recovered), one substitution pass over the
+  # eval spectra. RUN_PHASE_8=0 keeps causal ablation off: its cost is
+  # n_concepts x (1 + controls + ABLATION_PER_FEATURE_TOP) model passes per layer
+  # and would dominate the run.
+  command: >
+    RUN_CAUSAL=1 RUN_PHASE_8=0 MODEL_PATH=instanovo-v1.1.0 OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs ./run_pipeline.sh
+  tensorboard:
+    enabled: false
+  storage:
+    attachExistingPVCs:
+      # "app/fm_mount" (no leading slash) is the convention every working job on
+      # this project's PVC uses, and AIchor resolves it to /app/fm_mount -- which
+      # is what OUTPUT_ROOT in `command` above points at. Keep the two in sync.
+      #
+      # The PVC is the only real filesystem here: AIchor does not mount its
+      # buckets, so this is where the ~415 GB of activations must land. Bucket
+      # storage is reached separately, over S3 -- see the publish step at the end
+      # of run_pipeline.sh.
+      - name: "dtu-denovo-s-2e6da747d6d34f62-mass-spec-fo-3010d211a1d447cf"
+        mountPoint: "app/fm_mount"
+  debug:
+    vscode:
+      enabled: false
+  types:
+    worker:
+      count: 1
+      resources:
+        cpus: 24
+        ramRatio: 8
+        accelerators:
+          gpu:
+            count: 1
+            type: gpu
+            product: NVIDIA-H100-80GB-HBM3

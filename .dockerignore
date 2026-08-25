@@ -1,0 +1,7 @@
+*
+!README.md
+!pyproject.toml
+!uv.lock
+!*.py
+!run_pipeline.sh
+!manifest.yaml

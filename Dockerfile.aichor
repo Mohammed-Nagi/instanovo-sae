@@ -1,0 +1,45 @@
+FROM python:3.13-slim-bookworm
+
+ARG USER=app
+ARG UID=1001
+ARG GID=1000
+ARG HOME_DIRECTORY=/app
+
+ENV LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+ENV CUDA_DEVICE_ORDER=PCI_BUS_ID
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
+
+WORKDIR /tmp
+# libxrender1/libxext6/libx11-6/libxau6/libxdmcp6/libglib2.0-0: runtime shared
+# libraries rdkit's compiled extension needs to load. instanovo hard-depends on
+# matchms, which hard-depends on rdkit and matplotlib; instanovo.utils.data_handler
+# (SpectrumDataFrame, imported by instanovo_io.py) does `from matchms import
+# Spectrum` at module load, so simply importing instanovo_io -- which extract.py
+# and evaluate.py both do -- pulls rdkit in, even though nothing here ever draws
+# a molecule.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+        curl git make ca-certificates \
+        libxrender1 libxext6 libx11-6 libxau6 libxdmcp6 libglib2.0-0
+
+RUN groupadd --force --gid $GID $USER \
+    && useradd -M --home $HOME_DIRECTORY --base-dir $HOME_DIRECTORY \
+        --uid $UID --gid $GID --shell "/bin/bash" $USER \
+    && mkdir -p ${HOME_DIRECTORY} \
+    && chown -R ${USER}:${GID} ${HOME_DIRECTORY}
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+USER $USER
+WORKDIR $HOME_DIRECTORY
+
+COPY --chown=$USER:$GID pyproject.toml uv.lock ./
+RUN uv sync --no-dev --frozen --no-install-project --extra cu126
+
+COPY --chown=$USER:$GID . .
+RUN uv sync --frozen --no-dev --extra cu126
+
+ENV PYTHONPATH=$PWD:$PYTHONPATH \
+    PATH=/app/.venv/bin:$PATH \
+    UV_NO_SYNC=1

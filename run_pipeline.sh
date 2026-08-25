@@ -618,6 +618,42 @@ PYEOF
 fi
 
 if [[ "$RUN_EXTRACT" == "1" ]]; then
+    # Disk preflight. Extraction is the one step that can consume hundreds of GB,
+    # and it writes for hours before it would hit ENOSPC -- by which point the
+    # GPU time is already spent. Estimating from the measured footprint of the
+    # nine-species benchmark (~104 GB per layer in bf16 over 639,286 spectra),
+    # scaled by this run's spectrum cap, dtype width and layer count.
+    #
+    # There is no way to ask AIchor how large a PVC is; free space on the mount
+    # is the number that actually matters anyway, so read it directly.
+    if [[ "${SKIP_DISK_CHECK:-0}" != "1" ]]; then
+        avail_kb="$(df -Pk "$OUTPUT_ROOT" 2>/dev/null | awk 'NR==2 {print $4}')"
+        if [[ -z "$avail_kb" ]]; then
+            log "WARNING: could not read free space for $OUTPUT_ROOT -- skipping the disk preflight"
+        else
+            bytes_per_elem=2
+            [[ "$EXTRACT_DTYPE" == "float32" ]] && bytes_per_elem=4
+            spectra="$MAX_SPECTRA"
+            [[ "$spectra" == "0" ]] && spectra=639286
+            need_gb="$("$PYTHON" -c "
+import sys
+spectra, n_layers, width = float(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
+# 104 GB/layer at bf16 for 639,286 spectra, measured.
+print(round(104.0 * (spectra / 639286.0) * (width / 2.0) * n_layers, 1))
+" "$spectra" "${#LAYERS[@]}" "$bytes_per_elem")"
+            avail_gb="$(awk -v k="$avail_kb" 'BEGIN {printf "%.1f", k / 1048576}')"
+            log "Disk preflight   : ${avail_gb} GB free at $OUTPUT_ROOT, ~${need_gb} GB needed"
+            if awk -v a="$avail_gb" -v n="$need_gb" 'BEGIN {exit !(a < n)}'; then
+                echo "ERROR: not enough free space for extraction." >&2
+                echo "       ${avail_gb} GB available, ~${need_gb} GB needed for ${#LAYERS[@]} layer(s)" >&2
+                echo "       of $spectra spectra at $EXTRACT_DTYPE." >&2
+                echo "       Free space, enlarge the volume, cut LAYERS_OVERRIDE or MAX_SPECTRA," >&2
+                echo "       or set SKIP_DISK_CHECK=1 to override this estimate." >&2
+                exit 1
+            fi
+        fi
+    fi
+
     run_step "Extract activations (layers ${LAYERS[*]}, dtype=$EXTRACT_DTYPE)" \
         "$OUTPUT_ROOT/extract.log" \
         "$PYTHON" "$EXTRACT_PY" "${EXTRACT_ARGS[@]}"

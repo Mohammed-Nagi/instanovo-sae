@@ -33,11 +33,14 @@ spec:
   # could conclude a 207 GB float32 layer cache fits and then be OOM-killed at the
   # pod limit, hours into training. Streaming is what it would pick anyway at any
   # RAM setting we would request here.
+  # Invoked through `bash` rather than as ./run_pipeline.sh: the Dockerfile now
+  # restores the executable bit, but going through the interpreter does not
+  # depend on it at all, and losing it cost a full queue slot once already.
   command: >
     RUN_CAUSAL=1 RUN_PHASE_8=0 LAYERS_OVERRIDE="2 4" KEEP_CHUNKS=0
     TRAIN_NO_RAM_CACHE=1 DATASET_DIR=/app/fm_mount/dataset
     MODEL_PATH=instanovo-v1.1.0
-    OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs ./run_pipeline.sh
+    OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs bash ./run_pipeline.sh
   tensorboard:
     enabled: false
   storage:

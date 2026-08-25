@@ -38,6 +38,14 @@ COPY --chown=$USER:$GID pyproject.toml uv.lock ./
 RUN uv sync --no-dev --frozen --no-install-project --extra cu126
 
 COPY --chown=$USER:$GID . .
+
+# Restore the executable bit. `aichor experiments submit local` ships the working
+# directory as a zip, and a zip built on Windows carries no POSIX permissions, so
+# run_pipeline.sh arrives non-executable and the container dies immediately with
+# "./run_pipeline.sh: Permission denied". Git records mode 100755, but that only
+# helps a clone-based build (submit commit-sha), not this path.
+RUN chmod +x run_pipeline.sh
+
 RUN uv sync --frozen --no-dev --extra cu126
 
 ENV PYTHONPATH=$PWD:$PYTHONPATH \

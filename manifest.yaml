@@ -58,13 +58,22 @@ spec:
   types:
     worker:
       count: 1
+      # Sized to be schedulable, not generous. A 24-core/96 GB pod sat
+      # Unschedulable with the scheduler reporting 103 nodes short on memory and
+      # 15 short on CPU, on top of the 295 with no free GPU -- so the ask was
+      # excluding nodes the job would never have used.
+      #
+      # Nothing here scales with cores except annotation, which defaults to
+      # os.cpu_count() and is a one-off pass. Extraction uses NUM_WORKERS=4
+      # dataloader workers; training and evaluation are GPU-bound.
+      #
+      # 12 x 4 = 48 GB. Training streams rather than caching the layer (the
+      # float32 cache would need ~207 GB and RAM_CACHE_SAFETY puts the bar near
+      # 346 GB, unreachable at any figure worth requesting), and the streaming
+      # peak is ~20-30 GB: ~332 MB per chunk plus cross-layer's ~4.9 GB token
+      # sample per layer.
       resources:
-        cpus: 24
-        # 24 x 4 = 96 GB. The float32 layer cache would need ~207 GB, and
-        # RAM_CACHE_SAFETY=0.6 puts the threshold near 346 GB available, so no
-        # RAM figure we would plausibly request reaches it -- training streams
-        # either way. Streaming peaks well under this: ~332 MB per chunk, and
-        # cross-layer's token sample is ~4.9 GB per layer.
+        cpus: 12
         ramRatio: 4
         accelerators:
           gpu:

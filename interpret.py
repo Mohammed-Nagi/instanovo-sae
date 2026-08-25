@@ -4,39 +4,42 @@ Adapts the automated feature-description pipeline of InterPLM (Simon and Zou,
 2025, Methods 5.3) to the mass-spectrometry setting, and adds a causal
 cross-reference that the protein-language-model setting does not support.
 
-Motivation. The concept registry in annotate.py labels a peak only when it
-matches a theoretical fragment ion; the remaining peaks carry structural labels
-only. Features that fire preferentially on those peaks are invisible to the
-F1-based evaluation even when they are perfectly interpretable. Separately,
-F1-dom penalises a feature for firing on concept-negative tokens, which
-systematically demotes detectors of concepts that co-occur with others -- so the
-correlational ranking is biased in a way an LLM reading raw examples is not.
-This script probes both gaps.
+Motivation. The registry labels a peak only when it matches a theoretical
+fragment ion, so features firing on the unmatched majority are invisible to the
+F1 evaluation however interpretable they are. F1-dom separately demotes detectors
+of concepts that co-occur with others, since it penalises firing on
+concept-negative tokens. An LLM reading raw examples has neither bias. This
+script probes both gaps.
 
-Three feature strata are interpreted (see --strata):
+Strata (--strata), each feature assigned to exactly one, in this precedence:
 
-    A  concept    features with the strongest BH-significant concept association.
-                  POSITIVE CONTROL: the chemistry is already known from Phase 4,
-                  so recovering it without being told validates the pipeline.
-    B  unlabelled features with no BH-significant concept at all. DISCOVERY SET:
-                  these are the features the registry cannot describe, and the
-                  reason the reported interpretable fraction is a lower bound.
-    C  causal     features implicated by the Phase 8 ablations. CROSS-REFERENCE:
-                  asks whether causally necessary features have describable
-                  structure, including ones the F1 ranking demoted.
+    causal       implicated by the Phase 8 ablations. Cross-reference: do
+                 causally necessary features have describable structure?
+    unexplained  activation mass concentrated on peaks the theory cannot label,
+                 ranked by unexplained_mass_fraction above a firing floor.
+                 The discovery set.
+    concept      strongest BH-significant chemical association. Positive
+                 control: the chemistry is known, so recovering it without
+                 being told validates the method.
+    unlabelled   no BH-significant concept of any kind, sampled uniformly.
 
-Concept labels are WITHHELD from the prompt by default (--include-concept-labels
-to override). InterPLM supplies Swiss-Prot metadata, so its descriptions are
-partly retrieved rather than inferred; here the model sees only physical
-observables -- m/z, intensity, peptide, precursor -- so any chemistry it names is
-inferred from the spectra. For stratum B this also avoids feeding back the very
-labels whose bias the analysis is trying to circumvent.
+unexplained and unlabelled sound alike but need not overlap. "No significant
+concept" also collects features firing diffusely without selectivity, while a
+feature whose best concept is is_noise_peak is excluded from unlabelled by
+construction -- scoring a significant association is what disqualifies it --
+though it is the clearest possible unexplained-peak specialist. The two pools and
+their overlap are logged so the difference is visible per run.
 
-Validation. Descriptions are scored the way InterPLM scores them: a held-out set
-of examples is shown WITHOUT activations, the model predicts each activation, and
-the Pearson correlation against the measured values is reported. A description
-that cannot predict held-out activations is not evidence of anything. InterPLM
-reports a median r of 0.72 across 1,200 protein features.
+Concept labels are withheld from the prompt by default (--include-concept-labels
+to override), so any chemistry the model names is inferred from the spectra
+rather than retrieved. For the discovery set this also avoids feeding back the
+labels whose bias the analysis exists to circumvent.
+
+Validation follows InterPLM: a held-out set is shown without activations, the
+model predicts each one, and the Pearson correlation against measured values is
+reported (InterPLM's median is 0.72 over 1,200 protein features). A description
+that cannot predict held-out activations is not evidence of anything. Each row
+carries holdout_coverage, since r covers only the examples actually answered.
 
 Inputs (all produced by an existing evaluate.py run):
     <eval-dir>/per_feature_stats.csv        feature ranking and concept association
@@ -86,6 +89,30 @@ ZERO_EXAMPLES = 8
 # features with fewer than 20 examples across the top activation ranges.
 MIN_ACTIVE_EXAMPLES = 12
 
+# A partial reply scores the description on a subset the model may have picked
+# for being easy, so a shortfall below this share is logged rather than folded
+# silently into r.
+MIN_PREDICTION_COVERAGE = 0.8
+
+# Firing floor for the unexplained stratum. A feature firing on a single token
+# also scores a fraction of exactly 1.0, and on a ~500k-token layer that is the
+# bottom decile of high-fraction features. At 1e-4 a full layer leaves roughly
+# 16 sampled examples, clearing MIN_ACTIVE_EXAMPLES. Override per run with
+# --min-firing-rate.
+MIN_UNEXPLAINED_FIRING_RATE = 1e-4
+
+# Concepts that describe a token's role rather than its chemistry. A feature
+# whose best concept is one of these has not been given a chemical description --
+# is_noise_peak says the theory had nothing to say, is_latent_token says the
+# token is not a peak at all -- so neither works as a positive control for
+# inferring chemistry, and both are excluded from the concept stratum's ranking.
+STRUCTURAL_CONCEPTS = frozenset({"is_noise_peak", "is_latent_token"})
+
+# Fraction above which a feature counts as an unexplained-peak specialist when
+# reporting how far the older "no significant concept" proxy reaches. Reporting
+# only; the stratum itself ranks rather than thresholds.
+UNEXPLAINED_OVERLAP_FRACTION = 0.90
+
 # Peaks shown as spectral context around the activating peak.
 CONTEXT_PEAKS = 6
 
@@ -103,13 +130,14 @@ class InterpretConfig:
     output_dir: Path
     target_layer: int
 
-    strata: tuple[str, ...] = ("concept", "unlabelled", "causal")
+    strata: tuple[str, ...] = ("concept", "unexplained", "unlabelled", "causal")
     n_per_stratum: int = 40
 
     # Chunks encoded to recover the activation distribution. Each contributes
     # ~108k tokens, so a handful is ample for sampling examples per feature.
     n_sample_chunks: int = 12
     include_concept_labels: bool = False
+    min_firing_rate: float = MIN_UNEXPLAINED_FIRING_RATE
 
     model: str = DEFAULT_MODEL
     max_tokens: int = 2048
@@ -144,14 +172,33 @@ class TokenExample:
     peptide: str               # ProForma, so modifications are visible
     precursor_mz: float
     precursor_charge: int
-    neighbour_mzs: list[float]
+    # (m/z, relative intensity, ion type) per neighbour. Intensity and ion type
+    # are what let a description say "unmatched peaks just above an intense
+    # y-ion" rather than only "near a peak at 1044.5".
+    neighbours: list[tuple[float, float, str]]
     concepts: list[str]        # withheld from the prompt unless requested
 
 
 # --- Reading the evaluation artefacts ----------------------------------------
 
+def _optional_float(row: dict, key: str) -> float:
+    """Read a column evaluate.py may leave blank, as NaN.
+
+    The unexplained-mass columns are empty when Phase 4 was restored from cache,
+    which carries no activation magnitudes. NaN keeps those features out of any
+    ordering without dropping them from the table.
+    """
+    raw = (row.get(key) or "").strip()
+    if not raw:
+        return float("nan")
+    try:
+        return float(raw)
+    except ValueError:
+        return float("nan")
+
+
 def _read_per_feature_stats(eval_dir: Path) -> dict[int, dict]:
-    """feature_idx -> {firing_rate, max_f1_dom, best_concept, n_significant}."""
+    """feature_idx -> firing rate, concept association, and unexplained-mass stats."""
     path = eval_dir / "per_feature_stats.csv"
     if not path.exists():
         raise FileNotFoundError(
@@ -165,6 +212,8 @@ def _read_per_feature_stats(eval_dir: Path) -> dict[int, dict]:
                 "max_f1_dom": float(row["max_f1_dom"]),
                 "best_concept": row["best_concept"],
                 "n_significant": int(row["n_significant_concepts"]),
+                "unexplained_fraction": _optional_float(row, "unexplained_mass_fraction"),
+                "unexplained_enrichment": _optional_float(row, "unexplained_enrichment"),
             }
     return stats
 
@@ -279,12 +328,14 @@ def select_strata(
     n_per_stratum: int,
     strata: tuple[str, ...],
     rng: random.Random,
+    min_firing_rate: float = MIN_UNEXPLAINED_FIRING_RATE,
 ) -> dict[int, str]:
     """Choose features for each requested stratum. Returns feature_idx -> stratum.
 
-    A feature is assigned to exactly one stratum, with causal taking precedence:
-    a causally implicated feature is more informative there than as one more
-    concept-associated example, and the causal set is the smallest.
+    Each feature lands in exactly one stratum, in the order causal >
+    unexplained > concept > unlabelled. Causal is first as the smallest and most
+    informative set; unexplained precedes concept so an unexplained-peak
+    specialist is not absorbed into the positive control.
     """
     assigned: dict[int, str] = {}
 
@@ -301,11 +352,48 @@ def select_strata(
             "run evaluate.py with RUN_PHASE_8=1 to populate it. Skipping."
         )
 
+    if "unexplained" in strata:
+        # The discovery set: features concentrating their activation mass on
+        # peaks the theory cannot label.
+        missing = [fi for fi, s in stats.items()
+                   if np.isnan(s["unexplained_fraction"])]
+        if len(missing) == len(stats):
+            raise ValueError(
+                "per_feature_stats.csv has no unexplained_mass_fraction values, so "
+                "the 'unexplained' stratum cannot be selected. This column is "
+                "written by evaluate.py Phase 4 and is blank when Phase 4 was "
+                "restored from cache. Re-run evaluate.py for this layer/seed "
+                "without --phase4-cache-dir, or drop 'unexplained' from --strata."
+            )
+
+        # The firing floor separates a specialist from an artefact: a feature
+        # firing on one token also has a fraction of exactly 1.0.
+        candidates = [
+            fi for fi, s in stats.items()
+            if s["firing_rate"] >= min_firing_rate
+            and not np.isnan(s["unexplained_fraction"])
+            and fi not in assigned
+        ]
+        # Ties at exactly 1.0 are common, so the tie-break decides much of the
+        # set: firing rate gives more examples to describe from, where the
+        # default would just favour low feature ids.
+        candidates.sort(key=lambda fi: (-stats[fi]["unexplained_fraction"],
+                                        -stats[fi]["firing_rate"]))
+        for fi in candidates[:n_per_stratum]:
+            assigned[fi] = "unexplained"
+        LOG.info("Stratum unexplained: %d features (firing rate >= %g; %d candidates)",
+                 sum(1 for s in assigned.values() if s == "unexplained"),
+                 min_firing_rate, len(candidates))
+
     if "concept" in strata:
-        # Highest F1-dom among features the registry can already describe.
+        # Positive control: highest F1-dom among features the registry already
+        # describes chemically. Features whose best concept is structural rather
+        # than chemical are excluded -- see STRUCTURAL_CONCEPTS.
         candidates = sorted(
             (fi for fi, s in stats.items()
-             if s["n_significant"] > 0 and fi not in assigned),
+             if s["n_significant"] > 0
+             and s["best_concept"] not in STRUCTURAL_CONCEPTS
+             and fi not in assigned),
             key=lambda fi: -stats[fi]["max_f1_dom"],
         )
         for fi in candidates[:n_per_stratum]:
@@ -313,9 +401,9 @@ def select_strata(
         LOG.info("Stratum concept: %d features", sum(1 for s in assigned.values() if s == "concept"))
 
     if "unlabelled" in strata:
-        # Features with no significant concept, sampled rather than ranked:
-        # there is no meaningful ordering, and sampling keeps the set unbiased
-        # with respect to firing rate.
+        # Features the evaluation is silent about: no significant concept of any
+        # kind. Sampled rather than ranked, which keeps the set unbiased with
+        # respect to firing rate.
         candidates = [
             fi for fi, s in stats.items()
             if s["n_significant"] == 0 and s["firing_rate"] > 0 and fi not in assigned
@@ -323,8 +411,29 @@ def select_strata(
         rng.shuffle(candidates)
         for fi in candidates[:n_per_stratum]:
             assigned[fi] = "unlabelled"
-        LOG.info("Stratum unlabelled: %d features",
-                 sum(1 for s in assigned.values() if s == "unlabelled"))
+        LOG.info("Stratum unlabelled: %d features (uniform sample of %d candidates)",
+                 sum(1 for s in assigned.values() if s == "unlabelled"), len(candidates))
+
+    if "unexplained" in strata and "unlabelled" in strata:
+        # How far "no significant concept" reaches into the discovery
+        # population. Over the full pools, so it is independent of
+        # n_per_stratum.
+        pool_unexp = {
+            fi for fi, s in stats.items()
+            if s["firing_rate"] >= min_firing_rate
+            and not np.isnan(s["unexplained_fraction"])
+            and s["unexplained_fraction"] >= UNEXPLAINED_OVERLAP_FRACTION
+        }
+        pool_unlab = {fi for fi, s in stats.items()
+                      if s["n_significant"] == 0 and s["firing_rate"] > 0}
+        both = pool_unexp & pool_unlab
+        LOG.info(
+            "Pools at unexplained fraction >= %.2f: unexplained=%d, unlabelled=%d, "
+            "overlap=%d (%d unexplained specialists the 'no significant concept' "
+            "proxy misses)",
+            UNEXPLAINED_OVERLAP_FRACTION, len(pool_unexp), len(pool_unlab),
+            len(both), len(pool_unexp - pool_unlab),
+        )
 
     return assigned
 
@@ -419,14 +528,21 @@ def _make_example(
 
     if is_latent or peak_tokens.size == 0:
         peak_rank = 0
-        neighbours: list[float] = []
+        neighbours: list[tuple[float, float, str]] = []
     else:
         order = np.argsort(-intensities)
         rank_of = {int(peak_tokens[o]): r + 1 for r, o in enumerate(order)}
         peak_rank = rank_of.get(local_token, 0)
         mzs = rec["peak_mzs"][peak_tokens]
         near = np.argsort(np.abs(mzs - mz))[1:CONTEXT_PEAKS + 1]
-        neighbours = [round(float(mzs[i]), 4) for i in sorted(near)]
+        neighbours = [
+            (
+                round(float(mzs[i]), 4),
+                _relative_intensity(float(intensities[i]), spectrum_max),
+                ion_vocab.get(int(rec["ion_type_ids"][int(peak_tokens[i])]), "unknown"),
+            )
+            for i in sorted(near)
+        ]
 
     labels = rec["labels"][local_token]
     concepts = [concept_names[i] for i in np.flatnonzero(labels.numpy())] \
@@ -573,7 +689,7 @@ def format_example_table(
     header = [
         "example_id", "peak_mz", "rel_intensity", "intensity_rank",
         "n_peaks", "matched_ion", "peptide_proforma",
-        "precursor_mz", "precursor_z", "nearby_mz",
+        "precursor_mz", "precursor_z", "nearby_peaks",
     ]
     if include_concepts:
         header.append("concepts")
@@ -593,7 +709,7 @@ def format_example_table(
             _csv_safe(e.peptide),
             f"{e.precursor_mz:.4f}",
             str(e.precursor_charge),
-            " ".join(f"{m:.2f}" for m in e.neighbour_mzs),
+            " ".join(f"{m:.2f}@{i:.2f}/{t}" for m, i, t in e.neighbours),
         ]
         if include_concepts:
             cells.append(_csv_safe(" ".join(e.concepts)))
@@ -623,7 +739,10 @@ prepended to every spectrum and represents the spectrum as a whole. Columns:
   peptide_proforma the peptide that produced the spectrum, in ProForma notation;
                    bracketed values are modification delta masses
   precursor_mz/z   mass-to-charge and charge of the intact peptide
-  nearby_mz        m/z of the nearest other peaks in the same spectrum
+  nearby_peaks     the nearest other peaks in the same spectrum, each written
+                   mz@rel_intensity/matched_ion -- so "1044.52@0.91/y" is an
+                   intense y-ion neighbour. Use these for mass differences and
+                   for patterns defined by what a peak sits next to.
 """
 
 
@@ -874,6 +993,17 @@ def interpret_feature(
     measured = {e.example_id: e.activation for e in holdout_set}
     pairs = [(predictions[i], measured[i]) for i in predictions]
 
+    # A reply that skips the examples it found hard would score on an easier
+    # subset than the one it was given, so record the coverage alongside r.
+    coverage = len(pairs) / len(holdout_set) if holdout_set else 0.0
+    result["holdout_coverage"] = coverage
+    if coverage < MIN_PREDICTION_COVERAGE:
+        LOG.warning(
+            "Feature %d: model predicted only %d/%d held-out examples (%.0f%%); "
+            "its r is over that subset, not the full holdout.",
+            feature_idx, len(pairs), len(holdout_set), 100 * coverage,
+        )
+
     result["pearson_r"] = pearson_r(pairs)
     result["n_predicted"] = len(pairs)
     result["predictions"] = [
@@ -885,6 +1015,13 @@ def interpret_feature(
 
 
 # --- Output -------------------------------------------------------------------
+
+def _blank_if_nan(value) -> str:
+    """Write an absent unexplained-mass statistic as an empty cell, not 'nan'."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return ""
+    return str(value)
+
 
 def write_outputs(
     results: list[dict],
@@ -899,8 +1036,9 @@ def write_outputs(
     with open(csv_path, "w", newline="") as fp:
         writer = csv.writer(fp)
         writer.writerow([
-            "feature_idx", "stratum", "pearson_r", "n_predicted",
+            "feature_idx", "stratum", "pearson_r", "n_predicted", "holdout_coverage",
             "firing_rate", "max_f1_dom", "best_concept", "n_significant_concepts",
+            "unexplained_mass_fraction", "unexplained_enrichment",
             "causal_concept", "causal_selectivity", "causal_selectivity_z",
             "causal_mean_delta_ce", "summary",
         ])
@@ -910,8 +1048,11 @@ def write_outputs(
             c = causal.get(fi, {})
             writer.writerow([
                 fi, r["stratum"], r["pearson_r"], r["n_predicted"],
+                r.get("holdout_coverage", ""),
                 s.get("firing_rate", ""), s.get("max_f1_dom", ""),
                 s.get("best_concept", ""), s.get("n_significant", ""),
+                _blank_if_nan(s.get("unexplained_fraction")),
+                _blank_if_nan(s.get("unexplained_enrichment")),
                 c.get("concept", ""), c.get("selectivity", ""),
                 c.get("selectivity_z", ""), c.get("mean_delta_ce", ""),
                 r["summary"],
@@ -946,13 +1087,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--target-layer", type=int, required=True)
 
-    p.add_argument("--strata", nargs="+", default=["concept", "unlabelled", "causal"],
-                   choices=["concept", "unlabelled", "causal"])
+    p.add_argument("--strata", nargs="+",
+                   default=["concept", "unexplained", "unlabelled", "causal"],
+                   choices=["concept", "unexplained", "unlabelled", "causal"])
     p.add_argument("--n-per-stratum", type=int, default=40)
     p.add_argument("--n-sample-chunks", type=int, default=12)
     p.add_argument("--include-concept-labels", action="store_true",
                    help="Show the 50 concept labels to the model. Off by default so "
                         "any chemistry it names is inferred from the spectra alone.")
+    p.add_argument("--min-firing-rate", type=float, default=MIN_UNEXPLAINED_FIRING_RATE,
+                   help="Firing-rate floor for the unexplained stratum (default "
+                        f"{MIN_UNEXPLAINED_FIRING_RATE:g}). Excludes features whose "
+                        "unexplained-mass fraction of 1.0 comes from firing on only "
+                        "a handful of tokens.")
 
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--env-file", type=Path, default=None,
@@ -987,6 +1134,7 @@ def main() -> int:
         n_per_stratum=args.n_per_stratum,
         n_sample_chunks=args.n_sample_chunks,
         include_concept_labels=args.include_concept_labels,
+        min_firing_rate=args.min_firing_rate,
         model=args.model,
         max_tokens=args.max_tokens,
         seed=args.seed,
@@ -1004,7 +1152,8 @@ def main() -> int:
     ion_vocab = _read_ion_type_vocab(config.annotation_dir)
     concept_names = _read_concept_names(config.annotation_dir)
 
-    assigned = select_strata(stats, causal, config.n_per_stratum, config.strata, rng)
+    assigned = select_strata(stats, causal, config.n_per_stratum, config.strata, rng,
+                             min_firing_rate=config.min_firing_rate)
     if not assigned:
         LOG.error("No features selected; check --strata and the eval directory.")
         return 1

@@ -88,7 +88,7 @@ Layers are independent. Once extraction and annotation are done, training and ev
 
 Phases 1–6 run from the cached chunks alone. Phases 7 and 8 need `MODEL_PATH`, and `evaluate.py` imports the model lazily so the earlier phases work without it.
 
-The phases, in definition order:
+Phase definitions in `evaluate.py` are ordered to follow the results section of the accompanying paper:
 
 1. **1+2** reconstruction and sparsity
 2. **6** threshold sweep

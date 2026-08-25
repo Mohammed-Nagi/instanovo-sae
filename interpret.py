@@ -972,7 +972,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     logging.basicConfig(
-        level=args.log_level,
+        level=args.log_level.upper(),
         format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
     )
 

@@ -50,3 +50,20 @@ service-account*.json
 Thumbs.db
 .vscode/
 .idea/
+
+# Research documents and assistant config -- excluded from the anonymous
+# submission: these identify the author, institution and supervision context.
+# The whole docs/ tree stays local, alongside CLAUDE.md which points into it.
+docs/
+CLAUDE.md
+.claude/
+
+# Reference checkouts kept locally for comparison. Not ours to redistribute,
+# and nothing in this repo depends on them.
+InstaNovo-internal-*/
+
+# Pipeline artefacts (production and smoke). Individual subdirectories are also
+# matched by the extract/ annotation/ sae/ patterns above, but the roots
+# themselves otherwise show up as untracked.
+sae_pipeline_outputs/
+sae_pipeline_outputs_smoke/

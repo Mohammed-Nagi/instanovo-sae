@@ -1,21 +1,19 @@
-# Sparse Autoencoders for Interpretability of InstaNovo
-
-Code for the MSc thesis *Sparse Autoencoders for Interpretability of InstaNovo* (Mohammed Esameldin Adam Nagi, AIMS South Africa / InstaDeep, 2026).
+# Sparse Autoencoder Interpretability Pipeline for InstaNovo
 
 Sparse autoencoders are trained on the residual-stream activations of [InstaNovo](https://github.com/instadeepai/InstaNovo)'s encoder at four depths. Every spectral peak is labelled with chemical concepts derived from first-principles fragment-ion theory, allowing us to ask which learned features correspond to which chemical events — both correlationally and causally.
 
 ## Contents
 
-| File | Role | Thesis |
-|---|---|---|
-| `run_pipeline.sh` | Orchestration with resume and artefact reuse | Fig. 3.1 |
-| `instanovo_io.py` | The single boundary against the InstaNovo API | §3.2 |
-| `extract.py` | Multi-layer activation extraction (layers 2, 4, 6, 8) | §3.2 |
-| `train.py` | Sparse autoencoder: BatchTopK training, AuxK recovery, JumpReLU inference | §3.3 |
-| `annotate.py` | Per-peak fragment-ion annotation: 50 concepts, 14 families | §3.4 |
-| `evaluate.py` | Eight-phase evaluation suite | §3.5 |
-| `interpret.py` | LLM-assisted feature description, validated by held-out activation prediction | §5.3.1 |
-| `schema.py` | On-disk schema versions shared across the pipeline | — |
+| File | Role |
+|---|---|
+| `run_pipeline.sh` | Orchestration with resume and artefact reuse |
+| `instanovo_io.py` | The single boundary against the InstaNovo API |
+| `extract.py` | Multi-layer activation extraction (layers 2, 4, 6, 8) |
+| `train.py` | Sparse autoencoder: BatchTopK training, AuxK recovery, JumpReLU inference |
+| `annotate.py` | Per-peak fragment-ion annotation: 50 concepts, 14 families |
+| `evaluate.py` | Eight-phase evaluation suite |
+| `interpret.py` | LLM-assisted feature description, validated by held-out activation prediction |
+| `schema.py` | On-disk schema versions shared across the pipeline |
 
 The pipeline runs in four stages — extract, annotate, train, evaluate — orchestrated by `run_pipeline.sh`. Extraction and annotation are the expensive one-off stages and are reused across every layer, seed, and SAE width. Every step is idempotent and skips if its output already exists, so the pipeline is safe to interrupt and resume. `interpret.py` is a separate step run after evaluation.
 
@@ -48,7 +46,7 @@ MODEL_PATH=instanovo-v1.1.0        # downloaded automatically
 MODEL_PATH=/path/to/model.ckpt     # local checkpoint
 ```
 
-Ids come from InstaNovo's `models.json` — `instanovo-v1.1.0` (used for the thesis), `instanovo-v1.2.0`, and `instanovo-phospho-v1.0.0`. Anything ending in `.ckpt` or containing a path separator is treated as a file; everything else as an id.
+Ids come from InstaNovo's `models.json` — `instanovo-v1.1.0` (used in our experiments), `instanovo-v1.2.0`, and `instanovo-phospho-v1.0.0`. Anything ending in `.ckpt` or containing a path separator is treated as a file; everything else as an id.
 
 Copy `.env.example` to `.env` for the optional settings and, if you plan to run `interpret.py`, the API key. `.env` is gitignored and must never be committed.
 
@@ -56,11 +54,13 @@ Copy `.env.example` to `.env` for the optional settings and, if you plan to run 
 
 `run_pipeline.sh` is a bash script. On Windows, use Git Bash or WSL.
 
-Smoke test first — a few thousand spectra, end to end, in minutes:
+Smoke test first — a few thousand spectra, end to end:
 
 ```bash
 SMOKE_TEST=1 MODEL_PATH=instanovo-v1.1.0 ./run_pipeline.sh
 ```
+
+A smoke run writes to its own `OUTPUT_ROOT` (`./sae_pipeline_outputs_smoke`) so it never mixes artefacts with a production run, and ends with a verification block that checks every layer: schema versions current, decoder rows unit-norm, FVE finite, `L0 > 0`, calibrated JumpReLU threshold, and the expected columns in `per_feature_stats.csv`. It exits non-zero if any check fails.
 
 Full run over the nine-species benchmark:
 
@@ -75,8 +75,12 @@ LAYERS_OVERRIDE="8"                  # single layer
 DATASET_PATH=/data/combined.parquet  # skip the dataset merge
 SKIP_TRAIN=1                         # evaluate existing checkpoints
 OUTPUT_ROOT=/mnt/ssd/sae             # write artefacts elsewhere
-KEEP_CHUNKS=0                        # delete activations after the run
+KEEP_CHUNKS=0                        # delete this run's activations afterwards
+ANNOTATE_WORKERS=8                   # parallel chunk annotation (default: all cores)
+DEVICE=cpu                           # override the auto-detected device
 ```
+
+`DEVICE` follows the hardware by default: `cuda` when torch can see a GPU, `cpu` otherwise. Setting it explicitly is strict — `DEVICE=cuda` on a machine with no usable GPU aborts rather than silently running on CPU, since that would be orders of magnitude slower over the full dataset.
 
 Layers are independent. Once extraction and annotation are done, training and evaluation for different layers can run concurrently on separate GPUs by launching the script with `LAYERS_OVERRIDE="<layer>"` and a distinct `DEVICE` in separate shells.
 
@@ -84,20 +88,18 @@ Layers are independent. Once extraction and annotation are done, training and ev
 
 Phases 1–6 run from the cached chunks alone. Phases 7 and 8 need `MODEL_PATH`, and `evaluate.py` imports the model lazily so the earlier phases work without it.
 
-Phase definitions in `evaluate.py` are ordered to follow the thesis results chapter:
+The phases, in definition order:
 
-| Phase | Thesis |
-|---|---|
-| 1+2 reconstruction and sparsity | §4.1.1, §4.2.1 |
-| 6 threshold sweep | §4.1.2 (Figure 4.1) |
-| 5 dictionary geometry | §4.2.2 (Table 4.3) |
-| 3 top-activating tokens | §4.3 |
-| 4 feature–concept associations | §4.3 (Tables 4.4–4.5) |
-| 7 loss recovered | §4.4 (Table 4.6) |
-| cross-layer matching | §4.5 (Table 4.7) |
-| 8 causal ablation | §4.6 |
+1. **1+2** reconstruction and sparsity
+2. **6** threshold sweep
+3. **5** dictionary geometry
+4. **3** top-activating tokens
+5. **4** feature–concept associations
+6. **7** loss recovered
+7. **cross-layer matching**
+8. **8** causal ablation
 
-Execution order differs: Phase 8 and the cross-layer/cross-seed checks all consume Phase 4's output, so Phase 4 runs before them.
+Phase *numbers* are a stable cross-file contract — they key `report.json`, the `--skip` CLI, and the Phase 4 resume cache — so they stay fixed even though execution order differs: Phases 3 and 4 run as a single streaming pass, and Phase 8 and the cross-layer/cross-seed checks all consume Phase 4's output, so Phase 4 runs before them.
 
 **Phase 8 is off by default** (`RUN_PHASE_8=0`) because it dominates the runtime — its cost is `n_concepts × (1 + controls + ABLATION_PER_FEATURE_TOP)` model passes over `ABLATION_SPECTRA` spectra, per layer. At the defaults that is 50 × 106 passes over 5,000 spectra. To enable it at a lower cost:
 
@@ -148,10 +150,12 @@ The nine-species benchmark contains 639,286 spectra, giving roughly 67.5 million
 
 ```
 $OUTPUT_ROOT/
-├── pipeline.log
+├── pipeline.log                     plus one log per stage, layer and seed
 ├── combined_ninespecies.parquet     merged dataset (unless DATASET_PATH is set)
+├── eval_spectra_first{N}.parquet    capped Phase 7/8 source (capped runs only)
 ├── extract/
 │   ├── manifest.json
+│   ├── extract_config.json          resume fingerprint: dtype, n_peaks, dataset
 │   └── chunks/                      acts_L{2,4,6,8}_{chunk}.pt, meta_{chunk}.pt
 ├── annotation/
 │   ├── annotation_manifest.json     registry, base rates, vocabularies
@@ -163,7 +167,7 @@ $OUTPUT_ROOT/
 │       ├── training_log.jsonl
 │       └── eval/
 │           ├── report.json          all phase outputs
-│           ├── per_feature_stats.csv
+│           ├── per_feature_stats.csv   incl. unexplained-mass discovery columns
 │           ├── feature_label_associations.csv
 │           ├── top_activating_tokens.csv
 │           ├── causal_ablation.csv
@@ -178,14 +182,7 @@ The run ends with a cross-layer summary table printed to the log. None of these 
 
 ## Citation
 
-```bibtex
-@mastersthesis{nagi2026sae,
-  title  = {Sparse Autoencoders for Interpretability of InstaNovo},
-  author = {Nagi, Mohammed Esameldin Adam},
-  school = {African Institute for Mathematical Sciences (AIMS) South Africa},
-  year   = {2026}
-}
-```
+Citation details withheld for anonymous review.
 
 Built on InstaNovo (Eloff et al., *Nature Machine Intelligence* 7:565–579, 2025) and evaluated on the nine-species benchmark (Wen and Noble, *Scientific Data* 11, 2024). The interpretation step follows InterPLM (Simon and Zou, *Nature Methods* 22:2107–2117, 2025).
 

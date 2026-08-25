@@ -76,9 +76,22 @@ else
     LAYERS=(2 4 6 8)
 fi
 
-OUTPUT_ROOT="${OUTPUT_ROOT:-./sae_pipeline_outputs}"
+# Smoke runs default to their own output root. Sharing one with a production run
+# mixes artefacts written under different settings -- extract.py now refuses such
+# a resume outright (differing dtype / n_peaks), so an explicit split is clearer
+# than a confusing hard failure.
+if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
+    OUTPUT_ROOT="${OUTPUT_ROOT:-./sae_pipeline_outputs_smoke}"
+else
+    OUTPUT_ROOT="${OUTPUT_ROOT:-./sae_pipeline_outputs}"
+fi
 PYTHON="${PYTHON:-python}"
 SEED="${SEED:-0}"
+# Whether DEVICE came from the environment or from the default below. An explicit
+# request is treated as strict (see the resolution block before the header); the
+# default is free to follow the hardware.
+DEVICE_EXPLICIT=0
+[[ -n "${DEVICE:-}" ]] && DEVICE_EXPLICIT=1
 DEVICE="${DEVICE:-cuda}"
 
 # -----------------------------------------------------------------------------
@@ -86,7 +99,10 @@ DEVICE="${DEVICE:-cuda}"
 # Full nine-species benchmark (all splits concatenated). If DATASET_PATH is
 # already set (pointing at a pre-merged parquet), the merge step is skipped.
 DATASET_HF_ID="${DATASET_HF_ID:-InstaDeepAI/ms_ninespecies_benchmark}"
-COMBINED_DATASET="${COMBINED_DATASET:-$OUTPUT_ROOT/combined_ninespecies.parquet}"
+# Kept OUTSIDE OUTPUT_ROOT so a smoke run reuses the merged parquet rather than
+# re-downloading and re-merging 639k spectra into its own directory.
+DATASET_DIR="${DATASET_DIR:-./sae_pipeline_outputs}"
+COMBINED_DATASET="${COMBINED_DATASET:-$DATASET_DIR/combined_ninespecies.parquet}"
 DATASET_PATH="${DATASET_PATH:-}"   # set externally to skip the merge step
 
 # -----------------------------------------------------------------------------
@@ -96,6 +112,10 @@ MODEL_PATH="${MODEL_PATH:-./instanovo_v1.1.0.ckpt}"
 # -----------------------------------------------------------------------------
 # Extraction
 EXTRACT_BATCH_SIZE="${EXTRACT_BATCH_SIZE:-32}"
+# Remember whether the caller set these before the defaults below erase the
+# distinction: the smoke block re-sizes them, and must not silently overrule an
+# explicit request (same rule as DEVICE_EXPLICIT above).
+CHUNK_SIZE_EXPLICIT="${CHUNK_SIZE:-}"
 CHUNK_SIZE="${CHUNK_SIZE:-1024}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 # bfloat16 halves disk vs float32 with negligible precision loss for SAE training.
@@ -114,6 +134,9 @@ ION_TYPES="${ION_TYPES:-byIp}"
 # ~0.02 Da for lower-resolution instruments.
 FRAGMENT_TOL="${FRAGMENT_TOL:-20.0}"
 FRAGMENT_TOL_MODE="${FRAGMENT_TOL_MODE:-ppm}"
+# Parallel annotation processes. Annotation is CPU-only, so the default uses
+# every core; cap it on a shared node. Worker count never changes the output.
+ANNOTATE_WORKERS="${ANNOTATE_WORKERS:-}"
 
 # -----------------------------------------------------------------------------
 # SAE architecture and training
@@ -130,6 +153,11 @@ EPOCHS="${EPOCHS:-3}"                          # ~85M tokens/epoch -> convergenc
 SAE_BATCH_SIZE="${SAE_BATCH_SIZE:-8192}"       # tokens/batch; larger steadies BatchTopK
 GRAD_CLIP="${GRAD_CLIP:-1.0}"
 SKIP_TRAIN="${SKIP_TRAIN:-0}"  # 1 = require restored checkpoints; never train
+# Dtype the trainer computes in, INDEPENDENT of EXTRACT_DTYPE: activations are
+# cast on load, so a bfloat16 extract still occupies 4 bytes/element in a
+# float32 RAM cache. choose_ram_cache sizes against THIS value -- sizing against
+# the extract dtype under-counts the cache by 2x and invites an OOM mid-run.
+TRAIN_DTYPE="${TRAIN_DTYPE:-float32}"
 
 # RAM cache vs streaming. Unset (the default) means "decide automatically once
 # the manifest is known" -- see choose_ram_cache below. Set to 1 to force
@@ -147,6 +175,7 @@ EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-4096}"
 # RUN_CAUSAL=0 disables both. By default, full runs keep Phase 7 enabled and
 # skip Phase 8 because causal ablation is much more expensive.
 RUN_CAUSAL="${RUN_CAUSAL:-1}"
+RUN_PHASE_7_EXPLICIT="${RUN_PHASE_7:-}"   # see CHUNK_SIZE_EXPLICIT above
 RUN_PHASE_7="${RUN_PHASE_7:-$RUN_CAUSAL}"
 RUN_PHASE_8="${RUN_PHASE_8:-0}"
 PHASE8_RESUME="${PHASE8_RESUME:-0}"          # 1 = force eval and skip all phases except 8
@@ -175,16 +204,30 @@ REPORT_DISK_USAGE="${REPORT_DISK_USAGE:-1}"
 # Smoke-test override
 if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
     MAX_SPECTRA="${MAX_SPECTRA:-4096}"   # 0 = no cap; nonzero must be batch-aligned
+    # Evaluation materialises a dense [tokens, d_dict] feature matrix for one
+    # chunk at a time. At the production CHUNK_SIZE of 1024 with d_dict=12288
+    # that is ~10 GB, which OOMs a typical development box, so the smoke test
+    # uses smaller chunks. Must stay a multiple of EXTRACT_BATCH_SIZE.
+    CHUNK_SIZE="${CHUNK_SIZE_EXPLICIT:-${SMOKE_CHUNK_SIZE:-128}}"
     EPOCHS=1
     SAE_BATCH_SIZE=1024
     EVAL_BATCH_SIZE=1024
     TRAIN_NO_RAM_CACHE="${TRAIN_NO_RAM_CACHE:-0}"
-    RUN_CAUSAL=0                         # skip model-dependent phases in smoke test
-    RUN_PHASE_7=0
-    RUN_PHASE_8=0
+    # Warmup must be shorter than the run, or every step stays on the warmup
+    # branch and the cosine decay is never exercised. At the smoke sizing above
+    # one epoch is only a few hundred steps.
+    WARMUP_STEPS="${SMOKE_WARMUP_STEPS:-25}"
+    # Phase 7 IS exercised: it is one substitution pass, and it is the only step
+    # that checks the encoder hook, the n_peaks agreement between extraction and
+    # the re-run loader, and the flash-attention guard. Phase 8 stays off because
+    # its cost is quadratic in concepts x features.
+    RUN_CAUSAL="${SMOKE_RUN_CAUSAL:-1}"
+    RUN_PHASE_7="${RUN_PHASE_7_EXPLICIT:-$RUN_CAUSAL}"
+    RUN_PHASE_8="${SMOKE_RUN_PHASE_8:-0}"
     ABLATION_SPECTRA=256
     ABLATION_PER_FEATURE_TOP=5
     EXTRACT_DTYPE="float32"              # avoid bfloat16 issues on CPU-only smoke runs
+    TRAIN_DTYPE="float32"
 else
     MAX_SPECTRA="${MAX_SPECTRA:-0}"      # 0 = no cap (entire dataset)
 fi
@@ -249,6 +292,15 @@ ANNOTATION_DIR="$OUTPUT_ROOT/annotation"
 SAE_ROOT="$OUTPUT_ROOT/sae"
 mkdir -p "$SAE_ROOT"
 
+# Cross-process RAM-cache accounting for the documented pattern of running
+# several invocations of this script concurrently against the same
+# OUTPUT_ROOT (one per layer, on separate GPUs/DEVICE -- see choose_ram_cache
+# below). Each invocation records how many bytes it has committed to the RAM
+# cache here, so a sibling invocation's free-memory check can account for it.
+RAM_RESERVATION_DIR="$OUTPUT_ROOT/.ram_reservations"
+RAM_RESERVATION_FILE="$RAM_RESERVATION_DIR/$$"
+trap 'rm -f "$RAM_RESERVATION_FILE" 2>/dev/null || true' EXIT
+
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
@@ -302,25 +354,54 @@ choose_ram_cache() {
         return
     fi
 
+    mkdir -p "$RAM_RESERVATION_DIR"
+
+    # Sum bytes reserved by other still-running invocations of this script
+    # against the same OUTPUT_ROOT, so this invocation doesn't independently
+    # see the same "free" RAM a sibling already committed to its own cache and
+    # collectively over-commit. A reservation file left behind by a process
+    # that has since died (crash, kill -9) is stale and cleaned up here.
+    local reserved_by_others=0 f pid bytes
+    for f in "$RAM_RESERVATION_DIR"/*; do
+        [[ -e "$f" ]] || continue
+        pid="$(basename "$f")"
+        [[ "$pid" == "$$" ]] && continue
+        if kill -0 "$pid" 2>/dev/null; then
+            bytes="$(cat "$f" 2>/dev/null)"
+            reserved_by_others=$(( reserved_by_others + ${bytes:-0} ))
+        else
+            rm -f "$f" 2>/dev/null || true
+        fi
+    done
+    if (( reserved_by_others > 0 )); then
+        log "  RAM cache      : $(( reserved_by_others / 1000000000 ))GB already reserved by other concurrent invocation(s)"
+    fi
+
     local decision
-    decision="$("$PYTHON" - "$EXTRACT_DIR/manifest.json" "$D_MODEL" "$RAM_CACHE_SAFETY" <<'PYEOF'
+    decision="$("$PYTHON" - "$EXTRACT_DIR/manifest.json" "$D_MODEL" "$RAM_CACHE_SAFETY" "$reserved_by_others" "$TRAIN_DTYPE" <<'PYEOF'
 import json, sys
 from pathlib import Path
 
-manifest_path, d_model, safety = Path(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3])
+manifest_path, d_model, safety, reserved, train_dtype = (
+    Path(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3]), int(sys.argv[4]),
+    sys.argv[5],
+)
 DTYPE_BYTES = {"float32": 4, "bfloat16": 2, "float16": 2}
 
 try:
     manifest = json.loads(manifest_path.read_text())
     n_tokens = int(manifest["n_tokens"])
-    dtype = str(manifest.get("config", {}).get("dtype", "float32"))
-    needed = n_tokens * d_model * DTYPE_BYTES.get(dtype, 4)
+    # Size against the TRAINING dtype, not the manifest's storage dtype: the
+    # loader casts on read, so a bfloat16 extract still fills a float32 buffer.
+    needed = n_tokens * d_model * DTYPE_BYTES.get(train_dtype, 4)
 except Exception as exc:                       # manifest unreadable -> stay safe
-    print(f"1 unknown could-not-size-layer:{exc}")
+    print(f"1 0 unknown could-not-size-layer:{exc}")
     raise SystemExit(0)
 
 # MemAvailable is the kernel's own estimate of what can be allocated without
 # swapping, which is the right number here (MemFree ignores reclaimable cache).
+# Bytes already reserved by concurrent sibling invocations are treated as
+# unavailable to this one.
 available = 0
 try:
     for line in Path("/proc/meminfo").read_text().splitlines():
@@ -329,18 +410,56 @@ try:
             break
 except Exception:
     pass
+free_for_us = max(0, available - reserved)
 
 if available <= 0:
-    print(f"1 {needed/1e9:.0f}GB free-ram-unknown")
-elif needed <= available * safety:
-    print(f"0 {needed/1e9:.0f}GB fits-in-{available/1e9:.0f}GB-available")
+    print(f"1 {needed} free-ram-unknown")
+elif needed <= free_for_us * safety:
+    print(f"0 {needed} fits-in-{free_for_us/1e9:.0f}GB-available-after-other-reservations")
 else:
-    print(f"1 {needed/1e9:.0f}GB exceeds-{safety:.0%}-of-{available/1e9:.0f}GB-available")
+    print(f"1 {needed} exceeds-{safety:.0%}-of-{free_for_us/1e9:.0f}GB-available-after-other-reservations")
 PYEOF
 )"
     TRAIN_NO_RAM_CACHE="${decision%% *}"
-    log "  RAM cache      : auto -> no_ram_cache=$TRAIN_NO_RAM_CACHE  (${decision#* })"
+    local rest="${decision#* }"
+    local needed_bytes="${rest%% *}"
+    log "  RAM cache      : auto -> no_ram_cache=$TRAIN_NO_RAM_CACHE  (${rest#* })"
+
+    # Commit this invocation's reservation so concurrent siblings see it.
+    # Held for the lifetime of this process (cleaned up by the EXIT trap),
+    # since training loops over every layer in $LAYERS sequentially and each
+    # layer's cache is the same size, so the peak is one layer, not the sum.
+    if [[ "$TRAIN_NO_RAM_CACHE" == "0" ]]; then
+        echo "$needed_bytes" > "$RAM_RESERVATION_FILE"
+    fi
 }
+
+# -----------------------------------------------------------------------------
+# Device resolution
+#
+# The default follows the hardware: cuda when torch can actually see a GPU, cpu
+# otherwise, so a laptop smoke test needs no extra env var. torch is the arbiter
+# rather than nvidia-smi -- a driver can be present while torch is a CPU-only
+# build, and it is torch that every stage actually calls.
+#
+# Setting DEVICE explicitly is strict: DEVICE=cuda on a machine with no usable
+# GPU aborts instead of quietly falling back, because a CPU run over the full
+# dataset is orders of magnitude slower and would burn a cluster allocation
+# before anyone noticed. Unset DEVICE to auto-select, or pass DEVICE=cpu.
+# -----------------------------------------------------------------------------
+
+if [[ "$DEVICE" == cuda* ]]; then
+    if ! "$PYTHON" -c "import sys, torch; sys.exit(0 if torch.cuda.is_available() else 1)" \
+            >/dev/null 2>&1; then
+        if [[ "$DEVICE_EXPLICIT" == "1" ]]; then
+            echo "ERROR: DEVICE=$DEVICE was requested, but torch.cuda.is_available() is False." >&2
+            echo "       Unset DEVICE to auto-select a device, or pass DEVICE=cpu to force CPU." >&2
+            exit 1
+        fi
+        DEVICE_FALLBACK_NOTE="  (auto: no usable CUDA device, fell back from cuda)"
+        DEVICE=cpu
+    fi
+fi
 
 # -----------------------------------------------------------------------------
 # Header
@@ -366,7 +485,15 @@ log "  Keep chunks     : $KEEP_CHUNKS  (annotation always kept)"
 log "  Smoke / cap     : smoke=${SMOKE_TEST:-0}, max_spectra=$MAX_SPECTRA"
 log "  Python          : $("$PYTHON" --version 2>&1)"
 log "  GPU             : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo 'none detected')"
+log "  Device          : $DEVICE${DEVICE_FALLBACK_NOTE:-}"
 log "================================================================"
+
+# Loud and greppable: on a GPU node this line means something is wrong with the
+# GPU, not with the request, and the run is about to be far slower than planned.
+if [[ -n "${DEVICE_FALLBACK_NOTE:-}" ]]; then
+    log "WARNING: no usable CUDA device detected -- running on CPU. Expect a large"
+    log "         slowdown; pass DEVICE=cuda to make this a hard error instead."
+fi
 
 # -----------------------------------------------------------------------------
 # Step 0: Prepare dataset -- merge all HF splits into one local parquet
@@ -434,6 +561,31 @@ if [[ "$MAX_SPECTRA" != "0" ]]; then
     EXTRACT_ARGS+=(--max-spectra "$MAX_SPECTRA")
 fi
 
+# Manifest/chunk disagreement. Before the resume-counting fix, extract.py's
+# __iter__ did not yield chunks it skipped on resume, so extract_all counted only
+# the NEW ones -- and _write_manifest lists chunks as range(n_chunks). A run that
+# skipped chunks 0-9 and wrote 10-19 therefore recorded n_chunks=10 describing
+# chunks 0-9 while carrying chunk 10-19's token count. Such a manifest is
+# structurally valid and passes every schema check, so it is caught here by
+# comparing it against what is actually on disk. The repair is cheap: delete
+# manifest.json and re-run: per-chunk resume reuses every existing chunk and only
+# the manifest is rebuilt (no re-extraction).
+if [[ -f "$EXTRACT_DIR/manifest.json" && -d "$EXTRACT_DIR/chunks" ]]; then
+    on_disk="$(find "$EXTRACT_DIR/chunks" -maxdepth 1 -name 'meta_*.pt' | wc -l | tr -d ' ')"
+    listed="$("$PYTHON" -c "
+import json, sys
+print(json.load(open(sys.argv[1])).get('n_chunks', 0))
+" "$EXTRACT_DIR/manifest.json" 2>/dev/null || echo 0)"
+    if [[ "$on_disk" -gt 0 && "$listed" -gt 0 && "$on_disk" -ne "$listed" ]]; then
+        log "FAIL Extract manifest lists $listed chunk(s) but $on_disk meta_*.pt files are on disk."
+        log "     This manifest was written by a resumed run before the chunk-counting fix,"
+        log "     so its chunk list, n_spectra and n_tokens describe the wrong chunks."
+        log "     Delete $EXTRACT_DIR/manifest.json and re-run: the existing chunks are"
+        log "     reused as-is and only the manifest is rebuilt."
+        exit 1
+    fi
+fi
+
 RUN_EXTRACT=1
 if [[ -f "$EXTRACT_DIR/manifest.json" ]]; then
     missing_layers="$("$PYTHON" - "$EXTRACT_DIR/manifest.json" "${LAYERS[@]}" <<'PYEOF'
@@ -480,17 +632,52 @@ fi
 # window is far too wide at Orbitrap resolution and would match spurious peaks
 # as b/y ions, corrupting the cleavage-site labels.
 
+# The existence check alone is not enough: annotate.py's own schema check only
+# runs once annotate.py is invoked, and skipping the step means it never is. A
+# label set written under an older ANNOTATION_SCHEMA_VERSION would then be reused
+# silently, which is exactly the stale-artefact failure the versions exist to
+# prevent -- so validate before deciding to skip.
+ANNOTATION_STATE="missing"
 if [[ -f "$ANNOTATION_DIR/annotation_manifest.json" ]]; then
-    log "Annotation manifest exists -- skipping annotation"
+    ANNOTATION_STATE="$("$PYTHON" - "$ANNOTATION_DIR/annotation_manifest.json" "$SCRIPT_DIR" <<'PYEOF'
+import json, sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[2])
+from schema import ANNOTATION_SCHEMA_VERSION
+
+try:
+    found = int(json.loads(Path(sys.argv[1]).read_text())["schema_version"])
+except Exception as exc:
+    print(f"unreadable:{exc}")
+    raise SystemExit(0)
+print("current" if found == ANNOTATION_SCHEMA_VERSION
+      else f"stale:{found}:{ANNOTATION_SCHEMA_VERSION}")
+PYEOF
+)"
+fi
+
+if [[ "$ANNOTATION_STATE" == "current" ]]; then
+    log "Annotation manifest exists and matches the current schema -- skipping annotation"
+elif [[ "$ANNOTATION_STATE" != "missing" ]]; then
+    log "FAIL Annotation at $ANNOTATION_DIR is not usable by this build ($ANNOTATION_STATE)."
+    log "     Concept labels have changed, so cached labels would give wrong results."
+    log "     Delete $ANNOTATION_DIR and re-run to regenerate them."
+    exit 1
 else
+    ANNOTATE_ARGS=(
+        --extract-dir       "$EXTRACT_DIR"
+        --output-dir        "$ANNOTATION_DIR"
+        --ion-types         "$ION_TYPES"
+        --fragment-tol      "$FRAGMENT_TOL"
+        --fragment-tol-mode "$FRAGMENT_TOL_MODE"
+    )
+    if [[ -n "$ANNOTATE_WORKERS" ]]; then
+        ANNOTATE_ARGS+=(--num-workers "$ANNOTATE_WORKERS")
+    fi
     run_step "Annotate spectra (ion_types=$ION_TYPES, tol=${FRAGMENT_TOL} ${FRAGMENT_TOL_MODE})" \
         "$OUTPUT_ROOT/annotate.log" \
-        "$PYTHON" "$ANNOTATE_PY" \
-            --extract-dir          "$EXTRACT_DIR" \
-            --output-dir           "$ANNOTATION_DIR" \
-            --ion-types            "$ION_TYPES" \
-            --fragment-tol         "$FRAGMENT_TOL" \
-            --fragment-tol-mode    "$FRAGMENT_TOL_MODE"
+        "$PYTHON" "$ANNOTATE_PY" "${ANNOTATE_ARGS[@]}"
     # Internal fragments (ion type 'm') are enabled by default in annotate.py.
     # Add --no-internal above if you want to disable them.
 fi
@@ -534,6 +721,7 @@ for LAYER in "${LAYERS[@]}"; do
         --n-epochs       "$EPOCHS"
         --batch-size     "$SAE_BATCH_SIZE"
         --grad-clip-norm "$GRAD_CLIP"
+        --dtype          "$TRAIN_DTYPE"
         --device         "$DEVICE"
     )
     if [[ "$TRAIN_NO_RAM_CACHE" == "1" ]]; then
@@ -556,6 +744,62 @@ done
 #
 # evaluate.py appends layer_{L}/seed_{S}/eval/ to --output-dir automatically,
 # so --output-dir must be SAE_ROOT (not a separate eval directory).
+#
+# Phases 7/8 rebuild their own DataLoader from the extract manifest's
+# dataset_path -- the FULL dataset, even when extraction was capped. Processing
+# 639k spectra to evaluate 4k costs ~18 minutes of mapping per layer and yields
+# nothing, so a capped run gets a pre-sliced source instead. The slice must be
+# the FIRST n rows in dataset order, because that is exactly what extract.py
+# consumed (shuffle=False), and Phase 7/8 align per-spectrum CE against the
+# per-spectrum prevalence taken from those chunks.
+
+EVAL_SPECTRA_PATH=""
+if [[ "$RUN_PHASE_7" == "1" || "$RUN_PHASE_8" == "1" ]]; then
+    EXTRACTED_SPECTRA="$("$PYTHON" -c "
+import json, sys
+print(json.load(open(sys.argv[1]))['n_spectra'])
+" "$EXTRACT_DIR/manifest.json" 2>/dev/null || echo 0)"
+    TOTAL_SPECTRA="$("$PYTHON" -c "
+import sys
+import pyarrow.parquet as pq
+try:
+    print(pq.ParquetFile(sys.argv[1]).metadata.num_rows)
+except Exception:
+    print(0)
+" "$DATASET_PATH" 2>/dev/null || echo 0)"
+
+    if [[ "$EXTRACTED_SPECTRA" -gt 0 && "$TOTAL_SPECTRA" -gt "$EXTRACTED_SPECTRA" ]]; then
+        EVAL_SPECTRA_PATH="$OUTPUT_ROOT/eval_spectra_first${EXTRACTED_SPECTRA}.parquet"
+        if [[ -f "$EVAL_SPECTRA_PATH" ]]; then
+            log "Capped eval spectra source already exists: $EVAL_SPECTRA_PATH"
+        else
+            run_step "Cap Phase 7/8 spectra source to the first $EXTRACTED_SPECTRA of $TOTAL_SPECTRA rows" \
+                "$OUTPUT_ROOT/cap_eval_spectra.log" \
+                "$PYTHON" - "$DATASET_PATH" "$EVAL_SPECTRA_PATH" "$EXTRACTED_SPECTRA" <<'PYEOF'
+import sys
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+src, dst, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+reader = pq.ParquetFile(src)
+batches, taken = [], 0
+for batch in reader.iter_batches(batch_size=min(n, 8192)):
+    if taken >= n:
+        break
+    if taken + batch.num_rows > n:
+        batch = batch.slice(0, n - taken)
+    batches.append(batch)
+    taken += batch.num_rows
+
+if taken != n:
+    raise SystemExit(f"source has {taken} rows, expected at least {n}")
+
+pq.write_table(pa.Table.from_batches(batches), dst)
+print(f"Wrote first {taken} rows of {src} -> {dst}")
+PYEOF
+        fi
+    fi
+fi
 
 ANCHOR_LAYER="${LAYERS[0]}"
 for LAYER in "${LAYERS[@]}"; do
@@ -627,6 +871,9 @@ for LAYER in "${LAYERS[@]}"; do
     # --spectra-path is only needed if the dataset file has moved.
     if [[ "$RUN_PHASE_7" == "1" || "$RUN_PHASE_8" == "1" ]]; then
         EVAL_ARGS+=(--instanovo-path "$MODEL_PATH")
+        if [[ -n "$EVAL_SPECTRA_PATH" ]]; then
+            EVAL_ARGS+=(--spectra-path "$EVAL_SPECTRA_PATH")
+        fi
     fi
 
     # Cross-layer matching: only the anchor layer runs it, pointing at the other
@@ -667,9 +914,37 @@ if [[ "$KEEP_CHUNKS" == "1" ]]; then
     log "  (The manifest.json is kept for provenance even if chunks are deleted.)"
 else
     if [[ -d "$EXTRACT_DIR/chunks" ]]; then
-        log "KEEP_CHUNKS=0 -- deleting extract chunks (freeing ~$(dir_size "$EXTRACT_DIR/chunks"))"
-        rm -rf "$EXTRACT_DIR/chunks"
-        log "  manifest.json kept for provenance"
+        # The manifest can cover layers beyond this invocation's $LAYERS (e.g.
+        # a sibling invocation is concurrently training/evaluating another
+        # layer against the same OUTPUT_ROOT, per the documented per-layer
+        # concurrent-run pattern). Per-layer activation files
+        # (acts_L{layer}_*.pt) are safe to remove selectively, but meta_*.pt
+        # is layer-independent and still needed by every other layer's
+        # evaluate.py run, so it must only be removed when nothing else in the
+        # manifest still needs this chunk directory.
+        other_layers="$("$PYTHON" - "$EXTRACT_DIR/manifest.json" "${LAYERS[@]}" <<'PYEOF'
+import json, sys
+from pathlib import Path
+
+manifest = json.loads(Path(sys.argv[1]).read_text())
+requested = {str(x) for x in sys.argv[2:]}
+target = {str(x) for x in manifest.get("target_layers", [])}
+print(" ".join(sorted(target - requested)))
+PYEOF
+)"
+        if [[ -n "$other_layers" ]]; then
+            log "KEEP_CHUNKS=0, but the manifest also covers layer(s) $other_layers not"
+            log "  requested by this invocation (LAYERS=${LAYERS[*]}) -- only deleting this"
+            log "  invocation's own activation files; metadata and other layers' activations"
+            log "  are kept for the invocation(s) still using them."
+            for L in "${LAYERS[@]}"; do
+                rm -f "$EXTRACT_DIR"/chunks/acts_L${L}_*.pt
+            done
+        else
+            log "KEEP_CHUNKS=0 -- deleting extract chunks (freeing ~$(dir_size "$EXTRACT_DIR/chunks"))"
+            rm -rf "$EXTRACT_DIR/chunks"
+            log "  manifest.json kept for provenance"
+        fi
     fi
 fi
 
@@ -788,6 +1063,277 @@ for L in layers:
         size_mb = ckpt.stat().st_size / 1e6
         print(f"          checkpoint: {ckpt}  ({size_mb:.0f} MB)")
 PYEOF
+
+# -----------------------------------------------------------------------------
+# Smoke-test verification
+# -----------------------------------------------------------------------------
+#
+# Exiting 0 only means no command crashed. These checks assert the artefacts are
+# actually well-formed and mutually consistent, which is what makes the smoke
+# test worth running before committing a GPU cluster to the full dataset.
+
+if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
+    log ""
+    log "================================================================"
+    log "Smoke-test verification"
+    log "================================================================"
+    # pipefail (set at the top) makes the pipeline report the Python exit status
+    # rather than tee's, and `|| smoke_status=1` keeps `set -e` from exiting here
+    # so the failure can be logged before the explicit exit below.
+    smoke_status=0
+    "$PYTHON" - "$OUTPUT_ROOT" "$SAE_ROOT" "$SEED" "$SCRIPT_DIR" "${LAYERS[@]}" <<'PYEOF' 2>&1 | tee -a "$PIPELINE_LOG" || smoke_status=1
+import json, sys
+from pathlib import Path
+
+root, sae_root, seed, script_dir = (
+    Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+)
+layers = [int(x) for x in sys.argv[5:]]
+sys.path.insert(0, script_dir)
+from schema import ANNOTATION_SCHEMA_VERSION, EXTRACT_SCHEMA_VERSION, SAE_SCHEMA_VERSION
+
+import torch
+
+failures, checks = [], 0
+
+def check(label, ok, detail=""):
+    global checks
+    checks += 1
+    status = "PASS" if ok else "FAIL"
+    print(f"  [{status}] {label}" + (f" -- {detail}" if detail else ""))
+    if not ok:
+        failures.append(label)
+
+def finite(x):
+    return isinstance(x, (int, float)) and x == x and abs(x) != float("inf")
+
+def num(x, spec):
+    """Format x, or "n/a" if it is missing/None/non-numeric.
+
+    check()'s detail argument is evaluated eagerly, before check() can decide
+    the result -- so a bare f"{value:.1f}" on a missing metric raises and kills
+    the whole verification pass in exactly the case the check exists to report.
+    """
+    try:
+        return format(float(x), spec)
+    except (TypeError, ValueError):
+        return "n/a"
+
+# --- extraction ---
+em_path = root / "extract" / "manifest.json"
+check("extract manifest exists", em_path.exists(), str(em_path))
+if em_path.exists():
+    em = json.loads(em_path.read_text())
+    check("extract schema current", em["schema_version"] == EXTRACT_SCHEMA_VERSION,
+          f"found {em['schema_version']}")
+    check("extract produced >= 2 chunks", em["n_chunks"] >= 2,
+          f"{em['n_chunks']} chunks (train.py needs >=2 to hold out a val split)")
+    check("every requested layer extracted",
+          all(str(L) in em["chunks"][0]["activations"] for L in layers),
+          f"layers {layers}")
+    check("resume fingerprint written", (root / "extract" / "extract_config.json").exists())
+    n_extract_tokens = em["n_tokens"]
+    check("extract token count positive", n_extract_tokens > 0, f"{n_extract_tokens:,} tokens")
+else:
+    n_extract_tokens = None
+
+# --- annotation ---
+am_path = root / "annotation" / "annotation_manifest.json"
+check("annotation manifest exists", am_path.exists())
+if am_path.exists():
+    am = json.loads(am_path.read_text())
+    check("annotation schema current", am["schema_version"] == ANNOTATION_SCHEMA_VERSION,
+          f"found {am['schema_version']}")
+    if n_extract_tokens is not None:
+        check("annotation token count matches extraction",
+              am["n_tokens"] == n_extract_tokens,
+              f"{am['n_tokens']:,} vs {n_extract_tokens:,}")
+    check("concept registry populated", len(am["registry"]["names"]) > 0,
+          f"{len(am['registry']['names'])} concepts")
+    rates = am["base_rates"]
+    check("base rates are probabilities",
+          all(0.0 <= v <= 1.0 for v in rates.values()))
+    # The fix that motivated schema v2: unmatched peaks carry no fragment charge.
+    check("fragment-charge concepts are not noise-dominated",
+          rates.get("is_fragment_charge_1", 0.0) < 0.90,
+          f"is_fragment_charge_1 base rate {rates.get('is_fragment_charge_1', 0.0):.3f}")
+
+# --- per layer: checkpoint + eval ---
+for L in layers:
+    base = sae_root / f"layer_{L}" / f"seed_{seed}"
+    ckpt_path = base / "checkpoint.pt"
+    check(f"layer {L}: checkpoint exists", ckpt_path.exists())
+    if ckpt_path.exists():
+        try:
+            ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            check(f"layer {L}: SAE schema current",
+                  ck.get("schema_version") == SAE_SCHEMA_VERSION,
+                  f"found {ck.get('schema_version')}")
+            dmin, dmax = ck.get("decoder_norm_min"), ck.get("decoder_norm_max")
+            check(f"layer {L}: decoder rows unit-norm",
+                  finite(dmin) and finite(dmax)
+                  and abs(dmin - 1.0) < 1e-3 and abs(dmax - 1.0) < 1e-3,
+                  f"[{num(dmin, '.6f')}, {num(dmax, '.6f')}]")
+            fm = ck.get("final_metrics") or {}
+            check(f"layer {L}: final FVE finite", finite(fm.get("fve_uncentered")),
+                  f"{fm.get('fve_uncentered')}")
+            check(f"layer {L}: inference L0 > 0", (fm.get("l0_mean") or 0) > 0,
+                  f"L0={num(fm.get('l0_mean'), '.1f')} (k={ck.get('k')})")
+            d_dict = ck.get("d_dict")
+            check(f"layer {L}: not every feature dead",
+                  finite(d_dict) and fm.get("dead_features", d_dict) < d_dict,
+                  f"{fm.get('dead_features')}/{d_dict} dead")
+            # Stored as a 0-dim torch tensor, so coerce rather than isinstance-test.
+            try:
+                thr = float(ck.get("jumprelu_threshold"))
+            except (TypeError, ValueError):
+                thr = None
+            check(f"layer {L}: JumpReLU threshold calibrated",
+                  thr is not None and thr > 0,
+                  f"thr={num(thr, '.4f')}")
+        except Exception as exc:
+            # A malformed checkpoint is exactly what this block exists to catch,
+            # so report it as a failed check rather than dying with a traceback
+            # and skipping every remaining layer's checks.
+            check(f"layer {L}: checkpoint readable", False, f"{type(exc).__name__}: {exc}")
+
+    rpt_path = base / "eval" / "report.json"
+    check(f"layer {L}: eval report exists", rpt_path.exists())
+    if rpt_path.exists():
+        r = json.loads(rpt_path.read_text())
+        p12 = r.get("phase_1_2", {})
+        check(f"layer {L}: phase 1+2 FVE finite", finite(p12.get("fve_overall")),
+              f"{p12.get('fve_overall')}")
+        check(f"layer {L}: phase 1+2 L0 > 0", (p12.get("l0_mean") or 0) > 0,
+              f"L0={p12.get('l0_mean')}")
+        if "phase_7" in r and r["phase_7"]:
+            lr_ = r["phase_7"].get("loss_recovered_vs_zero")
+            check(f"layer {L}: phase 7 loss_recovered finite", finite(lr_), f"{lr_}")
+        csv_path = base / "eval" / "per_feature_stats.csv"
+        check(f"layer {L}: per_feature_stats.csv exists", csv_path.exists())
+        if csv_path.exists():
+            header = csv_path.read_text().splitlines()[0].split(",")
+            check(f"layer {L}: discovery columns present",
+                  "unexplained_mass_fraction" in header and "unexplained_enrichment" in header,
+                  ",".join(header))
+
+print()
+print(f"{checks - len(failures)}/{checks} checks passed")
+if failures:
+    print("FAILED: " + "; ".join(failures))
+raise SystemExit(1 if failures else 0)
+PYEOF
+
+    if [[ "$smoke_status" == "0" ]]; then
+        log "Smoke test PASSED"
+    else
+        log "Smoke test FAILED -- see the checks above"
+        exit 1
+    fi
+fi
+
+# -----------------------------------------------------------------------------
+# Publish durable artefacts to the AIchor output bucket
+#
+# AIchor does not mount its buckets. AICHOR_OUTPUT_PATH is an S3 URI reached
+# through an S3 client using AWS_ENDPOINT_URL, while an attached PVC is the only
+# real filesystem -- and AIchor's own docs call a PVC "a fast working cache, not
+# a system of record". So OUTPUT_ROOT stays on the PVC, where the ~415 GB of
+# activations can be written and re-read, and the small durable artefacts are
+# copied to the bucket here. AIchor scopes AICHOR_OUTPUT_PATH to the experiment
+# id, so each run's results land in their own subfolder.
+#
+# Chunks, label chunks and the merged parquet are deliberately NOT published:
+# they are regenerable intermediates, and together they dwarf everything else.
+#
+# The whole step is skipped when AICHOR_OUTPUT_PATH is unset, so local and smoke
+# runs are unaffected.
+# -----------------------------------------------------------------------------
+
+if [[ -n "${AICHOR_OUTPUT_PATH:-}" ]]; then
+    run_step "Publish artefacts to AIchor output bucket" \
+        "$OUTPUT_ROOT/publish.log" \
+        "$PYTHON" - "$OUTPUT_ROOT" <<'PYEOF'
+import fnmatch
+import os
+import sys
+from pathlib import Path
+from urllib.parse import urlparse
+
+root = Path(sys.argv[1])
+
+# Small, durable, and expensive to reproduce. Anything not matched here stays on
+# the PVC. Patterns are matched against POSIX paths relative to OUTPUT_ROOT.
+INCLUDE = [
+    "*.log",
+    "extract/manifest.json",
+    "extract/extract_config.json",
+    "annotation/annotation_manifest.json",
+    "annotation/concept_phi.pt",
+    "sae/*.log",
+    "sae/layer_*/seed_*/checkpoint.pt",
+    "sae/layer_*/seed_*/config.json",
+    "sae/layer_*/seed_*/training_log.jsonl",
+    "sae/layer_*/seed_*/eval/*",
+    "interpret/layer_*/*",
+]
+
+dest = os.environ["AICHOR_OUTPUT_PATH"]
+if "s3://" not in dest:                      # AIchor may hand it over bare
+    dest = f"s3://{dest}"
+dest = dest.rstrip("/")
+
+if "AWS_ENDPOINT_URL" not in os.environ:
+    print("ERROR: AICHOR_OUTPUT_PATH is set but AWS_ENDPOINT_URL is not; "
+          "cannot reach the bucket.", file=sys.stderr)
+    raise SystemExit(1)
+
+import s3fs
+
+fs = s3fs.core.S3FileSystem(
+    key=os.environ.get("AWS_ACCESS_KEY_ID"),
+    secret=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+    client_kwargs={"endpoint_url": os.environ["AWS_ENDPOINT_URL"]},
+)
+
+selected = []
+for path in sorted(root.rglob("*")):
+    if not path.is_file():
+        continue
+    rel = path.relative_to(root).as_posix()
+    if any(fnmatch.fnmatch(rel, pat) for pat in INCLUDE):
+        selected.append((path, rel))
+
+if not selected:
+    print(f"ERROR: nothing matched the publish patterns under {root}.", file=sys.stderr)
+    raise SystemExit(1)
+
+total = sum(p.stat().st_size for p, _ in selected)
+print(f"Publishing {len(selected)} files ({total / 1e6:.1f} MB) to {dest}")
+
+failed = []
+for path, rel in selected:
+    target = f"{dest}/{rel}"
+    parsed = urlparse(target)
+    key = f"{parsed.netloc}{parsed.path}"
+    try:
+        fs.put(str(path), key)
+        print(f"  ok    {rel}")
+    except Exception as exc:                 # noqa: BLE001 -- report every failure
+        print(f"  FAIL  {rel}: {exc}")
+        failed.append(rel)
+
+if failed:
+    print(f"\n{len(failed)}/{len(selected)} uploads failed. The artefacts are "
+          f"still on the PVC under {root}; re-run this step to retry.",
+          file=sys.stderr)
+    raise SystemExit(1)
+
+print(f"\nPublished {len(selected)} files to {dest}")
+PYEOF
+else
+    log "AICHOR_OUTPUT_PATH not set -- skipping bucket publish (artefacts stay in $OUTPUT_ROOT)"
+fi
 
 log ""
 log "All done. Full pipeline log: $PIPELINE_LOG"

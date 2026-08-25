@@ -42,6 +42,7 @@ import dataclasses
 import json
 import logging
 import math
+import os
 import random
 import sys
 import time
@@ -55,11 +56,16 @@ import torch.nn.functional as F
 
 from schema import EXTRACT_SCHEMA_VERSION, SAE_SCHEMA_VERSION
 
-# Re-exported under its historical name because evaluate.py imports
-# `SCHEMA_VERSION` from this module to tag its own report.
-SCHEMA_VERSION = SAE_SCHEMA_VERSION
-
 LOG = logging.getLogger("train")
+
+# Storage dtypes selectable on the CLI. float32 is the default and what the
+# reported results use; bfloat16 halves activation memory at some cost in
+# reconstruction fidelity.
+DTYPE_MAP = {
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+}
 
 # Batches used by a mid-training (non-full) validation pass. Capped so periodic
 # validation stays cheap relative to training; the final pass uses full=True.
@@ -168,9 +174,14 @@ class SparseAutoencoder(nn.Module):
         self.register_buffer("jumprelu_threshold", torch.zeros(()))
         self.register_buffer("_threshold_count", torch.zeros((), dtype=torch.long))
 
-        # Running firing counts for dead-feature tracking.
+        # Running firing counts for dead-feature tracking. Reset once per epoch,
+        # so these describe the current epoch, not the whole run.
         self.register_buffer("firing_count", torch.zeros(d_dict, dtype=torch.long))
         self.register_buffer("tokens_seen", torch.zeros(1, dtype=torch.long))
+
+        # One-shot latch so a degenerate BatchTopK boundary warns once per run
+        # rather than once per batch (see _batch_topk_mask).
+        self._warned_degenerate_topk = False
 
     # --- Encoder / decoder primitives ----------------------------------------
 
@@ -189,15 +200,34 @@ class SparseAutoencoder(nn.Module):
         """Select the top (k * batch_size) pre-activations across the whole batch.
 
         Returns the selection mask and the boundary value (the smallest kept
-        pre-activation), which calibrates the inference JumpReLU threshold. The
-        boundary is None when the batch is too small to fill k * batch_size, in
-        which case every positive pre-activation is kept.
+        pre-activation), which calibrates the inference JumpReLU threshold.
+
+        The boundary is None, and every positive pre-activation is kept, in two
+        cases: a batch too small to fill k * batch_size, and a boundary of zero.
+        The latter means fewer than k * batch_size pre-activations were positive
+        at all, so topk reached into the ReLU's zeros. Selecting on `>= 0` would
+        then mark EVERY feature as active -- reporting L0 = d_dict, hiding the
+        collapse behind a zero dead-feature count, and feeding a 0.0 boundary
+        into the threshold EMA that leaves JumpReLU gating on `h > 0` at
+        inference. Falling back keeps the mask honest, so the dead-feature
+        metrics show the collapse instead of masking it.
         """
         k_total = self.k * h_relu.size(0)
         flat = h_relu.reshape(-1)
         if k_total >= flat.numel():
             return h_relu > 0, None
         kth_value = torch.topk(flat, k_total, sorted=False).values.min()
+        if kth_value <= 0:
+            if not self._warned_degenerate_topk:
+                LOG.warning(
+                    "BatchTopK boundary hit zero: fewer than k*batch_size=%d "
+                    "pre-activations are positive, so the model is close to "
+                    "collapse. Keeping only positive pre-activations and "
+                    "skipping the threshold EMA for such batches.",
+                    k_total,
+                )
+                self._warned_degenerate_topk = True
+            return h_relu > 0, None
         return h_relu >= kth_value, kth_value.detach()
 
     def _auxk_features(self, h_relu: torch.Tensor, main_mask: torch.Tensor) -> torch.Tensor:
@@ -425,6 +455,11 @@ class SAETokenDataset:
         Sizes come from the (small) meta files so the output is preallocated and
         each activation file is freed right after copying -- peak memory is the
         full split plus one chunk, not twice the split.
+
+        Each chunk's row count is checked against its own meta entry. Checking
+        only the total would let two chunks drift in opposite directions and
+        cancel out, which would misalign every activation after the first of
+        them against the labels annotate.py wrote for it.
         """
         sizes = self.chunk_token_counts
         total = sum(sizes)
@@ -432,10 +467,16 @@ class SAETokenDataset:
         off = 0
         for ci, n in zip(self.chunk_indices, sizes):
             acts = _load_layer_activations(self.act_paths[ci]).to(self.dtype)
+            if acts.size(0) != n:
+                raise ValueError(
+                    f"Chunk {ci}: activation file has {acts.size(0)} rows but its "
+                    f"meta records {n} tokens. The activations and metadata are "
+                    "from different extraction runs; re-run extract.py."
+                )
             if buf is None:
                 buf = torch.empty(total, acts.size(1), dtype=self.dtype)
-            buf[off:off + acts.size(0)] = acts
-            off += acts.size(0)
+            buf[off:off + n] = acts
+            off += n
             del acts
         assert buf is not None and off == total, (
             f"cached {off} tokens but meta reported {total}"
@@ -541,9 +582,17 @@ def _split_chunks(manifest: dict, val_fraction: float, seed: int) -> tuple[list[
     """Partition chunk indices into train and validation splits.
 
     Splitting by chunk rather than by token keeps a validation spectrum's tokens
-    out of training entirely. At least one chunk is always held out.
+    out of training entirely. At least one chunk is always held out, which
+    requires at least two chunks total.
     """
     n_chunks = manifest["n_chunks"]
+    if n_chunks < 2:
+        raise ValueError(
+            f"Need at least 2 extraction chunks to hold out a validation split, "
+            f"got {n_chunks}. Lower --chunk-size or raise the spectra count "
+            "(e.g. MAX_SPECTRA / SMOKE_TEST sizing) so extraction produces more "
+            "than one chunk."
+        )
     n_val_chunks = max(1, int(round(val_fraction * n_chunks)))
     rng = random.Random(seed)
     all_chunk_indices = list(range(n_chunks))
@@ -553,13 +602,19 @@ def _split_chunks(manifest: dict, val_fraction: float, seed: int) -> tuple[list[
 
 def _infer_d_model(extract_dir: Path, manifest: dict, target_layer: int, chunk_idx: int) -> int:
     """Read the activation width from one chunk, so d_model never has to be
-    passed in and can never disagree with the extracted files."""
+    passed in and can never disagree with the extracted files.
+
+    Memory-mapped: only the tensor header is needed, and a production chunk is
+    ~630 MB that would otherwise be read in full to learn one integer. Falls
+    back to a normal load if the file predates zipfile serialisation.
+    """
     chunk_entry = manifest["chunks"][chunk_idx]
     acts_path = extract_dir / chunk_entry["activations"][str(target_layer)]
-    acts = _load_layer_activations(acts_path)
-    d_model = acts.size(1)
-    del acts
-    return d_model
+    try:
+        obj = torch.load(acts_path, map_location="cpu", weights_only=False, mmap=True)
+    except (RuntimeError, ValueError):
+        obj = torch.load(acts_path, map_location="cpu", weights_only=False)
+    return int(obj["activations"].size(1))
 
 
 def _build_datasets(
@@ -908,10 +963,16 @@ def _save_checkpoint(
         "b_enc": model.b_enc.detach().cpu(),
         "W_dec": model.W_dec.detach().cpu(),
         "b_dec": model.b_dec.detach().cpu(),
-        # Calibrated global JumpReLU threshold (scalar) and firing stats.
+        # Calibrated global JumpReLU threshold (scalar).
         "jumprelu_threshold": model.jumprelu_threshold.detach().cpu(),
+        # Firing statistics for the FINAL EPOCH only -- _run_epoch resets these
+        # each epoch so its dead-feature figure is per-epoch. The window is
+        # recorded alongside them so the file is self-describing; evaluate.py
+        # computes its own firing rates over the tokens it scores and does not
+        # read these.
         "firing_count": model.firing_count.detach().cpu(),
         "tokens_seen": int(model.tokens_seen.item()),
+        "firing_count_window": "final_epoch",
         # History + final metrics for downstream consumers.
         "training_history": training_history,
         "final_metrics": final_metrics,
@@ -919,8 +980,15 @@ def _save_checkpoint(
         "decoder_norm_min": float(model.W_dec.norm(dim=1).min().item()),
         "decoder_norm_max": float(model.W_dec.norm(dim=1).max().item()),
     }
-    torch.save(ckpt, out_dir / "checkpoint.pt")
-    LOG.info("Wrote checkpoint to %s", out_dir / "checkpoint.pt")
+    # Write to a temp file and atomically rename into place, so a process killed
+    # mid-write (OOM-kill, preemption, Ctrl-C) never leaves a truncated
+    # checkpoint.pt that a resumed run's existence-check would mistake for a
+    # complete, loadable checkpoint.
+    final_path = out_dir / "checkpoint.pt"
+    tmp_path = out_dir / "checkpoint.pt.tmp"
+    torch.save(ckpt, tmp_path)
+    os.replace(tmp_path, final_path)
+    LOG.info("Wrote checkpoint to %s", final_path)
     LOG.info(
         "  Decoder norm range after training: [%.6f, %.6f] (should be ~1.0)",
         ckpt["decoder_norm_min"], ckpt["decoder_norm_max"],
@@ -938,12 +1006,15 @@ def load_sae_from_checkpoint(
             f"Schema mismatch: checkpoint={ckpt['schema_version']}, loader={SAE_SCHEMA_VERSION}"
         )
 
+    # normalize_decoder only affects training (renormalize_decoder is never
+    # called at inference), but carry the trained setting through so a
+    # checkpoint reloaded to continue training keeps its own constraint.
     model = SparseAutoencoder(
         d_model=ckpt["d_model"],
         d_dict=ckpt["d_dict"],
         k=ckpt["k"],
         k_aux=ckpt.get("k_aux", 0),
-        normalize_decoder=True,
+        normalize_decoder=bool(ckpt.get("config", {}).get("normalize_decoder", True)),
     ).to(device)
 
     model.W_enc.data = ckpt["W_enc"].to(device)
@@ -990,6 +1061,11 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--dtype", default="float32", choices=list(DTYPE_MAP),
+                   help="Compute/storage dtype for training. float32 is the "
+                        "default and what reported results use; bfloat16 halves "
+                        "activation memory at some cost in reconstruction "
+                        "fidelity. Recorded in config.json either way.")
     p.add_argument("--no-ram-cache", action="store_true",
                    help="Stream chunk files instead of caching the layer in RAM "
                         "(slower, but for memory-constrained machines).")
@@ -1000,7 +1076,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     logging.basicConfig(
-        level=args.log_level,
+        level=args.log_level.upper(),
         format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
     )
 
@@ -1025,6 +1101,7 @@ def main() -> int:
         val_every=args.val_every,
         seed=args.seed,
         device=args.device,
+        dtype=DTYPE_MAP[args.dtype],
         cache_in_ram=not args.no_ram_cache,
     )
 

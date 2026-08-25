@@ -270,13 +270,17 @@ def model_forward_logits(
 
     The keyword names are x/p/y/x_mask/y_mask — NOT spectra/precursors/...
     With add_bos=True (the default), the output has T+1 token positions.
+
+    non_blocking=True is safe on every transfer below: make_dataloader always
+    builds its DataLoader with pin_memory=True, so these host->device copies
+    can run asynchronously instead of blocking the calling thread.
     """
     return model(
-        x=batch["spectra"].to(device),
-        p=batch["precursors"].to(device),
-        y=batch["peptides"].to(device),
-        x_mask=batch["spectra_mask"].to(device),
-        y_mask=batch["peptides_mask"].to(device),
+        x=batch["spectra"].to(device, non_blocking=True),
+        p=batch["precursors"].to(device, non_blocking=True),
+        y=batch["peptides"].to(device, non_blocking=True),
+        x_mask=batch["spectra_mask"].to(device, non_blocking=True),
+        y_mask=batch["peptides_mask"].to(device, non_blocking=True),
     )
 
 

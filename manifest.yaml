@@ -9,12 +9,28 @@ builder:
 spec:
   operator: pytorch
   image: instanovo-sae
+  # Layers are processed two at a time to keep peak PVC usage near 208 GB rather
+  # than the ~416 GB all four would need. Each pair pays its own extraction
+  # forward pass, and cross-layer matching runs within the pair. Run this with
+  # LAYERS_OVERRIDE="2 4", then again with "6 8", then the Phase 8 pass.
+  #
+  # KEEP_CHUNKS=0 is required, not optional: without it the first pair's ~208 GB
+  # stays on the volume and the second pair cannot fit. KEEP_CHUNK_SAMPLE (default
+  # 2) still retains a token sample per layer so cross-layer matching across all
+  # four layers remains possible in a later run.
+  #
+  # DATASET_DIR must sit under the mount. Its default is a relative path, which
+  # resolves to ephemeral container disk, so the 639k-spectrum merge would be
+  # redone and discarded on every run.
+  #
   # RUN_CAUSAL=1 enables Phase 7 (loss recovered), one substitution pass over the
   # eval spectra. RUN_PHASE_8=0 keeps causal ablation off: its cost is
   # n_concepts x (1 + controls + ABLATION_PER_FEATURE_TOP) model passes per layer
   # and would dominate the run.
   command: >
-    RUN_CAUSAL=1 RUN_PHASE_8=0 MODEL_PATH=instanovo-v1.1.0 OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs ./run_pipeline.sh
+    RUN_CAUSAL=1 RUN_PHASE_8=0 LAYERS_OVERRIDE="2 4" KEEP_CHUNKS=0
+    DATASET_DIR=/app/fm_mount/dataset MODEL_PATH=instanovo-v1.1.0
+    OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs ./run_pipeline.sh
   tensorboard:
     enabled: false
   storage:

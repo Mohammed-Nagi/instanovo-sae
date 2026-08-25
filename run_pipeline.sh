@@ -198,6 +198,14 @@ CROSS_LAYER_TOKENS="${CROSS_LAYER_TOKENS:-100000}"
 # reusable across all future SAE experiments on this dataset. Only set to 0 if
 # you are genuinely disk-constrained and do not plan to re-train.
 KEEP_CHUNKS="${KEEP_CHUNKS:-1}"
+# When KEEP_CHUNKS=0, retain this many chunks per layer instead of deleting them
+# all. Cross-layer matching needs a token sample from EVERY layer at once, which
+# a layer-at-a-time run cannot provide unless each layer leaves a sample behind.
+# It reads chunks in manifest order and stops at CROSS_LAYER_TOKENS, so the first
+# chunk or two is enough: at the defaults one chunk is ~108k tokens against a
+# 100k requirement, and costs ~0.17 GB per layer. Set to 0 to delete everything
+# and give up deferred cross-layer matching.
+KEEP_CHUNK_SAMPLE="${KEEP_CHUNK_SAMPLE:-2}"
 # Annotation labels are always kept -- they are small and layer-independent.
 KEEP_ANNOTATION="${KEEP_ANNOTATION:-1}"
 # `du -sh` over a multi-terabyte chunk tree can take minutes; set to 0 to skip.
@@ -986,18 +994,74 @@ target = {str(x) for x in manifest.get("target_layers", [])}
 print(" ".join(sorted(target - requested)))
 PYEOF
 )"
+        # Chunk indices this invocation keeps as the cross-layer token sample.
+        # Deleting a layer's activations entirely forecloses cross-layer matching
+        # later, which a layer-at-a-time run defers by construction.
+        keep_globs=()
+        if [[ "$KEEP_CHUNK_SAMPLE" -gt 0 ]]; then
+            for ((i = 0; i < KEEP_CHUNK_SAMPLE; i++)); do
+                keep_globs+=("$(printf '%05d' "$i")")
+            done
+            # The sample has to cover CROSS_LAYER_TOKENS, which is read from the
+            # first chunks in manifest order. Too few and the deferred cross-layer
+            # run dies on a missing file rather than a clear error, since the
+            # manifest still lists the chunks that were deleted.
+            needed="$("$PYTHON" - "$EXTRACT_DIR/manifest.json" "$CROSS_LAYER_TOKENS" <<'PYEOF'
+import json, math, sys
+from pathlib import Path
+try:
+    m = json.loads(Path(sys.argv[1]).read_text())
+    per_chunk = m["n_tokens"] / max(len(m["chunks"]), 1)
+    print(max(1, math.ceil(int(sys.argv[2]) / per_chunk)))
+except Exception:
+    print(0)      # unknown; the caller then skips the check
+PYEOF
+)"
+            if [[ "$needed" -gt 0 && "$KEEP_CHUNK_SAMPLE" -lt "$needed" ]]; then
+                log "WARNING: KEEP_CHUNK_SAMPLE=$KEEP_CHUNK_SAMPLE is below the $needed chunk(s)"
+                log "  CROSS_LAYER_TOKENS=$CROSS_LAYER_TOKENS needs; keeping $needed instead."
+                keep_globs=()
+                for ((i = 0; i < needed; i++)); do
+                    keep_globs+=("$(printf '%05d' "$i")")
+                done
+            fi
+        fi
+
+        delete_layer_acts() {   # $1 = layer
+            local L="$1" f base idx
+            for f in "$EXTRACT_DIR"/chunks/acts_L${L}_*.pt; do
+                [[ -e "$f" ]] || continue
+                base="$(basename "$f")"
+                idx="${base##*_}"; idx="${idx%.pt}"
+                local keep=0
+                for k in "${keep_globs[@]}"; do
+                    [[ "$idx" == "$k" ]] && keep=1 && break
+                done
+                [[ "$keep" == "1" ]] || rm -f "$f"
+            done
+        }
+
         if [[ -n "$other_layers" ]]; then
             log "KEEP_CHUNKS=0, but the manifest also covers layer(s) $other_layers not"
             log "  requested by this invocation (LAYERS=${LAYERS[*]}) -- only deleting this"
             log "  invocation's own activation files; metadata and other layers' activations"
             log "  are kept for the invocation(s) still using them."
             for L in "${LAYERS[@]}"; do
-                rm -f "$EXTRACT_DIR"/chunks/acts_L${L}_*.pt
+                delete_layer_acts "$L"
+            done
+        elif [[ "$KEEP_CHUNK_SAMPLE" -gt 0 ]]; then
+            log "KEEP_CHUNKS=0 -- deleting extract chunks, keeping the first"
+            log "  $KEEP_CHUNK_SAMPLE chunk(s) per layer as a cross-layer token sample"
+            for L in "${LAYERS[@]}"; do
+                delete_layer_acts "$L"
             done
         else
             log "KEEP_CHUNKS=0 -- deleting extract chunks (freeing ~$(dir_size "$EXTRACT_DIR/chunks"))"
             rm -rf "$EXTRACT_DIR/chunks"
             log "  manifest.json kept for provenance"
+        fi
+        if [[ "$KEEP_CHUNK_SAMPLE" -gt 0 && -d "$EXTRACT_DIR/chunks" ]]; then
+            log "  Retained for cross-layer: $(dir_size "$EXTRACT_DIR/chunks")"
         fi
     fi
 fi

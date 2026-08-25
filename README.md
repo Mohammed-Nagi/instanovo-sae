@@ -76,6 +76,7 @@ DATASET_PATH=/data/combined.parquet  # skip the dataset merge
 SKIP_TRAIN=1                         # evaluate existing checkpoints
 OUTPUT_ROOT=/mnt/ssd/sae             # write artefacts elsewhere
 KEEP_CHUNKS=0                        # delete this run's activations afterwards
+KEEP_CHUNK_SAMPLE=2                  # ...but retain N chunks/layer for cross-layer
 ANNOTATE_WORKERS=8                   # parallel chunk annotation (default: all cores)
 DEVICE=cpu                           # override the auto-detected device
 ```

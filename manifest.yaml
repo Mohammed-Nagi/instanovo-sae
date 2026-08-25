@@ -27,9 +27,16 @@ spec:
   # eval spectra. RUN_PHASE_8=0 keeps causal ablation off: its cost is
   # n_concepts x (1 + controls + ABLATION_PER_FEATURE_TOP) model passes per layer
   # and would dominate the run.
+  # TRAIN_NO_RAM_CACHE=1 is set explicitly rather than left to choose_ram_cache.
+  # That helper sizes against MemAvailable in /proc/meminfo, which in a container
+  # is commonly the node's memory rather than this pod's cgroup limit -- so it
+  # could conclude a 207 GB float32 layer cache fits and then be OOM-killed at the
+  # pod limit, hours into training. Streaming is what it would pick anyway at any
+  # RAM setting we would request here.
   command: >
     RUN_CAUSAL=1 RUN_PHASE_8=0 LAYERS_OVERRIDE="2 4" KEEP_CHUNKS=0
-    DATASET_DIR=/app/fm_mount/dataset MODEL_PATH=instanovo-v1.1.0
+    TRAIN_NO_RAM_CACHE=1 DATASET_DIR=/app/fm_mount/dataset
+    MODEL_PATH=instanovo-v1.1.0
     OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs ./run_pipeline.sh
   tensorboard:
     enabled: false
@@ -53,7 +60,12 @@ spec:
       count: 1
       resources:
         cpus: 24
-        ramRatio: 8
+        # 24 x 4 = 96 GB. The float32 layer cache would need ~207 GB, and
+        # RAM_CACHE_SAFETY=0.6 puts the threshold near 346 GB available, so no
+        # RAM figure we would plausibly request reaches it -- training streams
+        # either way. Streaming peaks well under this: ~332 MB per chunk, and
+        # cross-layer's token sample is ~4.9 GB per layer.
+        ramRatio: 4
         accelerators:
           gpu:
             count: 1

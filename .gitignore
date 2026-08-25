@@ -62,6 +62,9 @@ CLAUDE.md
 # and nothing in this repo depends on them.
 InstaNovo-internal-*/
 
+# Local log of submitted AIchor experiment ids -- run-specific bookkeeping.
+experiment_ids.txt
+
 # Pipeline artefacts (production and smoke). Individual subdirectories are also
 # matched by the extract/ annotation/ sae/ patterns above, but the roots
 # themselves otherwise show up as untracked.

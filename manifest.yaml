@@ -14,7 +14,27 @@ spec:
   operator: pytorch
   image: instanovo-sae
   # -------------------------------------------------------------------------
-  # Interpretation pass over run 1 (layers 2 and 4).
+  # Ship run 1's surviving activation chunks to the bucket, so interpretation can
+  # run off-cluster and the OpenAI key never has to reach this project's storage.
+  #
+  # Run 1 finished with KEEP_CHUNKS=0, which pruned 625 chunks to the 2-per-layer
+  # cross-layer sample. That is ~683 MB across 11 files, small enough to pull
+  # down and work with locally. PUBLISH_CHUNKS restricts itself to chunks whose
+  # activations survived: meta and label files were written for all 625 and are
+  # never pruned, so matching them wholesale would select ~6.5 GB of files with
+  # no activations to pair with, and PUBLISH_MAX_GB would refuse the job.
+  #
+  # RUN_INTERPRET is deliberately absent. This job only republishes; every
+  # earlier step finds its output present and skips, so it is the publish step
+  # and nothing else.
+  #
+  # Interpretation pass over run 1 (layers 2 and 4), for when it runs here
+  # instead. INTERPRET_ENV_FILE points at a key file placed on the PVC:
+  #   RUN_INTERPRET=1 SKIP_TRAIN=1 LAYERS_OVERRIDE="2 4"
+  #   INTERPRET_ENV_FILE=/app/fm_mount/secrets/openai.env
+  #   DATASET_DIR=/app/fm_mount/dataset
+  #   MODEL_PATH=instanovo-v1.1.0
+  #   OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs bash ./run_pipeline.sh
   #
   # Every earlier step is idempotent, so this is the whole pipeline pointed at an
   # output root that already has its artefacts: steps 0-5 find their outputs and
@@ -50,8 +70,7 @@ spec:
   #   OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs_l68 bash ./run_pipeline.sh
   # -------------------------------------------------------------------------
   command: >
-    RUN_INTERPRET=1 SKIP_TRAIN=1 LAYERS_OVERRIDE="2 4"
-    INTERPRET_ENV_FILE=/app/fm_mount/secrets/openai.env
+    PUBLISH_CHUNKS=1 SKIP_TRAIN=1 LAYERS_OVERRIDE="2 4"
     DATASET_DIR=/app/fm_mount/dataset
     MODEL_PATH=instanovo-v1.1.0
     OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs bash ./run_pipeline.sh
@@ -86,5 +105,5 @@ spec:
       # schedule quickly rather than generously -- a 24-core/96 GB ask sat
       # Unschedulable on this cluster.
       resources:
-        cpus: 4
+        cpus: 2
         ramRatio: 4

@@ -1541,6 +1541,32 @@ INCLUDE = [
     "interpret/layer_*/*",
 ]
 
+# PUBLISH_CHUNKS=1 additionally ships the activation chunks still on disk, so an
+# analysis needing raw activations can run somewhere other than this cluster.
+# Off by default because a full run holds ~104 GB per layer. It is practical only
+# after KEEP_CHUNKS=0 has pruned a run to its cross-layer sample, which is why
+# PUBLISH_MAX_GB refuses the job rather than quietly starting a 100 GB upload.
+#
+# Restricted to chunks whose activations survived. Metadata and label files are
+# written for every chunk and are never pruned -- on the nine-species run that is
+# ~2 GB of meta and ~4 GB of labels, none of it usable without the matching
+# activations, and enough on its own to trip the size guard.
+if os.environ.get("PUBLISH_CHUNKS") == "1":
+    import re
+    live = sorted({
+        m.group(1)
+        for p in (root / "extract" / "chunks").glob("acts_L*_*.pt")
+        if (m := re.search(r"_(\d+)\.pt$", p.name))
+    })
+    print(f"PUBLISH_CHUNKS=1: {len(live)} chunk(s) still hold activations: "
+          f"{', '.join(live) if len(live) <= 12 else ', '.join(live[:12]) + ', ...'}")
+    for i in live:
+        INCLUDE += [
+            f"extract/chunks/acts_L*_{i}.pt",
+            f"extract/chunks/meta_{i}.pt",
+            f"annotation/labels/chunk_{i}.pt",
+        ]
+
 dest = os.environ["AICHOR_OUTPUT_PATH"]
 if "s3://" not in dest:                      # AIchor may hand it over bare
     dest = f"s3://{dest}"
@@ -1572,6 +1598,16 @@ if not selected:
     raise SystemExit(1)
 
 total = sum(p.stat().st_size for p, _ in selected)
+
+# A wrong pattern here uploads for hours and bills for the transfer, so the size
+# is checked before the first byte moves rather than discovered from the log.
+max_gb = float(os.environ.get("PUBLISH_MAX_GB", "5"))
+if total / 1e9 > max_gb:
+    print(f"ERROR: the selection is {total / 1e9:.1f} GB, over PUBLISH_MAX_GB={max_gb} GB. "
+          f"Nothing was uploaded. Raise PUBLISH_MAX_GB if this is intended, or narrow "
+          f"what PUBLISH_CHUNKS matches.", file=sys.stderr)
+    raise SystemExit(1)
+
 print(f"Publishing {len(selected)} files ({total / 1e6:.1f} MB) to {dest}")
 
 failed = []

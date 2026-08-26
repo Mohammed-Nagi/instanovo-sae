@@ -65,6 +65,10 @@ InstaNovo-internal-*/
 # Local log of submitted AIchor experiment ids -- run-specific bookkeeping.
 experiment_ids.txt
 
+# Run artefacts pulled back from the AIchor output bucket. Hundreds of MB of
+# checkpoints and CSVs per run, reproducible from the bucket, and not source.
+results/
+
 # Pipeline artefacts (production and smoke). Individual subdirectories are also
 # matched by the extract/ annotation/ sae/ patterns above, but the roots
 # themselves otherwise show up as untracked.

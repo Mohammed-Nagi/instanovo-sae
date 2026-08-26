@@ -14,51 +14,54 @@ spec:
   operator: pytorch
   image: instanovo-sae
   # -------------------------------------------------------------------------
-  # Ship run 1's surviving activation chunks to the bucket, so interpretation can
-  # run off-cluster and the OpenAI key never has to reach this project's storage.
+  # Layer 6 alone, into its own output root.
   #
-  # Run 1 finished with KEEP_CHUNKS=0, which pruned 625 chunks to the 2-per-layer
-  # cross-layer sample. That is ~683 MB across 11 files, small enough to pull
-  # down and work with locally. PUBLISH_CHUNKS restricts itself to chunks whose
-  # activations survived: meta and label files were written for all 625 and are
-  # never pruned, so matching them wholesale would select ~6.5 GB of files with
-  # no activations to pair with, and PUBLISH_MAX_GB would refuse the job.
+  # One layer per job rather than the 6+8 pair. The pair sat Unschedulable for
+  # ten hours waiting on a full H100, while colleagues' jobs held the cards. A
+  # single-layer job is ~3.6 h and ~104 GB instead of ~7 h and ~208 GB, so it
+  # fits gaps the pair cannot, and a layer that finishes is worth more than a
+  # pair that never starts. Duplicated extraction and annotation cost ~30 min.
   #
-  # RUN_INTERPRET is deliberately absent. This job only republishes; every
-  # earlier step finds its output present and skips, so it is the publish step
-  # and nothing else.
+  # The cost is cross-layer matching between 6 and 8: cross_layer_matching reads
+  # every layer from ONE extract dir, so layers in separate roots cannot be
+  # compared. Accepted deliberately. Note the 6+8 pair could not have matched
+  # against 2+4 either, for the same reason. run_pipeline.sh drops the
+  # cross_layer phase on its own when a run has fewer than two layers.
   #
-  # SKIP_TRAIN=1 is load-bearing even here. Without it a checkpoint that failed
-  # to resolve would start a multi-hour training run instead of failing.
+  # KEEP_CHUNKS=1, explicitly. Run 1 finished with KEEP_CHUNKS=0 and pruned 625
+  # chunks to 2 per layer, which is why interpretation on layers 2 and 4 samples
+  # 0.3% of the corpus and only from its beginning. Keeping this layer's chunks
+  # (~104 GB against 1989 GB free) lets its interpretation span the whole run.
   #
-  # MODEL_PATH must be the pretrained id. The default is ./instanovo_v1.1.0.ckpt,
-  # which the path-form check rejects as missing before any step runs, even
-  # though nothing here loads the model. DATASET_DIR points at the merged parquet
-  # so Step 0 skips rather than re-merging 639k spectra.
+  # MODEL_PATH must be the pretrained id: the default ./instanovo_v1.1.0.ckpt is
+  # rejected by the path-form check before any step runs. DATASET_DIR points at
+  # the merged parquet so Step 0 skips rather than re-merging 639k spectra.
   #
-  # KEEP_CHUNKS is deliberately NOT set to 0: doing so again would delete the
-  # 2-per-layer remainder that is the whole point of this job.
-  #
-  # To run interpretation on the cluster instead, place a key file on the PVC
-  # and use:
-  #   RUN_INTERPRET=1 SKIP_TRAIN=1 LAYERS_OVERRIDE="2 4"
-  #   INTERPRET_ENV_FILE=/app/fm_mount/secrets/openai.env
-  #   DATASET_DIR=/app/fm_mount/dataset
-  #   MODEL_PATH=instanovo-v1.1.0
-  #   OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs bash ./run_pipeline.sh
-  # Adding INTERPRET_DRY_RUN=1 builds every prompt, calls nothing, needs no key.
-  #
-  # Previous run (layers 6+8), kept for resubmission:
-  #   RUN_CAUSAL=1 RUN_PHASE_8=0 LAYERS_OVERRIDE="6 8"
-  #   TRAIN_NO_RAM_CACHE=1 DATASET_DIR=/app/fm_mount/dataset
-  #   MODEL_PATH=instanovo-v1.1.0
-  #   OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs_l68 bash ./run_pipeline.sh
+  # Other commands this manifest has carried, kept for resubmission:
+  #   layer 8, after layer 6 lands:
+  #     RUN_CAUSAL=1 RUN_PHASE_8=0 LAYERS_OVERRIDE="8" TRAIN_NO_RAM_CACHE=1
+  #     KEEP_CHUNKS=1 DATASET_DIR=/app/fm_mount/dataset
+  #     MODEL_PATH=instanovo-v1.1.0
+  #     OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs_l8 bash ./run_pipeline.sh
+  #   interpretation on the cluster (needs a key file on the PVC; add
+  #   INTERPRET_DRY_RUN=1 to build prompts without calling anything):
+  #     RUN_INTERPRET=1 SKIP_TRAIN=1 LAYERS_OVERRIDE="2 4"
+  #     INTERPRET_ENV_FILE=/app/fm_mount/secrets/openai.env
+  #     DATASET_DIR=/app/fm_mount/dataset MODEL_PATH=instanovo-v1.1.0
+  #     OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs bash ./run_pipeline.sh
+  #   republish a pruned run's surviving chunks (PUBLISH_CHUNKS restricts itself
+  #   to chunks that still hold activations; PUBLISH_MAX_GB refuses oversized
+  #   selections before uploading):
+  #     PUBLISH_CHUNKS=1 SKIP_TRAIN=1 LAYERS_OVERRIDE="2 4"
+  #     DATASET_DIR=/app/fm_mount/dataset MODEL_PATH=instanovo-v1.1.0
+  #     OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs bash ./run_pipeline.sh
   # -------------------------------------------------------------------------
   command: >
-    PUBLISH_CHUNKS=1 SKIP_TRAIN=1 LAYERS_OVERRIDE="2 4"
+    RUN_CAUSAL=1 RUN_PHASE_8=0 LAYERS_OVERRIDE="6"
+    TRAIN_NO_RAM_CACHE=1 KEEP_CHUNKS=1
     DATASET_DIR=/app/fm_mount/dataset
     MODEL_PATH=instanovo-v1.1.0
-    OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs bash ./run_pipeline.sh
+    OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs_l6 bash ./run_pipeline.sh
   tensorboard:
     enabled: false
   storage:
@@ -78,17 +81,27 @@ spec:
   types:
     worker:
       count: 1
-      # No accelerator. Nothing in this job needs one: the single SAE encode over
-      # the surviving chunks is a few minutes on CPU, and everything after it is
-      # API latency. Asking for a GPU would put the job behind the same queue
-      # that has held the layers 6+8 run unscheduled for hours, to leave the card
-      # idle. DEVICE is left unset so run_pipeline.sh resolves it to cpu.
+      # A MIG slice, not a whole H100. This project has billed two accelerator
+      # types, the full card and this 3g.40gb partition, so both are available;
+      # the full card is what everything else competes for.
       #
-      # 2 x 4 = 8 GB, ample for an upload: this job runs no model and holds no
-      # activations in memory. An interpretation run on this manifest wants more --
-      # one chunk's dense [n_tokens, d_dict] float32 matrix is 5.3 GB -- so raise
-      # cpus to 4 for 16 GB there. Sized to schedule fast: a 24-core/96 GB ask sat
-      # Unschedulable on this cluster.
+      # 40 GB is roughly five times what the job peaks at. The SAE is 18.9M
+      # parameters (~300 MB with gradients and Adam state), training holds a few
+      # [8192, 12288] float32 tensors at ~400 MB each, evaluation half that, and
+      # InstaNovo's forward pass is 1-2 GB: under 8 GB all told. That estimate is
+      # analytical -- run 1 logged no GPU memory -- but the margin is wide.
+      #
+      # The trade is compute: 3 of 7 slices, so expect roughly 2-2.5x the wall
+      # time of a full card. A job that starts slowly still beats one that never
+      # schedules.
+      #
+      # 12 x 4 = 48 GB host RAM, as run 1 used successfully. TRAIN_NO_RAM_CACHE=1
+      # streams chunks rather than caching the layer, peaking near 20-30 GB.
       resources:
-        cpus: 2
+        cpus: 12
         ramRatio: 4
+        accelerators:
+          gpu:
+            count: 1
+            type: gpu
+            product: NVIDIA-H100-80GB-HBM3-MIG-3g.40gb

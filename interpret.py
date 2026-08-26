@@ -204,7 +204,7 @@ def _read_per_feature_stats(eval_dir: Path) -> dict[int, dict]:
             f"{path} not found. Run evaluate.py Phase 4 for this layer/seed first."
         )
     stats: dict[int, dict] = {}
-    with open(path, newline="") as fp:
+    with open(path, newline="", encoding="utf-8") as fp:
         for row in csv.DictReader(fp):
             stats[int(row["feature_idx"])] = {
                 "firing_rate": float(row["firing_rate"]),
@@ -236,7 +236,7 @@ def _read_causal_features(eval_dir: Path) -> dict[int, dict]:
     path = eval_dir / "report.json"
     if not path.exists():
         return {}
-    report = json.loads(path.read_text())
+    report = json.loads(path.read_text(encoding="utf-8"))
     phase_8 = report.get("phase_8") or {}
     per_concept = phase_8.get("per_concept") or {}
 
@@ -293,7 +293,7 @@ def _read_global_top_tokens(eval_dir: Path) -> dict[int, list[tuple[float, int, 
         LOG.warning("%s not found; using sampled chunks only for top examples", path)
         return {}
     out: dict[int, list[tuple[float, int, int]]] = {}
-    with open(path, newline="") as fp:
+    with open(path, newline="", encoding="utf-8") as fp:
         for row in csv.DictReader(fp):
             out.setdefault(int(row["feature_idx"]), []).append((
                 float(row["activation"]),
@@ -309,13 +309,13 @@ def _read_ion_type_vocab(annotation_dir: Path) -> dict[int, str]:
     Read from the manifest rather than imported from annotate.py, so this script
     inherits no spectrum_utils dependency.
     """
-    manifest = json.loads((annotation_dir / "annotation_manifest.json").read_text())
+    manifest = json.loads((annotation_dir / "annotation_manifest.json").read_text(encoding="utf-8"))
     vocab = manifest.get("vocab", {}).get("ion_type", {})
     return {int(v): k for k, v in vocab.items()}
 
 
 def _read_concept_names(annotation_dir: Path) -> list[str]:
-    manifest = json.loads((annotation_dir / "annotation_manifest.json").read_text())
+    manifest = json.loads((annotation_dir / "annotation_manifest.json").read_text(encoding="utf-8"))
     return list(manifest["registry"]["names"])
 
 
@@ -471,7 +471,7 @@ def available_chunk_indices(extract_dir: Path, target_layer: int) -> tuple[list[
     chunks that no longer exist and die on the first torch.load. Returns
     (available ids, total in manifest) so the caller can say how much survived.
     """
-    manifest = json.loads((extract_dir / "manifest.json").read_text())
+    manifest = json.loads((extract_dir / "manifest.json").read_text(encoding="utf-8"))
     layer_key = str(target_layer)
     available = [
         c["idx"] for c in manifest["chunks"]
@@ -914,11 +914,6 @@ def _make_client():
     return OpenAI()
 
 
-# Model ids the API actually served, as opposed to the alias asked for. An alias
-# like "gpt-4o" floats between versions, so the paper needs the resolved id and
-# write_outputs records whatever came back.
-RESOLVED_MODELS: set[str] = set()
-
 # HTTP statuses worth a second attempt: rate limits, and the server's own faults.
 # Anything else (bad key, unknown model, malformed request) will fail the same
 # way forever, and 160 features each burning three retries turns a typo into an
@@ -930,12 +925,17 @@ class PermanentAPIError(RuntimeError):
     """An API failure that retrying cannot fix."""
 
 
-def _create_completion(client, model: str, prompt: str, max_tokens: int) -> str:
-    """One chat completion.
+def _create_completion(client, model: str, prompt: str, max_tokens: int) -> tuple[str, dict]:
+    """One chat completion, returned as (text, provenance).
 
     The output-length parameter was renamed: older chat models take max_tokens,
     while the reasoning models reject it and require max_completion_tokens. The
     first call decides which this model wants, so the caller need not know.
+
+    Provenance travels with the reply rather than accumulating in a module-level
+    set. A set is only populated by calls this process actually made, so a run
+    resumed from the log would report no model and no tokens at all, despite
+    reporting the descriptions those calls produced.
     """
     messages = [{"role": "user", "content": prompt}]
     try:
@@ -952,12 +952,18 @@ def _create_completion(client, model: str, prompt: str, max_tokens: int) -> str:
         response = client.chat.completions.create(
             model=model, messages=messages, max_completion_tokens=max_tokens,
         )
-    if getattr(response, "model", None):
-        RESOLVED_MODELS.add(response.model)
-    return response.choices[0].message.content or ""
+    usage = getattr(response, "usage", None)
+    meta = {
+        # The alias asked for floats between versions; this is what answered.
+        "model": getattr(response, "model", None) or model,
+        "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+        "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+    }
+    return response.choices[0].message.content or "", meta
 
 
-def call_model(client, model: str, prompt: str, max_tokens: int, retries: int = 3) -> str:
+def call_model(client, model: str, prompt: str, max_tokens: int,
+               retries: int = 3) -> tuple[str, dict]:
     """One completion, retrying transient failures with linear backoff.
 
     A permanent failure is raised immediately: the run is unattended and every
@@ -1060,18 +1066,27 @@ def interpret_feature(
         result["description_prompt"] = description_prompt
         return result
 
-    description, summary = parse_description(
-        call_model(client, config.model, description_prompt, config.max_tokens)
+    reply, describe_meta = call_model(
+        client, config.model, description_prompt, config.max_tokens,
     )
+    description, summary = parse_description(reply)
     result["description"] = description
     result["summary"] = summary
 
     prediction_prompt = build_prediction_prompt(
         description, holdout_set, config.include_concept_labels,
     )
-    predictions = parse_predictions(
-        call_model(client, config.model, prediction_prompt, config.max_tokens),
-        {e.example_id for e in holdout_set},
+    reply, predict_meta = call_model(
+        client, config.model, prediction_prompt, config.max_tokens,
+    )
+    predictions = parse_predictions(reply, {e.example_id for e in holdout_set})
+
+    # Stored per feature so it survives a resume: both calls used the same model,
+    # and the token counts are what the compute statement is built from.
+    result["model_served"] = describe_meta["model"]
+    result["prompt_tokens"] = describe_meta["prompt_tokens"] + predict_meta["prompt_tokens"]
+    result["completion_tokens"] = (
+        describe_meta["completion_tokens"] + predict_meta["completion_tokens"]
     )
     measured = {e.example_id: e.activation for e in holdout_set}
     pairs = [(predictions[i], measured[i]) for i in predictions]
@@ -1115,7 +1130,7 @@ def load_completed(output_dir: Path) -> dict[int, dict]:
     if not path.exists():
         return {}
     done: dict[int, dict] = {}
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         try:
@@ -1165,7 +1180,7 @@ def write_outputs(
     results = sorted(results, key=lambda r: r["feature_idx"])
 
     csv_path = config.output_dir / "feature_descriptions.csv"
-    with open(csv_path, "w", newline="") as fp:
+    with open(csv_path, "w", newline="", encoding="utf-8") as fp:
         writer = csv.writer(fp)
         writer.writerow([
             "feature_idx", "stratum", "pearson_r", "n_predicted", "holdout_coverage",
@@ -1190,17 +1205,25 @@ def write_outputs(
                 r["summary"],
             ])
 
+    # Aggregated from the records themselves, so a run rebuilt entirely from the
+    # resume log still reports the model that produced it and what it cost.
+    usage = {
+        "models_served": sorted({r["model_served"] for r in results if r.get("model_served")}),
+        "prompt_tokens": sum(r.get("prompt_tokens", 0) for r in results),
+        "completion_tokens": sum(r.get("completion_tokens", 0) for r in results),
+        "n_api_calls": 2 * sum(1 for r in results if r.get("model_served")),
+    }
+
     json_path = config.output_dir / "feature_descriptions.json"
     json_path.write_text(json.dumps(
-        {
-            "config": config.as_jsonable(),
-            # The alias asked for floats between versions; this is what answered.
-            "models_served": sorted(RESOLVED_MODELS),
-            "results": results,
-        },
+        {"config": config.as_jsonable(), "usage": usage, "results": results},
         indent=2, default=str,
-    ))
+    ), encoding="utf-8")
     LOG.info("Wrote %s and %s", csv_path, json_path)
+    if usage["prompt_tokens"] or usage["completion_tokens"]:
+        LOG.info("API usage: %d calls to %s, %s prompt + %s completion tokens",
+                 usage["n_api_calls"], ", ".join(usage["models_served"]) or "?",
+                 f"{usage['prompt_tokens']:,}", f"{usage['completion_tokens']:,}")
 
     by_stratum: dict[str, list[float]] = {}
     for r in results:

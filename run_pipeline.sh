@@ -655,30 +655,46 @@ print(json.load(open(sys.argv[1])).get('n_chunks', 0))
 fi
 
 RUN_EXTRACT=1
-if [[ -f "$EXTRACT_DIR/manifest.json" ]]; then
-    missing_layers="$("$PYTHON" - "$EXTRACT_DIR/manifest.json" "${LAYERS[@]}" <<'PYEOF'
+if [[ "${FORCE_EXTRACT:-0}" == "1" ]]; then
+    log "FORCE_EXTRACT=1 -- running extraction regardless of the manifest"
+elif [[ -f "$EXTRACT_DIR/manifest.json" ]]; then
+    # Checks the files, not just the manifest. A KEEP_CHUNKS=0 run deletes
+    # activation files and leaves the manifest describing every one of them, so a
+    # manifest-only test reports a layer as extracted when 623 of its 625 files
+    # are gone -- and the whole step is then skipped, silently doing nothing.
+    # extract.py's own per-chunk resume would have caught it, but it never gets
+    # called. Matching that resume, a file that exists is assumed complete.
+    missing_layers="$("$PYTHON" - "$EXTRACT_DIR" "${LAYERS[@]}" <<'PYEOF'
 import json, sys
 from pathlib import Path
 
-manifest_path = Path(sys.argv[1])
+extract_dir = Path(sys.argv[1])
 requested = [str(x) for x in sys.argv[2:]]
-manifest = json.loads(manifest_path.read_text())
+manifest = json.loads((extract_dir / "manifest.json").read_text())
 chunks = manifest.get("chunks", [])
 
 missing = []
 for layer in requested:
-    if not chunks or any(layer not in chunk.get("activations", {}) for chunk in chunks):
+    if not chunks:
         missing.append(layer)
+        continue
+    for chunk in chunks:
+        rel = chunk.get("activations", {}).get(layer)
+        meta = chunk.get("meta")
+        if (rel is None or not (extract_dir / rel).exists()
+                or meta is None or not (extract_dir / meta).exists()):
+            missing.append(layer)
+            break
 
 print(" ".join(missing))
 PYEOF
 )"
     if [[ -z "$missing_layers" ]]; then
-        log "Extract manifest exists and contains requested layers (${LAYERS[*]}) -- skipping extraction"
+        log "Extract manifest and chunk files complete for layers (${LAYERS[*]}) -- skipping extraction"
         RUN_EXTRACT=0
     else
-        log "Extract manifest exists but is missing requested layer(s): $missing_layers"
-        log "Re-running extraction; per-chunk resume will keep intact chunks and fill missing layer files."
+        log "Extraction incomplete on disk for layer(s): $missing_layers"
+        log "Re-running extraction; per-chunk resume keeps intact chunks and rebuilds only what is missing."
     fi
 fi
 

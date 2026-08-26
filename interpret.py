@@ -1,39 +1,39 @@
 """interpret.py -- LLM-assisted interpretation of SAE features.
 
-Adapts the automated feature-description pipeline of InterPLM (Simon and Zou,
-2025, Methods 5.3) to the mass-spectrometry setting, and adds a causal
-cross-reference that the protein-language-model setting does not support.
+Adapts InterPLM's automated feature-description pipeline (Simon and Zou, 2025,
+Methods 5.3) to mass spectrometry, and adds a causal cross-reference the
+protein-language-model setting does not support.
 
-Motivation. The registry labels a peak only when it matches a theoretical
-fragment ion, so features firing on the unmatched majority are invisible to the
-F1 evaluation however interpretable they are. F1-dom separately demotes detectors
-of concepts that co-occur with others, since it penalises firing on
-concept-negative tokens. An LLM reading raw examples has neither bias. This
-script probes both gaps.
+Why. The registry labels a peak only when it matches a theoretical fragment ion,
+so features firing on the unmatched majority are invisible to the F1 evaluation
+however interpretable they are. F1-dom separately demotes detectors of concepts
+that co-occur with others, since it penalises firing on concept-negative tokens.
+An LLM reading raw examples carries neither bias.
 
-Strata (--strata), each feature assigned to exactly one, in this precedence:
+Strata (--strata). Each feature lands in exactly one, in this precedence:
 
-    causal       implicated by the Phase 8 ablations. Cross-reference: do
-                 causally necessary features have describable structure?
-    unexplained  activation mass concentrated on peaks the theory cannot label,
-                 ranked by unexplained_mass_fraction above a firing floor.
+    causal       implicated by the Phase 8 ablations. Do causally necessary
+                 features have describable structure?
+    unexplained  activation mass concentrated on peaks the theory cannot label.
                  The discovery set.
     concept      strongest BH-significant chemical association. Positive
-                 control: the chemistry is known, so recovering it without
-                 being told validates the method.
-    unlabelled   no BH-significant concept of any kind, sampled uniformly.
+                 control: recovering known chemistry unprompted validates the
+                 method.
+    unlabelled   no BH-significant concept of any kind.
 
-unexplained and unlabelled sound alike but need not overlap. "No significant
-concept" also collects features firing diffusely without selectivity, while a
-feature whose best concept is is_noise_peak is excluded from unlabelled by
-construction -- scoring a significant association is what disqualifies it --
-though it is the clearest possible unexplained-peak specialist. The two pools and
-their overlap are logged so the difference is visible per run.
+Expect unlabelled to come back empty, and read that as a result rather than a
+misconfiguration. With 12,288 features tested against 50 concepts, everything
+that fires appreciably picks up some significant association, leaving the pool to
+the near-dead tail: on layer 2 that is 151 features, the busiest firing on 18 of
+67.5M tokens. Nor does it stand in for the discovery set the way it might seem
+to -- layer 2 has 576 features above 0.90 unexplained mass and none of them are
+unlabelled, because scoring an is_noise_peak association is itself disqualifying.
+Both pools and their overlap are logged per run.
 
-Concept labels are withheld from the prompt by default (--include-concept-labels
-to override), so any chemistry the model names is inferred from the spectra
-rather than retrieved. For the discovery set this also avoids feeding back the
-labels whose bias the analysis exists to circumvent.
+Concept labels are withheld from the prompt unless --include-concept-labels, so
+any chemistry the model names is inferred from the spectra rather than retrieved.
+For the discovery set this also avoids feeding back the labels whose bias the
+analysis exists to circumvent.
 
 Validation follows InterPLM: a held-out set is shown without activations, the
 model predicts each one, and the Pearson correlation against measured values is
@@ -41,17 +41,21 @@ reported (InterPLM's median is 0.72 over 1,200 protein features). A description
 that cannot predict held-out activations is not evidence of anything. Each row
 carries holdout_coverage, since r covers only the examples actually answered.
 
-Inputs (all produced by an existing evaluate.py run):
-    <eval-dir>/per_feature_stats.csv        feature ranking and concept association
+Inputs, all from an existing evaluate.py run:
+    <eval-dir>/per_feature_stats.csv        ranking and concept association
     <eval-dir>/top_activating_tokens.csv    global top-K provenance (Phase 3)
     <eval-dir>/report.json                  Phase 8 causal results, if present
-plus the extract/annotation chunks and the SAE checkpoint, to recover the full
-activation distribution (Phase 3 stores only the top-K, and the mid-range and
-zero examples are what make the prediction task non-trivial).
+plus the extract/annotation chunks and the SAE checkpoint. The chunks are needed
+because Phase 3 stores only the top-K, and it is the mid-range and zero examples
+that make the prediction task non-trivial.
 
-Output under --output-dir:
-    feature_descriptions.csv    one row per feature: stratum, summary, r, n
-    feature_descriptions.json   full descriptions, examples, and predictions
+Outputs under --output-dir:
+    feature_descriptions.csv            one row per feature: stratum, summary, r
+    feature_descriptions.json           full descriptions, examples, predictions
+    feature_descriptions.partial.jsonl  resume log, appended as each feature lands
+
+Rerunning skips features already in the resume log, so an interrupted run does
+not pay for them twice.
 """
 from __future__ import annotations
 
@@ -84,9 +88,8 @@ EXAMPLES_PER_BIN = 2
 EXAMPLES_TOP_BIN = 6
 ZERO_EXAMPLES = 8
 
-# A feature with too few active examples cannot be characterised, and its
-# prediction r would be dominated by the zero examples. InterPLM excludes
-# features with fewer than 20 examples across the top activation ranges.
+# Below this, a feature cannot be characterised and its r would be dominated by
+# the zero examples. InterPLM's equivalent cutoff is 20.
 MIN_ACTIVE_EXAMPLES = 12
 
 # A partial reply scores the description on a subset the model may have picked
@@ -94,23 +97,19 @@ MIN_ACTIVE_EXAMPLES = 12
 # silently into r.
 MIN_PREDICTION_COVERAGE = 0.8
 
-# Firing floor for the unexplained stratum. A feature firing on a single token
-# also scores a fraction of exactly 1.0, and on a ~500k-token layer that is the
-# bottom decile of high-fraction features. At 1e-4 a full layer leaves roughly
-# 16 sampled examples, clearing MIN_ACTIVE_EXAMPLES. Override per run with
+# Firing floor for the unexplained and unlabelled strata. A feature firing on one
+# token also scores an unexplained fraction of exactly 1.0. Override per run with
 # --min-firing-rate.
 MIN_UNEXPLAINED_FIRING_RATE = 1e-4
 
-# Concepts that describe a token's role rather than its chemistry. A feature
-# whose best concept is one of these has not been given a chemical description --
-# is_noise_peak says the theory had nothing to say, is_latent_token says the
-# token is not a peak at all -- so neither works as a positive control for
-# inferring chemistry, and both are excluded from the concept stratum's ranking.
+# Concepts describing a token's role rather than its chemistry: is_noise_peak
+# says the theory had nothing to say, is_latent_token says the token is not a
+# peak. Neither is a positive control for inferring chemistry, so both are barred
+# from the concept stratum.
 STRUCTURAL_CONCEPTS = frozenset({"is_noise_peak", "is_latent_token"})
 
-# Fraction above which a feature counts as an unexplained-peak specialist when
-# reporting how far the older "no significant concept" proxy reaches. Reporting
-# only; the stratum itself ranks rather than thresholds.
+# Reporting only, for how far the older "no significant concept" proxy reaches
+# into the discovery population. The stratum itself ranks rather than thresholds.
 UNEXPLAINED_OVERLAP_FRACTION = 0.90
 
 # Peaks shown as spectral context around the activating peak.
@@ -142,7 +141,7 @@ class InterpretConfig:
     model: str = DEFAULT_MODEL
     max_tokens: int = 2048
     seed: int = 0
-    device: str = "cuda"
+    device: str = "cpu"   # resolved from --device before construction
     batch_size: int = 4096
     dry_run: bool = False       # build prompts, skip the API
 
@@ -366,12 +365,17 @@ def select_strata(
                 "without --phase4-cache-dir, or drop 'unexplained' from --strata."
             )
 
-        # The firing floor separates a specialist from an artefact: a feature
-        # firing on one token also has a fraction of exactly 1.0.
+        # Latent-token detectors are dropped. UnexplainedMass is a ratio over
+        # peak-token mass, correctly, but nothing requires that mass to be large:
+        # a feature answering almost entirely to the latent summary token clears
+        # the firing floor on latent tokens alone, then scores ~1.0 on the sliver
+        # of peak mass left over. It is not a peak specialist. is_noise_peak
+        # stays -- an unmatched peak is exactly the discovery case.
         candidates = [
             fi for fi, s in stats.items()
             if s["firing_rate"] >= min_firing_rate
             and not np.isnan(s["unexplained_fraction"])
+            and s["best_concept"] != "is_latent_token"
             and fi not in assigned
         ]
         # Ties at exactly 1.0 are common, so the tie-break decides much of the
@@ -401,18 +405,32 @@ def select_strata(
         LOG.info("Stratum concept: %d features", sum(1 for s in assigned.values() if s == "concept"))
 
     if "unlabelled" in strata:
-        # Features the evaluation is silent about: no significant concept of any
-        # kind. Sampled rather than ranked, which keeps the set unbiased with
-        # respect to firing rate.
-        candidates = [
-            fi for fi, s in stats.items()
-            if s["n_significant"] == 0 and s["firing_rate"] > 0 and fi not in assigned
-        ]
+        # Features the evaluation is silent about, sampled rather than ranked so
+        # the set stays unbiased with respect to firing rate within the pool.
+        # The firing floor matters here: without it this stratum selects the
+        # near-dead tail, which would be chosen, encoded, then dropped by
+        # MIN_ACTIVE_EXAMPLES having produced nothing. See the module docstring
+        # for why an empty result is expected and is itself informative.
+        pool = [fi for fi, s in stats.items()
+                if s["n_significant"] == 0 and s["firing_rate"] > 0 and fi not in assigned]
+        candidates = [fi for fi in pool if stats[fi]["firing_rate"] >= min_firing_rate]
         rng.shuffle(candidates)
         for fi in candidates[:n_per_stratum]:
             assigned[fi] = "unlabelled"
-        LOG.info("Stratum unlabelled: %d features (uniform sample of %d candidates)",
-                 sum(1 for s in assigned.values() if s == "unlabelled"), len(candidates))
+        n_taken = sum(1 for s in assigned.values() if s == "unlabelled")
+        LOG.info("Stratum unlabelled: %d features (uniform sample of %d candidates "
+                 "clearing firing rate %g; %d in the pool before the floor)",
+                 n_taken, len(candidates), min_firing_rate, len(pool))
+        if pool and not candidates:
+            hottest = max(stats[fi]["firing_rate"] for fi in pool)
+            LOG.warning(
+                "Stratum 'unlabelled' is empty: all %d features without a significant "
+                "concept fire below the floor (busiest %.2e). Every feature that fires "
+                "appreciably in this layer has some significant association, so this "
+                "stratum has no describable members -- lower --min-firing-rate only if "
+                "you want the near-dead tail.",
+                len(pool), hottest,
+            )
 
     if "unexplained" in strata and "unlabelled" in strata:
         # How far "no significant concept" reaches into the discovery
@@ -444,6 +462,40 @@ def _relative_intensity(intensity: float, spectrum_max: float) -> float:
     return float(intensity / spectrum_max) if spectrum_max > 0 else 0.0
 
 
+def available_chunk_indices(extract_dir: Path, target_layer: int) -> tuple[list[int], int]:
+    """Chunk ids whose activation file for this layer is still on disk.
+
+    A run with KEEP_CHUNKS=0 deletes activations after evaluating and keeps only
+    KEEP_CHUNK_SAMPLE per layer as a cross-layer token sample, while leaving the
+    manifest listing all of them. Selecting by manifest alone would then pick
+    chunks that no longer exist and die on the first torch.load. Returns
+    (available ids, total in manifest) so the caller can say how much survived.
+    """
+    manifest = json.loads((extract_dir / "manifest.json").read_text())
+    layer_key = str(target_layer)
+    available = [
+        c["idx"] for c in manifest["chunks"]
+        if layer_key in c.get("activations", {})
+        and (extract_dir / c["activations"][layer_key]).exists()
+        and (extract_dir / c["meta"]).exists()
+    ]
+    return available, manifest["n_chunks"]
+
+
+def spread_chunk_indices(n_chunks: int, n_sample: int) -> list[int]:
+    """Evenly spaced chunk ids, rather than the leading n_sample.
+
+    Chunks follow the merged parquet, which is not shuffled. Mean peptide length
+    drifts from about 14.7 residues at the start of the file to 21.8 at the end,
+    so the first dozen chunks of 625 are a different population from the corpus
+    and would describe every feature from one end of the dataset.
+    """
+    if n_sample >= n_chunks:
+        return list(range(n_chunks))
+    step = n_chunks / n_sample
+    return sorted({min(int(i * step), n_chunks - 1) for i in range(n_sample)})
+
+
 def _collect_activations(
     stream: ChunkStream,
     feature_ids: list[int],
@@ -455,12 +507,12 @@ def _collect_activations(
     The chunk records hold the per-token and per-spectrum metadata needed to turn
     a token index back into a readable example.
 
-    MEMORY. ChunkStream materialises the full dense [n_tokens, d_dict] feature
-    matrix for one chunk at a time -- about 5 GB at the default chunk size and
-    d_dict = 12,288 -- which is freed as the loop advances. Only the selected
-    columns are retained, so the lasting cost is
-    n_chunks * n_tokens * len(feature_ids) * 4 bytes (roughly 600 MB for 12
-    chunks and 120 features). Lower --n-sample-chunks on a small machine.
+    MEMORY. ChunkStream materialises one chunk's dense [n_tokens, d_dict] feature
+    matrix at a time, about 5 GB at d_dict = 12,288, freed as the loop advances.
+    Only the selected columns persist: n_chunks * n_tokens * len(feature_ids) * 4
+    bytes, roughly 600 MB for 12 chunks and 120 features. That transient 5 GB is
+    the binding constraint on a small machine, and --n-sample-chunks does not
+    shrink it; it is set by the chunk size chosen at extraction.
     """
     feature_index = {fi: i for i, fi in enumerate(feature_ids)}
     columns: list[np.ndarray] = []
@@ -562,7 +614,7 @@ def _make_example(
         peptide=str(rec["peptides"][spectrum]),
         precursor_mz=float(rec["precursor_mzs"][spectrum]),
         precursor_charge=int(rec["precursor_charges"][spectrum]),
-        neighbour_mzs=neighbours,
+        neighbours=neighbours,
         concepts=concepts,
     )
 
@@ -613,9 +665,12 @@ def build_examples(
         take = min(want, in_bin.size)
         chosen.extend(rng.sample(list(in_bin), take))
 
+    # Sampled by position: zeros holds most of the layer, and materialising it as
+    # a Python list once per feature costs more than the sampling does.
     zeros = np.flatnonzero(normalised == 0)
     if zeros.size:
-        chosen.extend(rng.sample(list(zeros), min(ZERO_EXAMPLES, zeros.size)))
+        take = min(ZERO_EXAMPLES, zeros.size)
+        chosen.extend(int(zeros[i]) for i in rng.sample(range(zeros.size), take))
 
     rng.shuffle(chosen)
     examples = []
@@ -638,10 +693,15 @@ def merge_global_top(
 ) -> list[TokenExample]:
     """Add Phase 3's globally strongest activations when they fall in the sample.
 
-    The sampled chunks rarely contain a feature's global maximum, and the
-    strongest examples carry the most information about what it detects. `peak`
-    is the shared scale from feature_peak, so these rows are directly comparable
-    to the sampled ones.
+    The strongest examples carry the most information about what a feature
+    detects, and `peak` is the shared scale from feature_peak, so these rows are
+    directly comparable to the sampled ones.
+
+    Expect few. Phase 3 ranked over every chunk while this run reads a sample of
+    them, so on the nine-species layers only 1 to 2 per cent of top-K rows land in
+    a 12-of-625 sample: under one row per feature. The consequence is that most
+    features are described from the lower part of their range, and raising
+    --n-sample-chunks is the only lever on it.
     """
     if peak <= 0:
         return examples
@@ -671,11 +731,10 @@ def merge_global_top(
 def _csv_safe(value: str) -> str:
     """Strip separators from a free-text cell.
 
-    The table is joined on commas by hand rather than via csv.writer, because the
-    model reads it as plain text. A comma or newline inside a field would shift
-    every column after it, so the row would still parse but describe the wrong
-    peak. No ProForma string in the nine-species benchmark contains either; this
-    is here so a different dataset cannot corrupt the table silently.
+    The table is joined on commas by hand, since the model reads it as plain
+    text. A comma or newline inside a field would shift every column after it and
+    the row would still parse, describing the wrong peak. Nothing in the
+    nine-species benchmark contains either; this guards a different dataset.
     """
     return str(value).replace(",", ";").replace("\n", " ").replace("\r", " ")
 
@@ -714,7 +773,10 @@ def format_example_table(
         if include_concepts:
             cells.append(_csv_safe(" ".join(e.concepts)))
         if include_activation:
-            cells.insert(1, f"{e.activation:.3f}")
+            # `or 0.0` collapses negative zero, which the SAE's masked multiply
+            # produces for about a third of inactive tokens. "-0.000" in the
+            # column the model reasons over invites a sign that is not there.
+            cells.insert(1, f"{e.activation or 0.0:.3f}")
         rows.append(",".join(cells))
     return "\n".join(rows)
 
@@ -807,17 +869,13 @@ Tokens to predict:
 def load_dotenv(path: Path) -> int:
     """Load KEY=value pairs from a .env file into os.environ. Returns the count.
 
-    Variables already set in the environment WIN over the file, so an explicitly
-    exported key overrides it and CI secrets are never shadowed by a stray local
-    file.
+    Handles one KEY=value per line, # comments, blank lines, an optional `export`
+    prefix and optional quotes -- small enough not to warrant python-dotenv.
 
-    Read as utf-8-sig because PowerShell's Set-Content and Notepad both write a
-    byte-order mark by default, which would otherwise make the first key parse
-    as "\\ufeffOPENAI_API_KEY" and silently fail to match.
-
-    Written here rather than taking a python-dotenv dependency: the format is
-    one KEY=value per line, with # comments, blank lines, an optional `export`
-    prefix, and optional quotes around the value.
+    The environment wins over the file, so an exported key overrides it and a
+    stray local file never shadows a deployment secret. Read as utf-8-sig
+    because PowerShell and Notepad write a BOM by default, which would otherwise
+    make the first key parse as "\\ufeffOPENAI_API_KEY" and silently not match.
     """
     if not path.exists():
         return 0
@@ -856,6 +914,22 @@ def _make_client():
     return OpenAI()
 
 
+# Model ids the API actually served, as opposed to the alias asked for. An alias
+# like "gpt-4o" floats between versions, so the paper needs the resolved id and
+# write_outputs records whatever came back.
+RESOLVED_MODELS: set[str] = set()
+
+# HTTP statuses worth a second attempt: rate limits, and the server's own faults.
+# Anything else (bad key, unknown model, malformed request) will fail the same
+# way forever, and 160 features each burning three retries turns a typo into an
+# hour of sleeping.
+RETRYABLE_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504})
+
+
+class PermanentAPIError(RuntimeError):
+    """An API failure that retrying cannot fix."""
+
+
 def _create_completion(client, model: str, prompt: str, max_tokens: int) -> str:
     """One chat completion.
 
@@ -872,22 +946,31 @@ def _create_completion(client, model: str, prompt: str, max_tokens: int) -> str:
         response = client.chat.completions.create(
             model=model, messages=messages, max_completion_tokens=max_tokens,
         )
-    except Exception as exc:  # noqa: BLE001 -- inspect the message, then re-raise
+    except Exception as exc:  # inspect the message, then re-raise
         if "max_completion_tokens" not in str(exc):
             raise
         response = client.chat.completions.create(
             model=model, messages=messages, max_completion_tokens=max_tokens,
         )
+    if getattr(response, "model", None):
+        RESOLVED_MODELS.add(response.model)
     return response.choices[0].message.content or ""
 
 
 def call_model(client, model: str, prompt: str, max_tokens: int, retries: int = 3) -> str:
-    """One completion, retrying on transient failures with linear backoff."""
+    """One completion, retrying transient failures with linear backoff.
+
+    A permanent failure is raised immediately: the run is unattended and every
+    feature would otherwise repeat the same doomed attempt.
+    """
     last: Exception | None = None
     for attempt in range(retries):
         try:
             return _create_completion(client, model, prompt, max_tokens)
-        except Exception as exc:  # noqa: BLE001 -- surface any API failure to the caller
+        except Exception as exc:  # classify, then retry or give up
+            status = getattr(exc, "status_code", None)
+            if status is not None and status not in RETRYABLE_STATUS:
+                raise PermanentAPIError(f"{type(exc).__name__}: {exc}") from exc
             last = exc
             wait = 5 * (attempt + 1)
             LOG.warning("Model call failed (attempt %d/%d): %s; retrying in %ds",
@@ -896,8 +979,8 @@ def call_model(client, model: str, prompt: str, max_tokens: int, retries: int = 
     raise RuntimeError(f"Model call failed after {retries} attempts: {last}")
 
 
-_DESCRIPTION_RE = re.compile(r"DESCRIPTION:\s*(.*?)\s*SUMMARY:", re.S)
-_SUMMARY_RE = re.compile(r"SUMMARY:\s*(.*)", re.S)
+_DESCRIPTION_RE = re.compile(r"DESCRIPTION:\s*(.*?)\s*SUMMARY:", re.DOTALL)
+_SUMMARY_RE = re.compile(r"SUMMARY:\s*(.*)", re.DOTALL)
 
 
 def parse_description(text: str) -> tuple[str, str]:
@@ -1016,6 +1099,53 @@ def interpret_feature(
 
 # --- Output -------------------------------------------------------------------
 
+def _resume_path(output_dir: Path) -> Path:
+    return output_dir / "feature_descriptions.partial.jsonl"
+
+
+def load_completed(output_dir: Path) -> dict[int, dict]:
+    """Features already described in an earlier attempt, keyed by feature_idx.
+
+    Every stage in this pipeline resumes rather than repeating work, and here the
+    work costs money: an interrupted run has already paid for the features it
+    finished. A malformed trailing line is dropped, since a run killed mid-write
+    leaves one.
+    """
+    path = _resume_path(output_dir)
+    if not path.exists():
+        return {}
+    done: dict[int, dict] = {}
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            LOG.warning("Ignoring a truncated line in %s", path.name)
+            continue
+        done[int(record["feature_idx"])] = record
+    return done
+
+
+def append_completed(output_dir: Path, result: dict) -> None:
+    """Persist one feature as soon as it is done, before the run can die.
+
+    A run killed mid-write leaves a line with no newline on the end. Appending
+    straight onto it would fuse the two records into one unparseable line and
+    lose this feature as well as that one, so the separator is restored first.
+    """
+    path = _resume_path(output_dir)
+    if path.exists() and path.stat().st_size:
+        with open(path, "rb") as fp:
+            fp.seek(-1, os.SEEK_END)
+            needs_newline = fp.read(1) != b"\n"
+        if needs_newline:
+            with open(path, "a", encoding="utf-8") as fp:
+                fp.write("\n")
+    with open(path, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(result, default=str) + "\n")
+
+
 def _blank_if_nan(value) -> str:
     """Write an absent unexplained-mass statistic as an empty cell, not 'nan'."""
     if value is None or (isinstance(value, float) and np.isnan(value)):
@@ -1031,6 +1161,8 @@ def write_outputs(
 ) -> None:
     """Write the summary CSV and the full JSON record."""
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    # Feature order, so a resumed run is byte-comparable with an uninterrupted one.
+    results = sorted(results, key=lambda r: r["feature_idx"])
 
     csv_path = config.output_dir / "feature_descriptions.csv"
     with open(csv_path, "w", newline="") as fp:
@@ -1060,7 +1192,12 @@ def write_outputs(
 
     json_path = config.output_dir / "feature_descriptions.json"
     json_path.write_text(json.dumps(
-        {"config": config.as_jsonable(), "results": results},
+        {
+            "config": config.as_jsonable(),
+            # The alias asked for floats between versions; this is what answered.
+            "models_served": sorted(RESOLVED_MODELS),
+            "results": results,
+        },
         indent=2, default=str,
     ))
     LOG.info("Wrote %s and %s", csv_path, json_path)
@@ -1096,10 +1233,10 @@ def parse_args() -> argparse.Namespace:
                    help="Show the 50 concept labels to the model. Off by default so "
                         "any chemistry it names is inferred from the spectra alone.")
     p.add_argument("--min-firing-rate", type=float, default=MIN_UNEXPLAINED_FIRING_RATE,
-                   help="Firing-rate floor for the unexplained stratum (default "
-                        f"{MIN_UNEXPLAINED_FIRING_RATE:g}). Excludes features whose "
-                        "unexplained-mass fraction of 1.0 comes from firing on only "
-                        "a handful of tokens.")
+                   help="Firing-rate floor for the unexplained and unlabelled strata "
+                        f"(default {MIN_UNEXPLAINED_FIRING_RATE:g}). Drops features too "
+                        "rare to describe, including those whose unexplained-mass "
+                        "fraction of 1.0 comes from firing on a handful of tokens.")
 
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--env-file", type=Path, default=None,
@@ -1108,12 +1245,28 @@ def parse_args() -> argparse.Namespace:
                         "take precedence over the file.")
     p.add_argument("--max-tokens", type=int, default=2048)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--device", default="cuda")
+    p.add_argument("--device", default="auto",
+                   help="'auto' (default) uses cuda when a GPU is visible and cpu "
+                        "otherwise. An explicit value is honoured as given.")
     p.add_argument("--batch-size", type=int, default=4096)
     p.add_argument("--dry-run", action="store_true",
                    help="Build prompts and write them out without calling the API.")
     p.add_argument("--log-level", default="INFO")
     return p.parse_args()
+
+
+def resolve_device(requested: str) -> str:
+    """Follow the hardware for 'auto'; honour anything explicit.
+
+    Matches run_pipeline.sh: the default adapts so a CPU box works untouched,
+    while an explicit --device cuda still fails loudly on a machine without one
+    rather than silently running orders of magnitude slower.
+    """
+    if requested != "auto":
+        return requested
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    LOG.info("Device auto-detected: %s", device)
+    return device
 
 
 def main() -> int:
@@ -1138,7 +1291,7 @@ def main() -> int:
         model=args.model,
         max_tokens=args.max_tokens,
         seed=args.seed,
-        device=args.device,
+        device=resolve_device(args.device),
         batch_size=args.batch_size,
         dry_run=args.dry_run,
     )
@@ -1161,6 +1314,66 @@ def main() -> int:
     LOG.info("Interpreting %d features across %d strata",
              len(feature_ids), len(set(assigned.values())))
 
+    # Both of these come before the encode, which is the expensive part: a
+    # missing key or an already-finished feature set should not cost a pass over
+    # the chunks first.
+    client = None
+    completed: dict[int, dict] = {}
+    if not config.dry_run:
+        env_file = args.env_file or Path(__file__).parent / ".env"
+        n_loaded = load_dotenv(env_file)
+        if n_loaded:
+            LOG.info("Loaded %d variable(s) from %s", n_loaded, env_file)
+        client = _make_client()
+        if client is None:
+            return 1
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+        completed = load_completed(config.output_dir)
+        if completed:
+            LOG.info("Resuming: %d feature(s) already described in %s",
+                     len(completed), _resume_path(config.output_dir).name)
+        # A feature can change stratum between runs without its description
+        # becoming wrong: adding Phase 8 promotes features into `causal` that a
+        # Phase-8-less run filed under `concept` or `unexplained`, since causal
+        # takes precedence. The description was written from the same examples
+        # either way, so relabel it rather than paying to regenerate it.
+        for fi, record in completed.items():
+            if fi in assigned and record.get("stratum") != assigned[fi]:
+                LOG.info("Feature %d moved from stratum %s to %s; keeping its description",
+                         fi, record.get("stratum"), assigned[fi])
+                record["stratum"] = assigned[fi]
+
+    todo = [fi for fi in feature_ids if fi not in completed]
+    if not todo:
+        LOG.info("Every selected feature is already described; rewriting outputs only.")
+        write_outputs([completed[fi] for fi in feature_ids if fi in completed],
+                      stats, causal, config)
+        return 0
+
+    available, total_chunks = available_chunk_indices(config.extract_dir, config.target_layer)
+    if not available:
+        LOG.error(
+            "No activation files for layer %d survive under %s, though the manifest "
+            "lists %d chunks. A KEEP_CHUNKS=0 run deletes them after evaluating. "
+            "Re-extract this layer to interpret it.",
+            config.target_layer, config.extract_dir, total_chunks,
+        )
+        return 1
+    if len(available) < total_chunks:
+        LOG.warning(
+            "Only %d of %d chunks still hold layer-%d activations (KEEP_CHUNKS=0 "
+            "prunes to a cross-layer sample). Sampling is confined to those, so the "
+            "examples come from %.1f%% of the corpus and from its beginning rather "
+            "than spread across it.",
+            len(available), total_chunks, config.target_layer,
+            100 * len(available) / total_chunks,
+        )
+    picks = spread_chunk_indices(len(available), config.n_sample_chunks)
+    chosen = [available[i] for i in picks]
+    LOG.info("Sampling %d chunk(s) of the %d available: %s",
+             len(chosen), len(available),
+             ", ".join(str(c) for c in chosen[:8]) + (", ..." if len(chosen) > 8 else ""))
+
     sae = load_sae_from_checkpoint(config.sae_checkpoint, device=config.device)
     stream = ChunkStream(
         extract_dir=config.extract_dir,
@@ -1170,22 +1383,13 @@ def main() -> int:
         device=config.device,
         batch_size=config.batch_size,
         dtype=torch.float32,
+        chunk_indices=chosen,
     )
-    activations, records = _collect_activations(stream, feature_ids, config.n_sample_chunks)
+    activations, records = _collect_activations(stream, todo, len(chosen))
 
-    client = None
-    if not config.dry_run:
-        env_file = args.env_file or Path(__file__).parent / ".env"
-        n_loaded = load_dotenv(env_file)
-        if n_loaded:
-            LOG.info("Loaded %d variable(s) from %s", n_loaded, env_file)
-        client = _make_client()
-        if client is None:
-            return 1
-
-    results: list[dict] = []
+    results: list[dict] = [completed[fi] for fi in feature_ids if fi in completed]
     skipped = 0
-    for n, fi in enumerate(feature_ids, start=1):
+    for n, fi in enumerate(todo, start=1):
         top_k = global_top.get(fi, [])
         peak = feature_peak(activations[fi], top_k)
         examples = build_examples(
@@ -1201,17 +1405,24 @@ def main() -> int:
         )
 
         LOG.info("[%d/%d] feature %d (%s), %d examples",
-                 n, len(feature_ids), fi, assigned[fi], len(examples))
+                 n, len(todo), fi, assigned[fi], len(examples))
         try:
-            results.append(interpret_feature(
-                client, config, fi, assigned[fi], examples, rng,
-            ))
+            result = interpret_feature(client, config, fi, assigned[fi], examples, rng)
+        except PermanentAPIError as exc:
+            # Nothing about the next feature would go differently, and the
+            # partial file already holds everything paid for so far.
+            LOG.error("Feature %d hit a permanent API error, stopping: %s", fi, exc)
+            break
         except RuntimeError as exc:
             LOG.error("Feature %d failed: %s", fi, exc)
+            continue
+        results.append(result)
+        if not config.dry_run:
+            append_completed(config.output_dir, result)
 
     if skipped:
         LOG.info("Skipped %d/%d features with too few active examples; raise "
-                 "--n-sample-chunks to reach rarer features.", skipped, len(feature_ids))
+                 "--n-sample-chunks to reach rarer features.", skipped, len(todo))
     write_outputs(results, stats, causal, config)
     return 0
 

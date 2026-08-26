@@ -378,6 +378,7 @@ class ChunkStream:
         device: str,
         batch_size: int,
         dtype: torch.dtype,
+        chunk_indices: list[int] | None = None,
     ):
         self.extract_dir = extract_dir
         self.annotation_dir = annotation_dir
@@ -386,6 +387,11 @@ class ChunkStream:
         self.device = device
         self.batch_size = batch_size
         self.dtype = dtype
+        # Which chunks to visit, in order. None means all of them, which is what
+        # every phase here wants. A caller that only needs a sample passes an
+        # explicit list; the ids stay the true chunk ids, so provenance recorded
+        # against them (Phase 3's top-K) still resolves.
+        self._chunk_indices = chunk_indices
 
         extract_manifest = json.loads((extract_dir / "manifest.json").read_text())
         annotation_manifest = json.loads((annotation_dir / "annotation_manifest.json").read_text())
@@ -396,6 +402,14 @@ class ChunkStream:
         )
         self.annotation_paths = [annotation_dir / c["path"] for c in annotation_manifest["chunks"]]
         self.n_chunks = extract_manifest["n_chunks"]
+        if self._chunk_indices is None:
+            self._chunk_indices = list(range(self.n_chunks))
+        else:
+            bad = [c for c in self._chunk_indices if not 0 <= c < self.n_chunks]
+            if bad:
+                raise ValueError(
+                    f"chunk_indices out of range for a {self.n_chunks}-chunk run: {bad[:5]}"
+                )
         self.concept_names: list[str] = annotation_manifest["registry"]["names"]
         self.diagnostic_concepts: set[str] = set(annotation_manifest["registry"]["diagnostic"])
         self.family_of: dict[str, str] = annotation_manifest["registry"]["family_of"]
@@ -462,7 +476,7 @@ class ChunkStream:
         return out
 
     def __iter__(self) -> Iterator[JoinedChunk]:
-        for ci in range(self.n_chunks):
+        for ci in self._chunk_indices:
             meta = torch.load(self.meta_paths[ci], map_location="cpu", weights_only=False)
             acts_obj = torch.load(self.acts_paths[ci], map_location="cpu", weights_only=False)
             annotation = torch.load(self.annotation_paths[ci], map_location="cpu", weights_only=False)
@@ -504,20 +518,22 @@ class ChunkStream:
     def iter_activations(self) -> Iterator[torch.Tensor]:
         """Raw activations only -- skips the default-threshold SAE encode, which
         phases that re-encode under their own settings would waste."""
-        for acts_path in self.acts_paths:
-            acts_obj = torch.load(acts_path, map_location="cpu", weights_only=False)
+        for ci in self._chunk_indices:
+            acts_obj = torch.load(self.acts_paths[ci], map_location="cpu", weights_only=False)
             yield acts_obj["activations"]
 
     def iter_metadata(self) -> Iterator[dict]:
         """Extract metadata only."""
-        for meta_path in self.meta_paths:
-            yield torch.load(meta_path, map_location="cpu", weights_only=False)
+        for ci in self._chunk_indices:
+            yield torch.load(self.meta_paths[ci], map_location="cpu", weights_only=False)
 
     def iter_metadata_annotations(self) -> Iterator[tuple[dict, dict]]:
         """Metadata plus annotation labels, without activations."""
-        for meta_path, annotation_path in zip(self.meta_paths, self.annotation_paths):
-            meta = torch.load(meta_path, map_location="cpu", weights_only=False)
-            annotation = torch.load(annotation_path, map_location="cpu", weights_only=False)
+        for ci in self._chunk_indices:
+            meta = torch.load(self.meta_paths[ci], map_location="cpu", weights_only=False)
+            annotation = torch.load(
+                self.annotation_paths[ci], map_location="cpu", weights_only=False
+            )
             yield meta, annotation
 
 

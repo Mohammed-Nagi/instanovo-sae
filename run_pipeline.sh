@@ -193,6 +193,29 @@ ABLATION_PER_FEATURE_TOP="${ABLATION_PER_FEATURE_TOP:-20}"
 CROSS_LAYER_TOKENS="${CROSS_LAYER_TOKENS:-100000}"
 
 # -----------------------------------------------------------------------------
+# Interpretation (Step 6) -- off by default: it is the only step that calls a
+# paid external API, so it never runs unless asked for.
+#
+# It needs no GPU. The one SAE encode over INTERPRET_SAMPLE_CHUNKS chunks is a
+# few minutes on CPU, and the rest is API latency. Run it on a CPU pod rather
+# than queueing behind an accelerator.
+#
+# The key is read from a file, never from the environment of this script and
+# never from the manifest, so it stays out of git and out of `ps`. Point
+# INTERPRET_ENV_FILE at a file holding OPENAI_API_KEY=sk-... . See
+# docs/aichor_deployment.md for placing one on the PVC.
+RUN_INTERPRET="${RUN_INTERPRET:-0}"
+INTERPRET_ENV_FILE="${INTERPRET_ENV_FILE:-}"
+INTERPRET_STRATA="${INTERPRET_STRATA:-}"          # blank = interpret.py's default set
+INTERPRET_N_PER_STRATUM="${INTERPRET_N_PER_STRATUM:-40}"
+INTERPRET_SAMPLE_CHUNKS="${INTERPRET_SAMPLE_CHUNKS:-12}"
+INTERPRET_MIN_FIRING_RATE="${INTERPRET_MIN_FIRING_RATE:-}"
+INTERPRET_MODEL="${INTERPRET_MODEL:-}"            # blank = interpret.py's default
+INTERPRET_MAX_TOKENS="${INTERPRET_MAX_TOKENS:-}"
+INTERPRET_DEVICE="${INTERPRET_DEVICE:-auto}"      # auto = cuda if visible, else cpu
+INTERPRET_DRY_RUN="${INTERPRET_DRY_RUN:-0}"       # 1 = build prompts, call nothing
+
+# -----------------------------------------------------------------------------
 # Disk management
 # KEEP_CHUNKS=1 (default): extraction chunks are expensive to produce and are
 # reusable across all future SAE experiments on this dataset. Only set to 0 if
@@ -259,6 +282,7 @@ EXTRACT_PY="$SCRIPT_DIR/extract.py"
 ANNOTATE_PY="$SCRIPT_DIR/annotate.py"
 TRAIN_PY="$SCRIPT_DIR/train.py"
 EVALUATE_PY="$SCRIPT_DIR/evaluate.py"
+INTERPRET_PY="$SCRIPT_DIR/interpret.py"
 
 for f in "$EXTRACT_PY" "$ANNOTATE_PY" "$TRAIN_PY" "$EVALUATE_PY"; do
     [[ -f "$f" ]] || { echo "ERROR: Missing pipeline script: $f" >&2; exit 1; }
@@ -349,6 +373,23 @@ run_step() {
         log "FAIL $desc -- see $log_path"
         exit 1
     fi
+}
+
+run_step_soft() {
+    # run_step, but a failure returns 1 instead of ending the run. For work that
+    # is an addition to an already-complete result, where aborting would strand
+    # everything the run has not yet published.
+    local desc="$1"; shift
+    local log_path="$1"; shift
+    log "RUN  $desc"
+    local t0
+    t0=$(date +%s)
+    if "$@" 2>&1 | tee "$log_path"; then
+        log "OK   $desc  ($(($(date +%s) - t0))s)"
+        return 0
+    fi
+    log "WARN $desc failed -- see $log_path"
+    return 1
 }
 
 sae_checkpoint_path() {   # $1 = layer
@@ -1364,6 +1405,94 @@ PYEOF
         log "Smoke test FAILED -- see the checks above"
         exit 1
     fi
+fi
+
+# -----------------------------------------------------------------------------
+# Step 6: Interpret features -- one pass per layer, after evaluation
+# -----------------------------------------------------------------------------
+#
+# Reads the eval directory Step 4 wrote and the extract/annotation chunks, and
+# asks an LLM to describe a sample of features. Off unless RUN_INTERPRET=1.
+#
+# Every earlier step is idempotent, so an interpretation-only run is just this
+# script over an output root that already has its artefacts:
+#
+#   RUN_INTERPRET=1 SKIP_TRAIN=1 KEEP_CHUNKS=1 \
+#   INTERPRET_ENV_FILE=/app/fm_mount/secrets/openai.env \
+#   OUTPUT_ROOT=... bash ./run_pipeline.sh
+#
+# Steps 0-5 find their outputs present and skip, leaving this and the publish.
+# SKIP_TRAIN=1 matters: without it a missing checkpoint would silently start a
+# multi-hour training run instead of failing.
+#
+# Failure here is deliberately not fatal. The descriptions are an addition to a
+# finished evaluation, and the publish step below is what makes everything else
+# retrievable -- losing a run's artefacts because an API key expired would be a
+# far worse outcome than losing the descriptions.
+# -----------------------------------------------------------------------------
+
+if [[ "$RUN_INTERPRET" == "1" ]]; then
+    if [[ ! -f "$INTERPRET_PY" ]]; then
+        log "FAIL RUN_INTERPRET=1 but $INTERPRET_PY is missing"
+        exit 1
+    fi
+    # A dry run builds prompts and calls nothing, so it needs no key. Checking
+    # anyway would make the one submission that can validate the plumbing before
+    # the key exists impossible to run.
+    if [[ -n "$INTERPRET_ENV_FILE" && ! -f "$INTERPRET_ENV_FILE" ]]; then
+        if [[ "$INTERPRET_DRY_RUN" == "1" ]]; then
+            log "INTERPRET_ENV_FILE=$INTERPRET_ENV_FILE is absent, but INTERPRET_DRY_RUN=1 -- continuing"
+            INTERPRET_ENV_FILE=""
+        else
+            log "FAIL INTERPRET_ENV_FILE=$INTERPRET_ENV_FILE does not exist"
+            log "     Create it on the PVC with a single line: OPENAI_API_KEY=sk-..."
+            exit 1
+        fi
+    fi
+
+    for LAYER in "${LAYERS[@]}"; do
+        INTERPRET_EVAL_DIR="$SAE_ROOT/layer_$LAYER/seed_${SEED}/eval"
+        INTERPRET_CKPT="$(sae_checkpoint_path "$LAYER")"
+        INTERPRET_OUT="$OUTPUT_ROOT/interpret/layer_$LAYER"
+
+        if [[ ! -f "$INTERPRET_EVAL_DIR/per_feature_stats.csv" ]]; then
+            log "WARNING: no per_feature_stats.csv for layer $LAYER -- skipping interpretation"
+            continue
+        fi
+        if [[ ! -f "$INTERPRET_CKPT" ]]; then
+            log "WARNING: no SAE checkpoint for layer $LAYER -- skipping interpretation"
+            continue
+        fi
+
+        INTERPRET_ARGS=(
+            --eval-dir        "$INTERPRET_EVAL_DIR"
+            --extract-dir     "$EXTRACT_DIR"
+            --annotation-dir  "$ANNOTATION_DIR"
+            --sae-checkpoint  "$INTERPRET_CKPT"
+            --output-dir      "$INTERPRET_OUT"
+            --target-layer    "$LAYER"
+            --seed            "$SEED"
+            --device          "$INTERPRET_DEVICE"
+            --n-per-stratum   "$INTERPRET_N_PER_STRATUM"
+            --n-sample-chunks "$INTERPRET_SAMPLE_CHUNKS"
+        )
+        [[ -n "$INTERPRET_ENV_FILE" ]] && INTERPRET_ARGS+=(--env-file "$INTERPRET_ENV_FILE")
+        [[ -n "$INTERPRET_MODEL" ]] && INTERPRET_ARGS+=(--model "$INTERPRET_MODEL")
+        [[ -n "$INTERPRET_MAX_TOKENS" ]] && INTERPRET_ARGS+=(--max-tokens "$INTERPRET_MAX_TOKENS")
+        [[ -n "$INTERPRET_MIN_FIRING_RATE" ]] && \
+            INTERPRET_ARGS+=(--min-firing-rate "$INTERPRET_MIN_FIRING_RATE")
+        # Unquoted on purpose: INTERPRET_STRATA is a space-separated list for nargs="+".
+        [[ -n "$INTERPRET_STRATA" ]] && INTERPRET_ARGS+=(--strata $INTERPRET_STRATA)
+        [[ "$INTERPRET_DRY_RUN" == "1" ]] && INTERPRET_ARGS+=(--dry-run)
+
+        if run_step_soft "Interpret features (layer $LAYER, seed $SEED)" \
+            "$OUTPUT_ROOT/interpret_layer${LAYER}.log" \
+            "$PYTHON" "$INTERPRET_PY" "${INTERPRET_ARGS[@]}"; then
+            log "  Descriptions: $INTERPRET_OUT/feature_descriptions.csv"
+        else
+            log "WARNING: interpretation failed for layer $LAYER -- continuing to publish"
+        fi
+    done
 fi
 
 # -----------------------------------------------------------------------------

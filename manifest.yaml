@@ -5,55 +5,56 @@ builder:
   dockerfile: ./Dockerfile.aichor
   context: .
   buildArgs:
+    # Left at true even though this job never touches a GPU: a CUDA build of
+    # torch runs fine on a CPU node (cuda.is_available() simply returns False),
+    # and flipping it would rebuild the image from a different dependency set for
+    # no gain.
     USE_CUDA: "true"
 spec:
   operator: pytorch
   image: instanovo-sae
-  # Layers are processed two at a time to keep peak PVC usage near 208 GB rather
-  # than the ~416 GB all four would need. Each pair pays its own extraction
-  # forward pass, and cross-layer matching runs within the pair. Run this with
-  # LAYERS_OVERRIDE="2 4", then again with "6 8", then the Phase 8 pass.
+  # -------------------------------------------------------------------------
+  # Interpretation pass over run 1 (layers 2 and 4).
   #
-  # KEEP_CHUNKS=0 is required, not optional: without it the first pair's ~208 GB
-  # stays on the volume and the second pair cannot fit. KEEP_CHUNK_SAMPLE (default
-  # 2) still retains a token sample per layer so cross-layer matching across all
-  # four layers remains possible in a later run.
+  # Every earlier step is idempotent, so this is the whole pipeline pointed at an
+  # output root that already has its artefacts: steps 0-5 find their outputs and
+  # skip, leaving Step 6 and the bucket publish. No bypass flag is involved.
   #
-  # DATASET_DIR must sit under the mount. Its default is a relative path, which
-  # resolves to ephemeral container disk, so the 639k-spectrum merge would be
-  # redone and discarded on every run.
+  # SKIP_TRAIN=1 is load-bearing. Without it a checkpoint that failed to resolve
+  # would start a multi-hour training run instead of failing immediately.
   #
-  # RUN_CAUSAL=1 enables Phase 7 (loss recovered), one substitution pass over the
-  # eval spectra. RUN_PHASE_8=0 keeps causal ablation off: its cost is
-  # n_concepts x (1 + controls + ABLATION_PER_FEATURE_TOP) model passes per layer
-  # and would dominate the run.
-  # TRAIN_NO_RAM_CACHE=1 is set explicitly rather than left to choose_ram_cache.
-  # That helper sizes against MemAvailable in /proc/meminfo, which in a container
-  # is commonly the node's memory rather than this pod's cgroup limit -- so it
-  # could conclude a 207 GB float32 layer cache fits and then be OOM-killed at the
-  # pod limit, hours into training. Streaming is what it would pick anyway at any
-  # RAM setting we would request here.
-  # Invoked through `bash` rather than as ./run_pipeline.sh: the Dockerfile now
-  # restores the executable bit, but going through the interpreter does not
-  # depend on it at all, and losing it cost a full queue slot once already.
+  # MODEL_PATH must be the pretrained id. The default is ./instanovo_v1.1.0.ckpt,
+  # which the path-form check rejects as missing before any step runs, even
+  # though nothing here loads the model.
   #
-  # Second half of the layer sweep. It writes to its OWN output root because
-  # extract.py rewrites extract/manifest.json with only the layers it was asked
-  # for, with no merge -- so pointing this at the layers 2+4 root while that run
-  # is still evaluating would strip layer 4 from the manifest and break it
-  # mid-flight. Separate roots share nothing mutable, so the two can run at once.
+  # DATASET_DIR points at the merged parquet so Step 0 skips rather than
+  # re-downloading and re-merging 639k spectra.
   #
-  # DATASET_DIR is shared deliberately: the merged parquet is read-only once
-  # written, so this run reuses it instead of re-downloading 639k spectra.
+  # KEEP_CHUNKS is deliberately NOT set to 0. Run 1 already pruned its chunks to
+  # a 2-per-layer sample, and interpret.py detects what survives and confines
+  # sampling to it; setting 0 again would delete the remainder and leave nothing
+  # to interpret from.
   #
-  # KEEP_CHUNKS is left at its default of 1. The PVC reported 1989 GB free, and
-  # discarding a forward pass over the full benchmark to reclaim ~208 GB would
-  # only cost it back on any re-train at a different d_dict, k or seed.
+  # INTERPRET_ENV_FILE holds OPENAI_API_KEY. It lives outside OUTPUT_ROOT so the
+  # publish step, which walks OUTPUT_ROOT only, can never upload it to the
+  # bucket. The key never appears in this manifest, in git, or in the process
+  # arguments -- interpret.py reads the file itself.
+  #
+  # To validate the plumbing without spending anything, add INTERPRET_DRY_RUN=1:
+  # it builds every prompt and calls nothing, and needs no key.
+  #
+  # Previous run (layers 6+8), kept for resubmission:
+  #   RUN_CAUSAL=1 RUN_PHASE_8=0 LAYERS_OVERRIDE="6 8"
+  #   TRAIN_NO_RAM_CACHE=1 DATASET_DIR=/app/fm_mount/dataset
+  #   MODEL_PATH=instanovo-v1.1.0
+  #   OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs_l68 bash ./run_pipeline.sh
+  # -------------------------------------------------------------------------
   command: >
-    RUN_CAUSAL=1 RUN_PHASE_8=0 LAYERS_OVERRIDE="6 8"
-    TRAIN_NO_RAM_CACHE=1 DATASET_DIR=/app/fm_mount/dataset
+    RUN_INTERPRET=1 SKIP_TRAIN=1 LAYERS_OVERRIDE="2 4"
+    INTERPRET_ENV_FILE=/app/fm_mount/secrets/openai.env
+    DATASET_DIR=/app/fm_mount/dataset
     MODEL_PATH=instanovo-v1.1.0
-    OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs_l68 bash ./run_pipeline.sh
+    OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs bash ./run_pipeline.sh
   tensorboard:
     enabled: false
   storage:
@@ -63,9 +64,8 @@ spec:
       # is what OUTPUT_ROOT in `command` above points at. Keep the two in sync.
       #
       # The PVC is the only real filesystem here: AIchor does not mount its
-      # buckets, so this is where the ~415 GB of activations must land. Bucket
-      # storage is reached separately, over S3 -- see the publish step at the end
-      # of run_pipeline.sh.
+      # buckets. Bucket storage is reached separately, over S3 -- see the publish
+      # step at the end of run_pipeline.sh.
       - name: "dtu-denovo-s-2e6da747d6d34f62-mass-spec-fo-3010d211a1d447cf"
         mountPoint: "app/fm_mount"
   debug:
@@ -74,25 +74,17 @@ spec:
   types:
     worker:
       count: 1
-      # Sized to be schedulable, not generous. A 24-core/96 GB pod sat
-      # Unschedulable with the scheduler reporting 103 nodes short on memory and
-      # 15 short on CPU, on top of the 295 with no free GPU -- so the ask was
-      # excluding nodes the job would never have used.
+      # No accelerator. Nothing in this job needs one: the single SAE encode over
+      # the surviving chunks is a few minutes on CPU, and everything after it is
+      # API latency. Asking for a GPU would put the job behind the same queue
+      # that has held the layers 6+8 run unscheduled for hours, to leave the card
+      # idle. DEVICE is left unset so run_pipeline.sh resolves it to cpu.
       #
-      # Nothing here scales with cores except annotation, which defaults to
-      # os.cpu_count() and is a one-off pass. Extraction uses NUM_WORKERS=4
-      # dataloader workers; training and evaluation are GPU-bound.
-      #
-      # 12 x 4 = 48 GB. Training streams rather than caching the layer (the
-      # float32 cache would need ~207 GB and RAM_CACHE_SAFETY puts the bar near
-      # 346 GB, unreachable at any figure worth requesting), and the streaming
-      # peak is ~20-30 GB: ~332 MB per chunk plus cross-layer's ~4.9 GB token
-      # sample per layer.
+      # 4 x 4 = 16 GB. The peak is one chunk's dense [n_tokens, d_dict] feature
+      # matrix, 108,005 x 12,288 in float32 = 5.3 GB, freed each iteration. The
+      # retained feature columns and chunk metadata add well under 1 GB. Sized to
+      # schedule quickly rather than generously -- a 24-core/96 GB ask sat
+      # Unschedulable on this cluster.
       resources:
-        cpus: 12
+        cpus: 4
         ramRatio: 4
-        accelerators:
-          gpu:
-            count: 1
-            type: gpu
-            product: NVIDIA-H100-80GB-HBM3

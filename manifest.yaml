@@ -5,16 +5,17 @@ builder:
   dockerfile: ./Dockerfile.aichor
   context: .
   buildArgs:
-    # Left at true even though this job never touches a GPU: a CUDA build of
-    # torch runs fine on a CPU node (cuda.is_available() simply returns False),
-    # and flipping it would rebuild the image from a different dependency set for
-    # no gain.
+    # Required: extraction, training and evaluation all run on the GPU. Leave it
+    # true even for the CPU-only jobs this manifest sometimes carries -- a CUDA
+    # build of torch runs fine on a CPU node, where cuda.is_available() simply
+    # returns False, and flipping it rebuilds the image from a different
+    # dependency set for no gain.
     USE_CUDA: "true"
 spec:
   operator: pytorch
   image: instanovo-sae
   # -------------------------------------------------------------------------
-  # Layer 6 alone, into its own output root.
+  # Layer 8 alone, into its own output root. Layer 6 is the sibling job.
   #
   # One layer per job rather than the 6+8 pair. The pair sat Unschedulable for
   # ten hours waiting on a full H100, while colleagues' jobs held the cards. A
@@ -38,11 +39,11 @@ spec:
   # the merged parquet so Step 0 skips rather than re-merging 639k spectra.
   #
   # Other commands this manifest has carried, kept for resubmission:
-  #   layer 8, after layer 6 lands:
-  #     RUN_CAUSAL=1 RUN_PHASE_8=0 LAYERS_OVERRIDE="8" TRAIN_NO_RAM_CACHE=1
+  #   layer 6 (submitted as b1e4527f, scheduled on MIG in ~20 min):
+  #     RUN_CAUSAL=1 RUN_PHASE_8=0 LAYERS_OVERRIDE="6" TRAIN_NO_RAM_CACHE=1
   #     KEEP_CHUNKS=1 DATASET_DIR=/app/fm_mount/dataset
   #     MODEL_PATH=instanovo-v1.1.0
-  #     OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs_l8 bash ./run_pipeline.sh
+  #     OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs_l6 bash ./run_pipeline.sh
   #   interpretation on the cluster (needs a key file on the PVC; add
   #   INTERPRET_DRY_RUN=1 to build prompts without calling anything):
   #     RUN_INTERPRET=1 SKIP_TRAIN=1 LAYERS_OVERRIDE="2 4"
@@ -57,11 +58,11 @@ spec:
   #     OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs bash ./run_pipeline.sh
   # -------------------------------------------------------------------------
   command: >
-    RUN_CAUSAL=1 RUN_PHASE_8=0 LAYERS_OVERRIDE="6"
+    RUN_CAUSAL=1 RUN_PHASE_8=0 LAYERS_OVERRIDE="8"
     TRAIN_NO_RAM_CACHE=1 KEEP_CHUNKS=1
     DATASET_DIR=/app/fm_mount/dataset
     MODEL_PATH=instanovo-v1.1.0
-    OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs_l6 bash ./run_pipeline.sh
+    OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs_l8 bash ./run_pipeline.sh
   tensorboard:
     enabled: false
   storage:

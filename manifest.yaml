@@ -36,11 +36,24 @@ spec:
   # Invoked through `bash` rather than as ./run_pipeline.sh: the Dockerfile now
   # restores the executable bit, but going through the interpreter does not
   # depend on it at all, and losing it cost a full queue slot once already.
+  #
+  # Second half of the layer sweep. It writes to its OWN output root because
+  # extract.py rewrites extract/manifest.json with only the layers it was asked
+  # for, with no merge -- so pointing this at the layers 2+4 root while that run
+  # is still evaluating would strip layer 4 from the manifest and break it
+  # mid-flight. Separate roots share nothing mutable, so the two can run at once.
+  #
+  # DATASET_DIR is shared deliberately: the merged parquet is read-only once
+  # written, so this run reuses it instead of re-downloading 639k spectra.
+  #
+  # KEEP_CHUNKS is left at its default of 1. The PVC reported 1989 GB free, and
+  # discarding a forward pass over the full benchmark to reclaim ~208 GB would
+  # only cost it back on any re-train at a different d_dict, k or seed.
   command: >
-    RUN_CAUSAL=1 RUN_PHASE_8=0 LAYERS_OVERRIDE="2 4" KEEP_CHUNKS=0
+    RUN_CAUSAL=1 RUN_PHASE_8=0 LAYERS_OVERRIDE="6 8"
     TRAIN_NO_RAM_CACHE=1 DATASET_DIR=/app/fm_mount/dataset
     MODEL_PATH=instanovo-v1.1.0
-    OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs bash ./run_pipeline.sh
+    OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs_l68 bash ./run_pipeline.sh
   tensorboard:
     enabled: false
   storage:

@@ -28,40 +28,25 @@ spec:
   # earlier step finds its output present and skips, so it is the publish step
   # and nothing else.
   #
-  # Interpretation pass over run 1 (layers 2 and 4), for when it runs here
-  # instead. INTERPRET_ENV_FILE points at a key file placed on the PVC:
+  # SKIP_TRAIN=1 is load-bearing even here. Without it a checkpoint that failed
+  # to resolve would start a multi-hour training run instead of failing.
+  #
+  # MODEL_PATH must be the pretrained id. The default is ./instanovo_v1.1.0.ckpt,
+  # which the path-form check rejects as missing before any step runs, even
+  # though nothing here loads the model. DATASET_DIR points at the merged parquet
+  # so Step 0 skips rather than re-merging 639k spectra.
+  #
+  # KEEP_CHUNKS is deliberately NOT set to 0: doing so again would delete the
+  # 2-per-layer remainder that is the whole point of this job.
+  #
+  # To run interpretation on the cluster instead, place a key file on the PVC
+  # and use:
   #   RUN_INTERPRET=1 SKIP_TRAIN=1 LAYERS_OVERRIDE="2 4"
   #   INTERPRET_ENV_FILE=/app/fm_mount/secrets/openai.env
   #   DATASET_DIR=/app/fm_mount/dataset
   #   MODEL_PATH=instanovo-v1.1.0
   #   OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs bash ./run_pipeline.sh
-  #
-  # Every earlier step is idempotent, so this is the whole pipeline pointed at an
-  # output root that already has its artefacts: steps 0-5 find their outputs and
-  # skip, leaving Step 6 and the bucket publish. No bypass flag is involved.
-  #
-  # SKIP_TRAIN=1 is load-bearing. Without it a checkpoint that failed to resolve
-  # would start a multi-hour training run instead of failing immediately.
-  #
-  # MODEL_PATH must be the pretrained id. The default is ./instanovo_v1.1.0.ckpt,
-  # which the path-form check rejects as missing before any step runs, even
-  # though nothing here loads the model.
-  #
-  # DATASET_DIR points at the merged parquet so Step 0 skips rather than
-  # re-downloading and re-merging 639k spectra.
-  #
-  # KEEP_CHUNKS is deliberately NOT set to 0. Run 1 already pruned its chunks to
-  # a 2-per-layer sample, and interpret.py detects what survives and confines
-  # sampling to it; setting 0 again would delete the remainder and leave nothing
-  # to interpret from.
-  #
-  # INTERPRET_ENV_FILE holds OPENAI_API_KEY. It lives outside OUTPUT_ROOT so the
-  # publish step, which walks OUTPUT_ROOT only, can never upload it to the
-  # bucket. The key never appears in this manifest, in git, or in the process
-  # arguments -- interpret.py reads the file itself.
-  #
-  # To validate the plumbing without spending anything, add INTERPRET_DRY_RUN=1:
-  # it builds every prompt and calls nothing, and needs no key.
+  # Adding INTERPRET_DRY_RUN=1 builds every prompt, calls nothing, needs no key.
   #
   # Previous run (layers 6+8), kept for resubmission:
   #   RUN_CAUSAL=1 RUN_PHASE_8=0 LAYERS_OVERRIDE="6 8"
@@ -99,10 +84,10 @@ spec:
       # that has held the layers 6+8 run unscheduled for hours, to leave the card
       # idle. DEVICE is left unset so run_pipeline.sh resolves it to cpu.
       #
-      # 4 x 4 = 16 GB. The peak is one chunk's dense [n_tokens, d_dict] feature
-      # matrix, 108,005 x 12,288 in float32 = 5.3 GB, freed each iteration. The
-      # retained feature columns and chunk metadata add well under 1 GB. Sized to
-      # schedule quickly rather than generously -- a 24-core/96 GB ask sat
+      # 2 x 4 = 8 GB, ample for an upload: this job runs no model and holds no
+      # activations in memory. An interpretation run on this manifest wants more --
+      # one chunk's dense [n_tokens, d_dict] float32 matrix is 5.3 GB -- so raise
+      # cpus to 4 for 16 GB there. Sized to schedule fast: a 24-core/96 GB ask sat
       # Unschedulable on this cluster.
       resources:
         cpus: 2

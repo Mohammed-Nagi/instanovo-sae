@@ -98,7 +98,13 @@ METADATA_COLUMNS = (
 )
 
 # Tolerance for comparing a loader-reported precursor m/z against the dataset's.
+# The absolute floor covers small values; the relative term covers float32
+# rounding, whose spacing grows with magnitude and exceeds the floor above
+# m/z ~350. float32 has ~1.2e-7 relative precision, so 1e-6 leaves an order of
+# magnitude of headroom while staying far below the separation between two
+# genuinely different spectra.
 MZ_MATCH_TOLERANCE = 1e-5
+MZ_MATCH_REL_TOLERANCE = 1e-6
 
 # Config fields a resumed run must match, because each changes chunk CONTENT:
 # mixing them yields a silently inconsistent dataset (a different n_peaks gives
@@ -572,7 +578,17 @@ def _cross_check_row(
         loader_value = observed[key][local_idx]
 
         if key == "precursor_mz":
-            matches = abs(float(loader_value) - float(dataset_value)) <= MZ_MATCH_TOLERANCE
+            # The loader yields float32 while the dataset column is float64, so
+            # the two differ by float32 rounding even when they are the same
+            # number: 508.7639 arrives as 508.76388549, a gap of 1.45e-5 that a
+            # flat 1e-5 tolerance rejects. float32 spacing also grows with
+            # magnitude (~3e-5 at m/z 500, ~1.2e-4 at m/z 2000), so the bound
+            # has to scale rather than sit at a fixed value below the noise.
+            # Two genuinely different spectra differ by far more than this, so
+            # the guard still catches the misalignment it exists for.
+            tol = max(MZ_MATCH_TOLERANCE,
+                      abs(float(dataset_value)) * MZ_MATCH_REL_TOLERANCE)
+            matches = abs(float(loader_value) - float(dataset_value)) <= tol
         elif key == "precursor_charge":
             matches = int(loader_value) == int(dataset_value)
         else:

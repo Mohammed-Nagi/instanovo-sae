@@ -15,24 +15,33 @@ spec:
   operator: pytorch
   image: instanovo-sae
   # -------------------------------------------------------------------------
-  # Layer 8 alone, into its own output root. Layer 6 is the sibling job.
+  # Re-extract layers 2 and 4 into run 1's root, restoring the activations that
+  # run's KEEP_CHUNKS=0 pruned away at the end.
   #
-  # One layer per job rather than the 6+8 pair. The pair sat Unschedulable for
-  # ten hours waiting on a full H100, while colleagues' jobs held the cards. A
-  # single-layer job is ~3.6 h and ~104 GB instead of ~7 h and ~208 GB, so it
-  # fits gaps the pair cannot, and a layer that finishes is worth more than a
-  # pair that never starts. Duplicated extraction and annotation cost ~30 min.
+  # Why: only 2 of 625 chunks survived, so interpretation on these layers draws
+  # its examples from 0.3% of the corpus -- and from its beginning, which is not
+  # a random slice, since the merged parquet is unshuffled and mean peptide
+  # length drifts from ~14.7 residues at the head to ~21.8 at the tail. Layers 6
+  # and 8 keep all their chunks, so without this the same table would mix two
+  # sampling regimes.
   #
-  # The cost is cross-layer matching between 6 and 8: cross_layer_matching reads
-  # every layer from ONE extract dir, so layers in separate roots cannot be
-  # compared. Accepted deliberately. Note the 6+8 pair could not have matched
-  # against 2+4 either, for the same reason. run_pipeline.sh drops the
-  # cross_layer phase on its own when a run has fewer than two layers.
+  # Feature SELECTION is already unbiased: unexplained_mass_fraction and
+  # max_f1_dom come from Phase 4, which ran over all 625 chunks during run 1's
+  # evaluation, before the cleanup. Only the examples shown to the model are
+  # affected, and therefore the descriptions and their r.
   #
-  # KEEP_CHUNKS=1, explicitly. Run 1 finished with KEEP_CHUNKS=0 and pruned 625
-  # chunks to 2 per layer, which is why interpretation on layers 2 and 4 samples
-  # 0.3% of the corpus and only from its beginning. Keeping this layer's chunks
-  # (~104 GB against 1989 GB free) lets its interpretation span the whole run.
+  # Nothing is recomputed but the activations. Chunks 0-1 hold meta plus both
+  # layers' activations and are skipped; 2-624 hold meta but no activations, so
+  # _is_chunk_done reports them unfinished and they are re-extracted. Annotation
+  # skips entirely -- KEEP_ANNOTATION never prunes, so all 625 label chunks are
+  # intact. Evaluation skips on the existing report.json. About 35 minutes.
+  #
+  # SKIP_TRAIN=1 is load-bearing: the checkpoints exist, and without it a
+  # checkpoint that failed to resolve would start a multi-hour training run.
+  #
+  # Do not vary n_peaks, chunk_size, dtype, dataset or model. extract_config.json
+  # records them and refuses a resume that disagrees, which is what stops
+  # incompatible chunks being mixed into one manifest.
   #
   # MODEL_PATH must be the pretrained id: the default ./instanovo_v1.1.0.ckpt is
   # rejected by the path-form check before any step runs. DATASET_DIR points at
@@ -58,11 +67,10 @@ spec:
   #     OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs bash ./run_pipeline.sh
   # -------------------------------------------------------------------------
   command: >
-    RUN_CAUSAL=1 RUN_PHASE_8=0 LAYERS_OVERRIDE="8"
-    TRAIN_NO_RAM_CACHE=1 KEEP_CHUNKS=1
+    LAYERS_OVERRIDE="2 4" SKIP_TRAIN=1 KEEP_CHUNKS=1
     DATASET_DIR=/app/fm_mount/dataset
     MODEL_PATH=instanovo-v1.1.0
-    OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs_l8 bash ./run_pipeline.sh
+    OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs bash ./run_pipeline.sh
   tensorboard:
     enabled: false
   storage:
@@ -86,15 +94,15 @@ spec:
       # types, the full card and this 3g.40gb partition, so both are available;
       # the full card is what everything else competes for.
       #
-      # 40 GB is roughly five times what the job peaks at. The SAE is 18.9M
-      # parameters (~300 MB with gradients and Adam state), training holds a few
-      # [8192, 12288] float32 tensors at ~400 MB each, evaluation half that, and
-      # InstaNovo's forward pass is 1-2 GB: under 8 GB all told. That estimate is
-      # analytical -- run 1 logged no GPU memory -- but the margin is wide.
+      # 40 GB is ample: layers 6 and 8 both trained here at full batch without an
+      # OOM, which is the memory peak. The SAE is 18.9M parameters (~300 MB with
+      # gradients and Adam state) and training holds a few [8192, 12288] float32
+      # tensors at ~400 MB each, so the job runs well under 8 GB.
       #
-      # The trade is compute: 3 of 7 slices, so expect roughly 2-2.5x the wall
-      # time of a full card. A job that starts slowly still beats one that never
-      # schedules.
+      # Measured throughput against a full card: ~64% in training (7.7 vs 12.0
+      # steps/s, steady state) and ~60% in extraction. An earlier 45% figure came
+      # from the first 1000 steps, which include threshold calibration and warmup
+      # -- do not size a schedule from those.
       #
       # 12 x 4 = 48 GB host RAM, as run 1 used successfully. TRAIN_NO_RAM_CACHE=1
       # streams chunks rather than caching the layer, peaking near 20-30 GB.

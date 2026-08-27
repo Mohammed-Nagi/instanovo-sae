@@ -1,65 +1,63 @@
 #!/usr/bin/env bash
 # =============================================================================
-# run_pipeline.sh -- SAE pipeline for layers {2, 4, 6, 8} of InstaNovo
+# run_pipeline.sh -- SAE interpretability pipeline for InstaNovo's encoder
 # =============================================================================
 #
-# Four-script pipeline:
-#   1. extract.py   -- one multi-layer forward pass over all spectra; writes
-#                      per-layer activation files + ChunkMeta.
-#                      REUSABLE: chunks are kept by default so future experiments
-#                      (new SAE widths, seeds, layers) skip this expensive step.
-#   2. annotate.py  -- one annotation pass; concept labels are layer-independent
-#                      and dataset-fixed. REUSABLE: labels are always kept.
-#   3. train.py     -- one run per (layer, seed); reads only its own layer's
-#                      activation files from the extract dir.
-#   4. evaluate.py  -- one run per (layer, seed); eight evaluation phases,
-#                      including causal ablation (Phases 7/8) when the InstaNovo
-#                      model is available.
+# Seven steps, each idempotent: every step skips when its own output is already
+# present, so the run is safe to kill and restart at any point.
 #
-# Flow:
-#   prepare dataset (merge all HF splits into one parquet)
-#     -> extract all layers in a single forward pass     [reusable, kept]
-#     -> annotate spectra (layer-independent labels)     [reusable, kept]
-#     -> for each layer: train SAE, unless SKIP_TRAIN=1 and checkpoints exist
-#     -> for each layer: evaluate SAE
-#          (cross-layer matching runs on the deepest/anchor layer)
-#     -> cross-layer summary table
+#   0  prepare       merge every split of the HF dataset into one parquet
+#   1  extract.py    one multi-layer forward pass -> per-layer activation chunks
+#                    plus layer-independent metadata. Kept by default and reused
+#                    by every later experiment (new width, seed or layer)
+#   2  annotate.py   concept labels from fragment-ion theory. Reads metadata
+#                    only, never activations, so it is layer-independent and is
+#                    always kept
+#   3  train.py      one SAE per (layer, seed), reading only its own layer
+#   4  evaluate.py   eight phases per (layer, seed). Phases 7 and 8 need the
+#                    InstaNovo model and are gated separately
+#   5  cleanup       chunk retention, per KEEP_CHUNKS / KEEP_CHUNK_SAMPLE
+#   6  interpret.py  LLM feature descriptions. Off by default: the only step
+#                    that calls a paid external API
 #
-# Resume: every step skips if its sentinel output already exists.
-#         Safe to kill and re-run at any point.
+# A cross-layer summary table prints after step 5, and the run ends by publishing
+# the small durable artefacts to the AIchor output bucket when one is configured.
 #
 # -----------------------------------------------------------------------------
 # WHERE THE TIME GOES, and the knobs that move it
 # -----------------------------------------------------------------------------
-#   Phase 8 (causal ablation) dominates everything else when enabled. Cost is
-#   n_concepts x (1 group + N_RANDOM_CONTROLS + ABLATION_PER_FEATURE_TOP) model
-#   passes over ABLATION_SPECTRA spectra, per layer. At the defaults that is
-#   50 x 106 = 5,300 passes over 5,000 spectra = 26.5M spectrum-forwards per
-#   layer. ABLATION_PER_FEATURE_TOP is 94% of that; halving it halves Phase 8.
-#   This is why RUN_PHASE_8 defaults to 0.
+#   Extraction is the largest one-off cost, ~104 GB and several hours per layer
+#   on the nine-species benchmark, but it runs once and is then cached.
+#
+#   Phase 8 (causal ablation) dominates everything else when enabled, which is
+#   why RUN_PHASE_8 defaults to 0. Per concept it costs 1 group ablation + 5
+#   random controls + ABLATION_PER_FEATURE_TOP single-feature ablations, each a
+#   model pass over ABLATION_SPECTRA spectra. At the defaults that is
+#   50 x 26 = 1,300 passes over 5,000 spectra per layer, of which the
+#   per-feature term is roughly three quarters.
 #
 #   SAE training I/O is the next lever. TRAIN_NO_RAM_CACHE=1 re-reads the whole
-#   layer from disk every epoch (3x); =0 loads it once and shuffles in RAM. The
-#   script now sizes this automatically against free memory -- see below.
-#
-#   Extraction is the largest one-off cost but runs once and is cached.
+#   layer from disk every epoch; =0 loads it once and shuffles in RAM. Left
+#   unset, choose_ram_cache sizes the decision against free memory.
 #
 # Usage
-#   MODEL_PATH=/path/to/instanovo.ckpt ./run_pipeline.sh
-#   SMOKE_TEST=1 MODEL_PATH=... ./run_pipeline.sh          # fast end-to-end test
-#   LAYERS_OVERRIDE="8" MODEL_PATH=... ./run_pipeline.sh   # single layer
-#   OUTPUT_ROOT=/mnt/ssd/sae MODEL_PATH=... ./run_pipeline.sh
-#   DATASET_PATH=/data/combined.parquet MODEL_PATH=... ./run_pipeline.sh  # skip merge
-#   KEEP_CHUNKS=0 MODEL_PATH=... ./run_pipeline.sh         # free disk after run
-#   SKIP_TRAIN=1 MODEL_PATH=... ./run_pipeline.sh          # evaluate existing checkpoints
-#   RUN_PHASE_8=1 ABLATION_PER_FEATURE_TOP=20 MODEL_PATH=... ./run_pipeline.sh
-#       # causal ablation at ~4x lower cost than the default per-feature depth
-#   PHASE8_RESUME=1 SKIP_TRAIN=1 MODEL_PATH=... ./run_pipeline.sh
-#       # reuse existing Phase 4 CSV/report cache and run only Phase 8
+#   MODEL_PATH=instanovo-v1.1.0 ./run_pipeline.sh                  # full run
+#   SMOKE_TEST=1 MODEL_PATH=... ./run_pipeline.sh                  # fast end-to-end check
+#   LAYERS_OVERRIDE="8" MODEL_PATH=... ./run_pipeline.sh           # one layer
+#   OUTPUT_ROOT=/mnt/ssd/sae MODEL_PATH=... ./run_pipeline.sh      # artefacts elsewhere
+#   DATASET_PATH=/data/combined.parquet MODEL_PATH=... ./run_pipeline.sh   # skip the merge
+#   SKIP_TRAIN=1 MODEL_PATH=... ./run_pipeline.sh                  # evaluate existing checkpoints
+#   KEEP_CHUNKS=0 MODEL_PATH=... ./run_pipeline.sh                 # free disk after the run
+#   RUN_PHASE_8=1 MODEL_PATH=... ./run_pipeline.sh                 # add causal ablation
+#   PHASE8_RESUME=1 SKIP_TRAIN=1 MODEL_PATH=... ./run_pipeline.sh  # only Phase 8, from cache
+#   RUN_INTERPRET=1 SKIP_TRAIN=1 MODEL_PATH=... ./run_pipeline.sh  # only Step 6, needs a key
 #
-# Layers are independent: train/eval for different layers can run concurrently
-# on separate GPUs by launching this script with LAYERS_OVERRIDE="<layer>" and
-# a distinct DEVICE in separate shells, once extract + annotate have completed.
+# MODEL_PATH is either a local .ckpt path or a pretrained id such as
+# instanovo-v1.1.0, which InstaNovo resolves and caches on first use.
+#
+# Layers are independent once extract and annotate are done, so several
+# invocations can run concurrently with LAYERS_OVERRIDE="<layer>" and distinct
+# DEVICE values. They coordinate RAM-cache sizing through OUTPUT_ROOT.
 # =============================================================================
 
 set -euo pipefail
@@ -87,9 +85,9 @@ else
 fi
 PYTHON="${PYTHON:-python}"
 SEED="${SEED:-0}"
-# Whether DEVICE came from the environment or from the default below. An explicit
-# request is treated as strict (see the resolution block before the header); the
-# default is free to follow the hardware.
+# Whether DEVICE came from the environment or from the default below. An
+# explicit request is strict, the default follows the hardware -- see "Device
+# resolution" further down.
 DEVICE_EXPLICIT=0
 [[ -n "${DEVICE:-}" ]] && DEVICE_EXPLICIT=1
 DEVICE="${DEVICE:-cuda}"
@@ -170,10 +168,10 @@ RAM_CACHE_SAFETY="${RAM_CACHE_SAFETY:-0.6}"
 # Evaluation
 FDR_Q="${FDR_Q:-0.05}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-4096}"
-# Phases 7 (loss recovered) and 8 (causal ablation) require InstaNovo forward
-# passes. RUN_CAUSAL is the legacy switch for model-dependent evaluation:
-# RUN_CAUSAL=0 disables both. By default, full runs keep Phase 7 enabled and
-# skip Phase 8 because causal ablation is much more expensive.
+# Phases 7 (loss recovered) and 8 (causal ablation) both need InstaNovo forward
+# passes, but are gated separately because Phase 8 costs orders of magnitude
+# more. RUN_CAUSAL is the older combined switch and now only supplies Phase 7's
+# default; Phase 8 is off unless RUN_PHASE_8=1, whatever RUN_CAUSAL says.
 RUN_CAUSAL="${RUN_CAUSAL:-1}"
 RUN_PHASE_7_EXPLICIT="${RUN_PHASE_7:-}"   # see CHUNK_SIZE_EXPLICIT above
 RUN_PHASE_7="${RUN_PHASE_7:-$RUN_CAUSAL}"
@@ -183,22 +181,21 @@ FORCE_EVAL="${FORCE_EVAL:-$PHASE8_RESUME}"   # 1 = ignore existing report.json s
 EVAL_SKIP_PHASES="${EVAL_SKIP_PHASES:-}"     # optional explicit evaluate.py --skip list
 ABLATION_SPECTRA="${ABLATION_SPECTRA:-5000}"
 ABLATION_TOP_N="${ABLATION_TOP_N:-10}"
-# Single-feature ablations per concept. This is the dominant Phase 8 cost: each
-# one is a full model pass over ABLATION_SPECTRA spectra, so the per-concept cost
-# is 1 group + N_RANDOM_CONTROLS + this. At 20 that is 26 passes per concept
-# rather than the 106 the old default of 100 implied -- a ~4x saving on the
-# phase, for coarser per-feature resolution. The group-level causal metrics
-# (selectivity, selectivity_z) are unaffected: they come from the group ablation.
+# Single-feature ablations per concept, and the dominant Phase 8 cost: each is a
+# full model pass over ABLATION_SPECTRA spectra, so a concept costs 1 group + 5
+# random controls + this, or 26 passes at the default. Lowering it trades
+# per-feature resolution for runtime and nothing else -- the group-level causal
+# metrics (selectivity, selectivity_z) come from the group ablation.
 ABLATION_PER_FEATURE_TOP="${ABLATION_PER_FEATURE_TOP:-20}"
 CROSS_LAYER_TOKENS="${CROSS_LAYER_TOKENS:-100000}"
 
 # -----------------------------------------------------------------------------
-# Interpretation (Step 6) -- off by default: it is the only step that calls a
-# paid external API, so it never runs unless asked for.
+# Interpretation (Step 6)
+# Off by default: the only step that calls a paid external API.
 #
-# It needs no GPU. The one SAE encode over INTERPRET_SAMPLE_CHUNKS chunks is a
-# few minutes on CPU, and the rest is API latency. Run it on a CPU pod rather
-# than queueing behind an accelerator.
+# It needs no GPU. The single SAE encode over INTERPRET_SAMPLE_CHUNKS chunks is
+# a few minutes on CPU and the rest is API latency, so run it on a CPU pod
+# rather than queueing behind an accelerator.
 #
 # The key is read from a file, never from the environment of this script and
 # never from the manifest, so it stays out of git and out of `ps`. Point
@@ -603,15 +600,12 @@ fi
 # Step 1: Extract activations -- single forward pass, all target layers
 # -----------------------------------------------------------------------------
 #
-# This is the most expensive step. The result is stored permanently (KEEP_CHUNKS=1
-# by default) so it can be reused across all future SAE experiments:
-#   - different d_dict / k / seed values (re-run only train + evaluate)
-#   - additional layers (re-run extract; per-chunk resume fills the new layer)
-#   - evaluation-only reruns (extract + annotate are already done)
+# Chunks are kept by default so later experiments skip this step entirely: a new
+# d_dict, k or seed re-runs only train and evaluate, and an added layer re-runs
+# extraction with per-chunk resume filling in just that layer.
 #
-# Per-chunk resume is handled internally: if the manifest exists and individual
-# chunk files are intact, only missing chunks are re-extracted. Running this step
-# again after a crash is safe and efficient.
+# Resume is per chunk and internal to extract.py: an intact chunk file is left
+# alone and only missing ones are rebuilt, so re-running after a crash is cheap.
 
 EXTRACT_ARGS=(
     --model-path   "$MODEL_PATH"
@@ -629,15 +623,12 @@ if [[ "$MAX_SPECTRA" != "0" ]]; then
     EXTRACT_ARGS+=(--max-spectra "$MAX_SPECTRA")
 fi
 
-# Manifest/chunk disagreement. Before the resume-counting fix, extract.py's
-# __iter__ did not yield chunks it skipped on resume, so extract_all counted only
-# the NEW ones -- and _write_manifest lists chunks as range(n_chunks). A run that
-# skipped chunks 0-9 and wrote 10-19 therefore recorded n_chunks=10 describing
-# chunks 0-9 while carrying chunk 10-19's token count. Such a manifest is
-# structurally valid and passes every schema check, so it is caught here by
-# comparing it against what is actually on disk. The repair is cheap: delete
-# manifest.json and re-run: per-chunk resume reuses every existing chunk and only
-# the manifest is rebuilt (no re-extraction).
+# Manifest/chunk disagreement. A resumed run written before the chunk-counting
+# fix could record n_chunks describing one set of chunks while carrying another
+# set's token count. Such a manifest is structurally valid and passes every
+# schema check, so the only way to catch it is to count what is on disk. The
+# repair is cheap: delete manifest.json and re-run, which rebuilds it from the
+# existing chunks without re-extracting anything.
 if [[ -f "$EXTRACT_DIR/manifest.json" && -d "$EXTRACT_DIR/chunks" ]]; then
     on_disk="$(find "$EXTRACT_DIR/chunks" -maxdepth 1 -name 'meta_*.pt' | wc -l | tr -d ' ')"
     listed="$("$PYTHON" -c "
@@ -759,13 +750,9 @@ fi
 # Step 2: Annotate spectra -- single pass, layer-independent concept labels
 # -----------------------------------------------------------------------------
 #
-# Reads only ChunkMeta files (not activation tensors) -- much cheaper than
-# extraction. Labels are fixed once the dataset and concept vocabulary are fixed,
-# so they are always kept and reused across all layer/seed/SAE-width experiments.
-#
-# Fragment tolerance: 20 ppm for Orbitrap-class high-resolution data. A 0.5 Da
-# window is far too wide at Orbitrap resolution and would match spurious peaks
-# as b/y ions, corrupting the cleavage-site labels.
+# Reads ChunkMeta files only, never activation tensors, so it is far cheaper
+# than extraction. Labels are fixed once the dataset and concept vocabulary are,
+# so they are always kept and reused across every layer, seed and SAE width.
 
 # The existence check alone is not enough: annotate.py's own schema check only
 # runs once annotate.py is invoked, and skipping the step means it never is. A
@@ -813,8 +800,6 @@ else
     run_step "Annotate spectra (ion_types=$ION_TYPES, tol=${FRAGMENT_TOL} ${FRAGMENT_TOL_MODE})" \
         "$OUTPUT_ROOT/annotate.log" \
         "$PYTHON" "$ANNOTATE_PY" "${ANNOTATE_ARGS[@]}"
-    # Internal fragments (ion type 'm') are enabled by default in annotate.py.
-    # Add --no-internal above if you want to disable them.
 fi
 
 # -----------------------------------------------------------------------------
@@ -872,10 +857,11 @@ done
 # Step 4: Evaluate SAE -- one per layer
 # -----------------------------------------------------------------------------
 #
-# All eight phases run by default (Phases 7/8 require the InstaNovo model and
-# are gated on RUN_PHASE_7 / RUN_PHASE_8). Cross-layer matching runs on the
-# deepest requested anchor layer against all other layers -- it needs all SAE
-# checkpoints to exist, which they do at this point in the script.
+# Phases 1-6 always run. Phase 7 follows RUN_PHASE_7 (on by default) and Phase 8
+# RUN_PHASE_8 (off), since both need the InstaNovo model and Phase 8 is the
+# expensive one. Cross-layer matching runs only on the deepest requested layer,
+# against the others, and needs every SAE checkpoint to exist -- which they do by
+# this point in the script.
 #
 # evaluate.py appends layer_{L}/seed_{S}/eval/ to --output-dir automatically,
 # so --output-dir must be SAE_ROOT (not a separate eval directory).

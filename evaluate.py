@@ -379,6 +379,7 @@ class ChunkStream:
         batch_size: int,
         dtype: torch.dtype,
         chunk_indices: list[int] | None = None,
+        feature_subset: list[int] | None = None,
     ):
         self.extract_dir = extract_dir
         self.annotation_dir = annotation_dir
@@ -392,6 +393,13 @@ class ChunkStream:
         # explicit list; the ids stay the true chunk ids, so provenance recorded
         # against them (Phase 3's top-K) still resolves.
         self._chunk_indices = chunk_indices
+        # Which feature columns to keep. None means the whole dictionary, which is
+        # what every phase here wants. JoinedChunk.features is then [n_tokens,
+        # len(feature_subset)] with columns in the order given, NOT indexed by
+        # feature id -- the caller asked for that order and gets it.
+        self._feature_subset = (
+            None if feature_subset is None else torch.as_tensor(feature_subset, dtype=torch.long)
+        )
 
         extract_manifest = json.loads((extract_dir / "manifest.json").read_text())
         annotation_manifest = json.loads((annotation_dir / "annotation_manifest.json").read_text())
@@ -463,16 +471,27 @@ class ChunkStream:
         Writes into a pre-allocated output rather than list-then-cat, which would
         briefly hold both copies -- and a chunk's [n_tokens, d_dict] feature
         matrix is already several GB.
+
+        With feature_subset the output holds only those columns, in the order
+        given. A caller interested in a handful of features otherwise pays for the
+        whole dictionary: at 101,746 tokens and d_dict = 12,288 that is 5.0 GB per
+        chunk in float32, which is enough to be OOM-killed on a 16 GB machine,
+        against 32 MB for 80 columns. The slice happens per batch, so the full
+        width never exists outside one batch.
         """
         n_tokens = activations.size(0)
-        out = torch.empty((n_tokens, self.sae.d_dict), dtype=self.dtype)
+        width = self.sae.d_dict if self._feature_subset is None else self._feature_subset.numel()
+        out = torch.empty((n_tokens, width), dtype=self.dtype)
         for start in range(0, n_tokens, self.batch_size):
             end = min(start + self.batch_size, n_tokens)
             x = activations[start:end].to(self.device, dtype=self.dtype, non_blocking=True)
             with torch.inference_mode():
                 batch_out = self.sae.forward_inference(x)
-            out[start:end] = batch_out["features"].detach().to(self.dtype).cpu()
-            del x, batch_out
+            feats = batch_out["features"].detach()
+            if self._feature_subset is not None:
+                feats = feats[:, self._feature_subset.to(feats.device)]
+            out[start:end] = feats.to(self.dtype).cpu()
+            del x, batch_out, feats
         return out
 
     def __iter__(self) -> Iterator[JoinedChunk]:

@@ -507,12 +507,16 @@ def _collect_activations(
     The chunk records hold the per-token and per-spectrum metadata needed to turn
     a token index back into a readable example.
 
-    MEMORY. ChunkStream materialises one chunk's dense [n_tokens, d_dict] feature
-    matrix at a time, about 5 GB at d_dict = 12,288, freed as the loop advances.
-    Only the selected columns persist: n_chunks * n_tokens * len(feature_ids) * 4
-    bytes, roughly 600 MB for 12 chunks and 120 features. That transient 5 GB is
-    the binding constraint on a small machine, and --n-sample-chunks does not
-    shrink it; it is set by the chunk size chosen at extraction.
+    MEMORY. The stream is built with feature_subset=feature_ids, so it encodes
+    straight into the selected columns and the full [n_tokens, d_dict] matrix
+    never exists outside one batch. Peak is
+    n_chunks * n_tokens * len(feature_ids) * 4 bytes, about 400 MB for 12 chunks
+    and 80 features. Without the subset it would be ~5 GB per chunk at
+    d_dict = 12,288, enough to be OOM-killed on a 16 GB machine -- which is what
+    happened before that argument existed.
+
+    chunk.features therefore arrives already narrowed, with columns in
+    feature_ids order rather than indexed by feature id.
     """
     feature_index = {fi: i for i, fi in enumerate(feature_ids)}
     columns: list[np.ndarray] = []
@@ -520,7 +524,12 @@ def _collect_activations(
     offset = 0
 
     for chunk in stream:
-        feats = chunk.features[:, feature_ids].to(torch.float32).numpy()
+        feats = chunk.features.to(torch.float32).numpy()
+        if feats.shape[1] != len(feature_ids):
+            raise RuntimeError(
+                f"stream yielded {feats.shape[1]} feature columns, expected "
+                f"{len(feature_ids)}; build ChunkStream with feature_subset=feature_ids"
+            )
         columns.append(feats)
         records.append({
             "chunk_idx": chunk.chunk_idx,
@@ -1383,13 +1392,19 @@ def main() -> int:
         )
         return 1
     if len(available) < total_chunks:
+        # Say where the survivors sit, not just how many. A KEEP_CHUNKS=0 prune
+        # leaves the first few, clustered at the head of an unshuffled corpus; a
+        # deliberately published sample is spread across it. Those two cases carry
+        # very different weight, and only the span distinguishes them.
+        span = (available[-1] - available[0] + 1) / total_chunks if len(available) > 1 else 0.0
         LOG.warning(
-            "Only %d of %d chunks still hold layer-%d activations (KEEP_CHUNKS=0 "
-            "prunes to a cross-layer sample). Sampling is confined to those, so the "
-            "examples come from %.1f%% of the corpus and from its beginning rather "
-            "than spread across it.",
+            "Only %d of %d chunks hold layer-%d activations, so sampling is confined "
+            "to them: %.1f%% of the corpus, spanning chunks %d to %d (%.0f%% of its "
+            "length). Chunks are in dataset order and the dataset is not shuffled, so "
+            "a narrow span means a narrow slice of the data, not a random one.",
             len(available), total_chunks, config.target_layer,
             100 * len(available) / total_chunks,
+            available[0], available[-1], 100 * span,
         )
     picks = spread_chunk_indices(len(available), config.n_sample_chunks)
     chosen = [available[i] for i in picks]
@@ -1407,6 +1422,9 @@ def main() -> int:
         batch_size=config.batch_size,
         dtype=torch.float32,
         chunk_indices=chosen,
+        # Encode straight into the columns we need. The full dictionary is 5 GB
+        # per chunk and we keep 80 columns of it.
+        feature_subset=todo,
     )
     activations, records = _collect_activations(stream, todo, len(chosen))
 

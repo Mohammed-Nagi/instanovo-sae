@@ -15,59 +15,29 @@ spec:
   operator: pytorch
   image: instanovo-sae
   # -------------------------------------------------------------------------
-  # Re-extract layers 2 and 4 into run 1's root, restoring the activations that
-  # run's KEEP_CHUNKS=0 pruned away at the end.
+  # Publish the 12 chunks interpret.py will read, so interpretation can run off
+  # the cluster and the OpenAI key never has to be written to shared storage.
   #
-  # Why: only 2 of 625 chunks survived, so interpretation on these layers draws
-  # its examples from 0.3% of the corpus -- and from its beginning, which is not
-  # a random slice, since the merged parquet is unshuffled and mean peptide
-  # length drifts from ~14.7 residues at the head to ~21.8 at the tail. Layers 6
-  # and 8 keep all their chunks, so without this the same table would mix two
-  # sampling regimes.
+  # PUBLISH_CHUNK_IDS names them explicitly. All four layers now hold all 625
+  # chunks, which is ~219 GB per root once activations are included, and
+  # PUBLISH_MAX_GB refuses that. interpret.py's spread is deterministic
+  # (spread_chunk_indices(625, 12)), so the ids are known before the job runs and
+  # only what will actually be opened gets uploaded: ~4.2 GB for run 1's root,
+  # ~2.2 GB for each single-layer root.
   #
-  # Feature SELECTION is already unbiased: unexplained_mass_fraction and
-  # max_f1_dom come from Phase 4, which ran over all 625 chunks during run 1's
-  # evaluation, before the cleanup. Only the examples shown to the model are
-  # affected, and therefore the descriptions and their r.
+  # Run once per output root, changing OUTPUT_ROOT and nothing else:
+  #   /app/fm_mount/sae_pipeline_outputs       layers 2+4, LAYERS_OVERRIDE="2 4"
+  #   /app/fm_mount/sae_pipeline_outputs_l6    layer 6,    LAYERS_OVERRIDE="6"
+  #   /app/fm_mount/sae_pipeline_outputs_l8    layer 8,    LAYERS_OVERRIDE="8"
   #
-  # Nothing is recomputed but the activations. Chunks 0-1 hold meta plus both
-  # layers' activations and are skipped; 2-624 hold meta but no activations, so
-  # _is_chunk_done reports them unfinished and they are re-extracted. Annotation
-  # skips entirely -- KEEP_ANNOTATION never prunes, so all 625 label chunks are
-  # intact. Evaluation skips on the existing report.json. About 35 minutes.
-  #
-  # SKIP_TRAIN=1 is load-bearing: the checkpoints exist, and without it a
-  # checkpoint that failed to resolve would start a multi-hour training run.
-  #
-  # Do not vary n_peaks, chunk_size, dtype, dataset or model. extract_config.json
-  # records them and refuses a resume that disagrees, which is what stops
-  # incompatible chunks being mixed into one manifest.
-  #
-  # MODEL_PATH must be the pretrained id: the default ./instanovo_v1.1.0.ckpt is
-  # rejected by the path-form check before any step runs. DATASET_DIR points at
-  # the merged parquet so Step 0 skips rather than re-merging 639k spectra.
-  #
-  # Other commands this manifest has carried, kept for resubmission:
-  #   layer 6 (submitted as b1e4527f, scheduled on MIG in ~20 min):
-  #     RUN_CAUSAL=1 RUN_PHASE_8=0 LAYERS_OVERRIDE="6" TRAIN_NO_RAM_CACHE=1
-  #     KEEP_CHUNKS=1 DATASET_DIR=/app/fm_mount/dataset
-  #     MODEL_PATH=instanovo-v1.1.0
-  #     OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs_l6 bash ./run_pipeline.sh
-  #   interpretation on the cluster (needs a key file on the PVC; add
-  #   INTERPRET_DRY_RUN=1 to build prompts without calling anything):
-  #     RUN_INTERPRET=1 SKIP_TRAIN=1 LAYERS_OVERRIDE="2 4"
-  #     INTERPRET_ENV_FILE=/app/fm_mount/secrets/openai.env
-  #     DATASET_DIR=/app/fm_mount/dataset MODEL_PATH=instanovo-v1.1.0
-  #     OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs bash ./run_pipeline.sh
-  #   republish a pruned run's surviving chunks (PUBLISH_CHUNKS restricts itself
-  #   to chunks that still hold activations; PUBLISH_MAX_GB refuses oversized
-  #   selections before uploading):
-  #     PUBLISH_CHUNKS=1 SKIP_TRAIN=1 LAYERS_OVERRIDE="2 4"
-  #     DATASET_DIR=/app/fm_mount/dataset MODEL_PATH=instanovo-v1.1.0
-  #     OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs bash ./run_pipeline.sh
+  # No GPU: every pipeline step finds its output present and skips, leaving the
+  # upload. SKIP_TRAIN=1 guards against a checkpoint that fails to resolve
+  # starting a multi-hour training run instead of failing.
   # -------------------------------------------------------------------------
   command: >
-    LAYERS_OVERRIDE="2 4" SKIP_TRAIN=1 KEEP_CHUNKS=1
+    PUBLISH_CHUNKS=1
+    PUBLISH_CHUNK_IDS="0,52,104,156,208,260,312,364,416,468,520,572"
+    SKIP_TRAIN=1 KEEP_CHUNKS=1 LAYERS_OVERRIDE="2 4"
     DATASET_DIR=/app/fm_mount/dataset
     MODEL_PATH=instanovo-v1.1.0
     OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs bash ./run_pipeline.sh
@@ -90,27 +60,10 @@ spec:
   types:
     worker:
       count: 1
-      # A MIG slice, not a whole H100. This project has billed two accelerator
-      # types, the full card and this 3g.40gb partition, so both are available;
-      # the full card is what everything else competes for.
-      #
-      # 40 GB is ample: layers 6 and 8 both trained here at full batch without an
-      # OOM, which is the memory peak. The SAE is 18.9M parameters (~300 MB with
-      # gradients and Adam state) and training holds a few [8192, 12288] float32
-      # tensors at ~400 MB each, so the job runs well under 8 GB.
-      #
-      # Measured throughput against a full card: ~64% in training (7.7 vs 12.0
-      # steps/s, steady state) and ~60% in extraction. An earlier 45% figure came
-      # from the first 1000 steps, which include threshold calibration and warmup
-      # -- do not size a schedule from those.
-      #
-      # 12 x 4 = 48 GB host RAM, as run 1 used successfully. TRAIN_NO_RAM_CACHE=1
-      # streams chunks rather than caching the layer, peaking near 20-30 GB.
+      # No accelerator and a small ask, so this schedules immediately rather
+      # than queueing. The job runs no model and holds no activations in memory;
+      # it stats files and streams them to S3. DEVICE is left unset, so
+      # run_pipeline.sh resolves it to cpu.
       resources:
-        cpus: 12
+        cpus: 2
         ramRatio: 4
-        accelerators:
-          gpu:
-            count: 1
-            type: gpu
-            product: NVIDIA-H100-80GB-HBM3-MIG-3g.40gb

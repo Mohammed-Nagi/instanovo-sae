@@ -1574,8 +1574,27 @@ if os.environ.get("PUBLISH_CHUNKS") == "1":
         for p in (root / "extract" / "chunks").glob("acts_L*_*.pt")
         if (m := re.search(r"_(\d+)\.pt$", p.name))
     })
-    print(f"PUBLISH_CHUNKS=1: {len(live)} chunk(s) still hold activations: "
-          f"{', '.join(live) if len(live) <= 12 else ', '.join(live[:12]) + ', ...'}")
+    # PUBLISH_CHUNK_IDS narrows that to specific chunks. A full run holds 625,
+    # which is ~219 GB once activations are included and PUBLISH_MAX_GB rightly
+    # refuses it. An analysis that reads a spread sample needs only the chunks it
+    # will actually open, and interpret.py's spread is deterministic, so those
+    # ids are known before the job starts. Accepts commas or spaces, bare or
+    # zero-padded.
+    wanted = os.environ.get("PUBLISH_CHUNK_IDS", "").replace(",", " ").split()
+    if wanted:
+        keep = {f"{int(w):05d}" for w in wanted}
+        missing = sorted(keep - set(live))
+        live = [i for i in live if i in keep]
+        if missing:
+            print(f"WARNING: PUBLISH_CHUNK_IDS names {len(missing)} chunk(s) with no "
+                  f"activations on disk: {', '.join(missing[:8])}"
+                  f"{', ...' if len(missing) > 8 else ''}", file=sys.stderr)
+        if not live:
+            print("ERROR: PUBLISH_CHUNK_IDS matched no chunk that holds activations.",
+                  file=sys.stderr)
+            raise SystemExit(1)
+    shown = ', '.join(live) if len(live) <= 12 else ', '.join(live[:12]) + ', ...'
+    print(f"PUBLISH_CHUNKS=1: publishing {len(live)} chunk(s): {shown}")
     for i in live:
         INCLUDE += [
             f"extract/chunks/acts_L*_{i}.pt",

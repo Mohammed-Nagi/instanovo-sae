@@ -36,6 +36,16 @@ Phase numbers are the stable identifiers used across the codebase, so
 `phase_1_2` is reconstruction and sparsity, `phase_7` is task preservation, and
 so on; see the paper's evaluation section for the full list.
 
-`phase_8` (causal ablation) is absent where a run was launched with
-`RUN_PHASE_8=0`. It is expensive enough to be run as a separate pass over the
-cached Phase 4 output.
+`phase_8` (causal ablation) is absent from all four: every run so far set
+`RUN_PHASE_8=0`, since its cost is `n_concepts x (1 + controls +
+ABLATION_PER_FEATURE_TOP)` model passes per layer. It is run as a separate pass
+over the cached Phase 4 output.
+
+`cross_layer` is present only in `layer_4.json`, which matched against layer 2
+within run 1. Layers 6 and 8 were each run alone, and `cross_layer_matching`
+reads every layer from a single extract directory, so layers in separate output
+roots cannot be compared.
+
+Layers 2 and 4 come from one run of the pair; layers 6 and 8 from separate
+single-layer runs on an H100 MIG partition. Reconstruction fidelity declines
+monotonically with depth across all four, as the paper reports.

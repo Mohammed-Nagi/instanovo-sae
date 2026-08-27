@@ -39,10 +39,10 @@ spec:
   # -------------------------------------------------------------------------
   command: >
     PHASE8_RESUME=1 SKIP_TRAIN=1 ABLATION_PER_FEATURE_TOP=5
-    LAYERS_OVERRIDE="2" KEEP_CHUNKS=1
+    LAYERS_OVERRIDE="8" KEEP_CHUNKS=1
     DATASET_DIR=/app/fm_mount/dataset
     MODEL_PATH=instanovo-v1.1.0
-    OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs bash ./run_pipeline.sh
+    OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs_l8 bash ./run_pipeline.sh
   tensorboard:
     enabled: false
   storage:
@@ -54,7 +54,9 @@ spec:
       # The PVC is the only real filesystem here: AIchor does not mount its
       # buckets. Bucket storage is reached separately, over S3 -- see the publish
       # step at the end of run_pipeline.sh.
-      - name: "dtu-denovo-s-2e6da747d6d34f62-mass-spec-fo-3010d211a1d447cf"
+      # Redacted for anonymous review: the real name identifies the cluster and
+      # therefore the institution. Substitute your own PVC name to run this.
+      - name: "<PVC-NAME>"
         mountPoint: "app/fm_mount"
   debug:
     vscode:

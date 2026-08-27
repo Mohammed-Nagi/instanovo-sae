@@ -61,11 +61,11 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
-import torch
 
-# Fragment-ion annotation engine; its object layout is read only in
-# _annotation_to_dict (see module docstring).
+# spectrum_utils is the fragment-ion annotation engine; its object layout is
+# read only in _annotation_to_dict (see module docstring).
 import spectrum_utils.spectrum as sus
+import torch
 
 from schema import ANNOTATION_SCHEMA_VERSION, EXTRACT_SCHEMA_VERSION
 
@@ -74,7 +74,9 @@ from schema import ANNOTATION_SCHEMA_VERSION, EXTRACT_SCHEMA_VERSION
 # (see _mod_unimod_id).
 try:
     from instanovo.constants import LEGACY_PTM_TO_UNIMOD
-except Exception:
+except Exception:  # noqa: BLE001
+    # Broad on purpose: any failure to reach the table, not just ImportError,
+    # must leave this module importable on the mass-matching fallback.
     LEGACY_PTM_TO_UNIMOD: dict[str, str] = {}
 
 LOG = logging.getLogger("annotate")
@@ -304,7 +306,7 @@ class IonGeometry:
     only and can never localise a PTM.
     """
 
-    __slots__ = ("ion_type", "ion_index", "peptide_length", "internal_end", "residue")
+    __slots__ = ("internal_end", "ion_index", "ion_type", "peptide_length", "residue")
 
     def __init__(
         self,
@@ -461,7 +463,7 @@ def exact_mass_proforma(proforma: str) -> str:
     matching a tracked PTM by mass is rewritten to its exact monoisotopic mass
     instead. UNIMOD tags and unrecognised deltas are left untouched.
     """
-    def repl(m: "re.Match") -> str:
+    def repl(m: re.Match) -> str:
         body = m.group(1)
         if "UNIMOD" in body.upper():
             return m.group(0)
@@ -603,8 +605,9 @@ def run_spectrum_utils(
             max_isotope=0,                               # monoisotopic fragments only
             neutral_losses=NEUTRAL_LOSSES,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         # Bad ProForma or unsupported residue: all-noise keeps the run going.
+        # spectrum_utils raises several unrelated types here, so this stays broad.
         LOG.warning("spectrum_utils annotation failed for %r: %s", proforma, exc)
         return [dict(_NOISE) for _ in range(len(mz_np))]
 
@@ -638,7 +641,7 @@ def compute_spectrum_concepts(
 
     # Spectrum-level PTM diagnostics: does any modification map to each tracked PTM.
     present = {_mod_to_ptm_name(m, peptide) for m in modifications}
-    for _unimod, (ptm_name, _mass) in TRACKED_PTMS.items():
+    for ptm_name, _mass in TRACKED_PTMS.values():
         out[f"spectrum_contains_{ptm_name}"] = ptm_name in present
 
     return out
@@ -1241,13 +1244,11 @@ class AnnotationRunner:
                 ): chunk_idx
                 for chunk_idx in chunk_indices
             }
-            completed = 0
-            for future in as_completed(futures):
+            for completed, future in enumerate(as_completed(futures), start=1):
                 chunk_idx = futures[future]
                 got_idx, n_tokens, cooccur, marginal = future.result()
                 assert got_idx == chunk_idx, f"chunk index desync: expected {chunk_idx}, got {got_idx}"
                 accumulator.add_partial(n_tokens, cooccur, marginal)
-                completed += 1
                 LOG.info(
                     "  Annotated chunk %d (%d/%d) | n_tokens=%d | elapsed=%.1fs",
                     chunk_idx, completed, n_total, n_tokens, time.time() - t0,

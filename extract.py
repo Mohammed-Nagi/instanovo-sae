@@ -47,8 +47,8 @@ import os
 import re
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 import torch
 from torch.utils.hooks import RemovableHandle
@@ -287,7 +287,7 @@ class MultiLayerCapture:
         self._captured: dict[int, torch.Tensor] = {}
         self._handles: list[RemovableHandle] = []
 
-    def __enter__(self) -> MultiLayerCapture:
+    def __enter__(self) -> MultiLayerCapture:  # noqa: PYI034 -- Self is 3.11+
         for layer_idx in self.target_layers:
             layer_module = self.model.encoder.layers[layer_idx]
             self._handles.append(

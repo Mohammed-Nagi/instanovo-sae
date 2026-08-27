@@ -63,8 +63,8 @@ import os
 import sys
 import time
 from collections import defaultdict
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 import numpy as np
 import torch
@@ -74,8 +74,8 @@ from scipy.stats import chi2 as scipy_chi2
 sys.path.insert(0, str(Path(__file__).parent))
 from schema import (
     ANNOTATION_SCHEMA_VERSION,  # annotate.py label chunks
-    EVAL_SCHEMA_VERSION,        # this module's report.json + CSVs
-    EXTRACT_SCHEMA_VERSION,     # extract.py manifest/layout
+    EVAL_SCHEMA_VERSION,  # this module's report.json + CSVs
+    EXTRACT_SCHEMA_VERSION,  # extract.py manifest/layout
 )
 from train import SparseAutoencoder, load_sae_from_checkpoint
 
@@ -810,7 +810,9 @@ def _effective_rank(W_dec: torch.Tensor) -> float:
         normalized = sv / sv.sum().clamp_min(1e-12)
         entropy = -(normalized * (normalized + 1e-12).log()).sum()
         return float(entropy.exp().item())
-    except Exception:
+    except Exception:  # noqa: BLE001
+        # Any failure to decompose is reported as nan rather than raised: this
+        # is a descriptive statistic, not a result the run depends on.
         return float("nan")
 
 
@@ -2136,8 +2138,8 @@ def _selectivity(delta_ce: torch.Tensor, prevalence_col: torch.Tensor) -> float:
 
 def _zscore(value: float, distribution: list[float]) -> float:
     """Standardise a value against a control distribution (NaNs dropped)."""
-    vals = [v for v in distribution if v == v]
-    if value != value or len(vals) < 2:
+    vals = [v for v in distribution if not math.isnan(v)]
+    if math.isnan(value) or len(vals) < 2:
         return float("nan")
     mu, sd = float(np.mean(vals)), float(np.std(vals, ddof=1))
     return (value - mu) / sd if sd > 1e-12 else float("nan")
@@ -2191,7 +2193,7 @@ def _causal_report(
     ctrl_means = [float(d.mean().item()) for d in control_deltas if d.numel()]
     # _selectivity truncates to the shared length itself.
     ctrl_sels = [_selectivity(d, prev_col) for d in control_deltas]
-    ctrl_sels_valid = [s for s in ctrl_sels if s == s]
+    ctrl_sels_valid = [s for s in ctrl_sels if not math.isnan(s)]
     return {
         "mean_delta_ce": target_mean,
         "selectivity": sel,
@@ -3066,7 +3068,7 @@ class Evaluator:
 
         if phase_4_full is not None:
             self._write_per_feature_csv(phase_4_full)
-        if "phase_8" in report and report["phase_8"]:
+        if report.get("phase_8"):
             self._write_causal_csv(report)
         if "cross_layer" in report:
             self._write_cross_layer_csv(report)

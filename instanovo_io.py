@@ -27,10 +27,14 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-# Repo-facing imports — these are the module paths.
+# isort: off
+# The InstaNovo boundary. These are the only upstream symbols this repo imports,
+# here and nowhere else; the trailing comments give the source location upstream.
+# Kept grouped and unsorted on purpose, so the boundary stays legible.
 from instanovo.transformer.model import InstaNovo            # transformer/model.py:44
 from instanovo.transformer.data import TransformerDataProcessor  # transformer/data.py:21
 from instanovo.utils.data_handler import SpectrumDataFrame   # utils/data_handler.py:50
+# isort: on
 
 # Canonical legacy-PTM -> UNIMOD remapping (e.g. "M(+15.99)" -> "M[UNIMOD:35]").
 # The nine-species benchmark writes mods in (+mass) notation that the bare
@@ -38,7 +42,9 @@ from instanovo.utils.data_handler import SpectrumDataFrame   # utils/data_handle
 # Guarded because the constant's location could shift across versions.
 try:
     from instanovo.constants import LEGACY_PTM_TO_UNIMOD
-except Exception:  # pragma: no cover
+except Exception:  # pragma: no cover  # noqa: BLE001
+    # Broad on purpose: the constant's location may shift across versions, and
+    # any failure to reach it must still leave this module importable.
     LEGACY_PTM_TO_UNIMOD: dict[str, str] = {}
 
 LOG = logging.getLogger("instanovo_io")
@@ -90,8 +96,10 @@ def _apply_residue_remapping(model: InstaNovo, config: Any) -> None:
         cfg_remap = config.get("residue_remapping", None) if hasattr(config, "get") else None
         if cfg_remap:
             remapping.update(dict(cfg_remap))
-    except Exception:  # pragma: no cover - config shape varies across versions
-        pass
+    except Exception as exc:  # pragma: no cover  # noqa: BLE001
+        # Config shape varies across versions; the built-in table is a usable
+        # fallback, so log the reason rather than failing the load.
+        LOG.debug("Could not read residue_remapping from config: %s", exc)
 
     if remapping:
         model.residue_set.update_remapping(remapping)

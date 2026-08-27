@@ -64,6 +64,7 @@ import csv
 import dataclasses
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -223,7 +224,7 @@ def _selectivity_rank(value: float) -> float:
     Every comparison against NaN is False, so comparing raw values would let a
     NaN entry win by arriving first and never be replaced by a real measurement.
     """
-    return abs(value) if value == value else -float("inf")
+    return abs(value) if not math.isnan(value) else -float("inf")
 
 
 def _read_causal_features(eval_dir: Path) -> dict[int, dict]:

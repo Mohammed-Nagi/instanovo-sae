@@ -46,13 +46,13 @@ import os
 import random
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from schema import EXTRACT_SCHEMA_VERSION, SAE_SCHEMA_VERSION
 
@@ -593,7 +593,7 @@ def _split_chunks(manifest: dict, val_fraction: float, seed: int) -> tuple[list[
             "(e.g. MAX_SPECTRA / SMOKE_TEST sizing) so extraction produces more "
             "than one chunk."
         )
-    n_val_chunks = max(1, int(round(val_fraction * n_chunks)))
+    n_val_chunks = max(1, round(val_fraction * n_chunks))
     rng = random.Random(seed)
     all_chunk_indices = list(range(n_chunks))
     rng.shuffle(all_chunk_indices)
@@ -766,7 +766,9 @@ def train_one_sae(config: TrainingConfig) -> dict:
     log_path = out_dir / "training_log.jsonl"
     if log_path.exists():
         log_path.unlink()  # restart fresh -- checkpoints carry their own resume info
-    log_file = open(log_path, "a", buffering=1)
+    # Not a context manager: the handle is passed into the training loop below
+    # and closed in this function's finally block.
+    log_file = open(log_path, "a", buffering=1)  # noqa: SIM115
 
     _seed_everything(config.seed)
 

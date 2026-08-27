@@ -16,8 +16,7 @@ env/
 *.pth
 
 # ---------------------------------------------------------------------------
-# Pipeline artefacts -- NEVER commit these.
-# Extraction alone is ~67.5M tokens x 768 dims x 4 layers.
+# Pipeline artefacts
 # Directory names match run_pipeline.sh: $OUTPUT_ROOT/{extract,annotation,sae}
 # ---------------------------------------------------------------------------
 outputs/
@@ -58,11 +57,7 @@ docs/
 CLAUDE.md
 .claude/
 
-# Reference checkouts kept locally for comparison. Not ours to redistribute,
-# and nothing in this repo depends on them.
-InstaNovo-internal-*/
-
-# Local log of submitted AIchor experiment ids -- run-specific bookkeeping.
+# Local log of submitted AIchor experiment ids.
 experiment_ids.txt
 
 # Run artefacts pulled back from the AIchor output bucket. Hundreds of MB of

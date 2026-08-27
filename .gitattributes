@@ -1,11 +1,17 @@
-# Normalise line endings. run_pipeline.sh MUST be LF: a CRLF shebang makes
-# bash fail with "$'\r': command not found". This replaces the sed workaround
-# at gcp_run.ps1:478.
-* text=auto
+# Normalise line endings to LF everywhere. Every tracked file is consumed on
+# Linux (the AIchor image, the K8s manifest, the shell entrypoint), and none of
+# them needs CRLF, so there is nothing here to exempt.
+#
+# run_pipeline.sh is the file that actually breaks: a CRLF shebang makes bash
+# fail with "$'\r': command not found".
+#
+# eol=lf covers the working tree as well as the repository, which matters
+# because "aichor submit local" zips the working tree rather than git, so a
+# checked-out CRLF file rides straight into the image. Dockerfile.aichor strips
+# CRLF anyway as a second line of defence; keep that line.
+#
+# Setting eol does not rewrite files that are already checked out. After
+# changing this file, run "git checkout -- ." to bring the working tree into
+# line with it.
 
-*.sh   text eol=lf
-*.py   text eol=lf
-*.toml text eol=lf
-*.md   text eol=lf
-
-*.ps1  text eol=crlf
+* text=auto eol=lf

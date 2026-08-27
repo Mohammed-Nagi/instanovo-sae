@@ -15,31 +15,44 @@ spec:
   operator: pytorch
   image: instanovo-sae
   # -------------------------------------------------------------------------
-  # Phase 8 (causal ablation) for layer 2, the only phase not yet run on real data.
+  # The job that produced the reported runs. One encoder layer per job, two
+  # passes per layer.
+  #
+  # Pass 1, the command below: extraction, annotation, SAE training and
+  # evaluation phases 1 to 7. Roughly 20 h per layer on the partition requested
+  # below, most of it extraction.
+  #
+  # Pass 2, causal ablation, is the same command with Phase 8 turned on and
+  # everything else skipped:
+  #
+  #   RUN_PHASE_8=1 PHASE8_RESUME=1 SKIP_TRAIN=1 FORCE_EVAL=1
+  #   ABLATION_PER_FEATURE_TOP=5 LAYERS_OVERRIDE="8" ...
   #
   # PHASE8_RESUME=1 sets EVAL_SKIP_PHASES="1 2 3 4 5 6 7 cross_seed cross_layer",
-  # so this reruns nothing but the ablation, reusing the cached Phase 4 output.
-  # It needs the model and dataset, not the activation chunks.
+  # so it reruns nothing but the ablation, reusing the cached Phase 4 output. It
+  # needs the model and the dataset, not the activation chunks, and takes about
+  # 90 min per layer.
   #
   # ABLATION_PER_FEATURE_TOP=5 rather than the default 20. Cost is
   # n_concepts x (1 group + 5 controls + per_feature_top) passes over
   # ABLATION_SPECTRA spectra: 50 x 26 = 1300 conditions at the default against
-  # 50 x 11 = 550 here, roughly 8 h against 3.4 h per layer on a MIG partition.
+  # 50 x 11 = 550 here. Five is chosen rather than zero because the paper's null
+  # result is a SINGLE-feature ablation of the highest-F1dom immonium detector,
+  # and _select_per_feature_targets ranks by F1dom, so rank 1 is exactly that
+  # feature. At zero only the group result would survive, and the group is
+  # significantly selective, so the contrast the argument rests on would be lost.
   #
-  # Five is chosen, not zero, because the paper's null result is a SINGLE-feature
-  # ablation of the highest-F1dom immonium detector, and _select_per_feature_targets
-  # ranks by F1-dom, so rank 1 is exactly that feature. At zero the group result
-  # would be all that survives, and the group is significantly selective: the
-  # contrast the argument rests on would be lost. Five keeps it with margin.
+  # Both passes run once per layer, changing LAYERS_OVERRIDE and OUTPUT_ROOT:
+  #   layers 2 and 4   /app/fm_mount/sae_pipeline_outputs
+  #   layer 6          /app/fm_mount/sae_pipeline_outputs_l6
+  #   layer 8          /app/fm_mount/sae_pipeline_outputs_l8
   #
-  # Run once per output root, changing OUTPUT_ROOT and LAYERS_OVERRIDE:
-  #   /app/fm_mount/sae_pipeline_outputs      layers 2 and 4
-  #   /app/fm_mount/sae_pipeline_outputs_l6   layer 6
-  #   /app/fm_mount/sae_pipeline_outputs_l8   layer 8
+  # Layers 2 and 4 share a root because they were extracted together, which is
+  # also why they are the only pair cross_layer_matching can compare: it reads
+  # every layer from a single extract directory.
   # -------------------------------------------------------------------------
   command: >
-    PHASE8_RESUME=1 SKIP_TRAIN=1 ABLATION_PER_FEATURE_TOP=5
-    LAYERS_OVERRIDE="8" KEEP_CHUNKS=1
+    LAYERS_OVERRIDE="8" KEEP_CHUNKS=1 TRAIN_NO_RAM_CACHE=1
     DATASET_DIR=/app/fm_mount/dataset
     MODEL_PATH=instanovo-v1.1.0
     OUTPUT_ROOT=/app/fm_mount/sae_pipeline_outputs_l8 bash ./run_pipeline.sh
@@ -64,9 +77,11 @@ spec:
   types:
     worker:
       count: 1
-      # Phase 8 is model passes, so it needs the GPU. The MIG partition is
-      # ample: peak is under 8 GB, the same passes Phase 7 already ran, and both
-      # layer 6 and 8 trained here at full batch without an OOM.
+      # A MIG partition, not a whole card. Nothing here needs 80 GB: the SAE is
+      # 18.9M parameters and the peak is a few [8192, 12288] float32 tensors,
+      # under 8 GB all told. The partition runs training at ~64% of a whole card
+      # and extraction at ~60%, and whole cards are what the queue contends for,
+      # so asking for a slice is the difference between running and waiting.
       resources:
         cpus: 12
         ramRatio: 4

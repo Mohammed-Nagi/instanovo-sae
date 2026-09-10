@@ -13,7 +13,7 @@ pipeline regenerates them from a public model checkpoint and a public benchmark.
 
 ```python
 import json
-r = json.load(open("eval_reports/layer_2.json"))
+r = json.load(open("paper_artifacts/eval_reports/layer_2.json"))
 
 r["phase_1_2"]["fve_overall"]              # centred fraction of variance explained
 r["phase_1_2"]["l0_mean"]                  # mean active features per token

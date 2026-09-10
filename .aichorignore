@@ -5,6 +5,8 @@
 !run_pipeline.sh
 !Dockerfile.aichor
 !manifest.yaml
+!src/
+!src/*.py
 
 .venv/
 __pycache__/

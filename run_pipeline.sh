@@ -105,7 +105,7 @@ DATASET_PATH="${DATASET_PATH:-}"   # set externally to skip the merge step
 
 # -----------------------------------------------------------------------------
 # Model
-MODEL_PATH="${MODEL_PATH:-./instanovo_v1.1.0.ckpt}"
+MODEL_PATH="${MODEL_PATH:-./checkpoints/instanovo_v1.1.0.ckpt}"
 
 # -----------------------------------------------------------------------------
 # Extraction
@@ -275,11 +275,12 @@ fi
 # -----------------------------------------------------------------------------
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EXTRACT_PY="$SCRIPT_DIR/extract.py"
-ANNOTATE_PY="$SCRIPT_DIR/annotate.py"
-TRAIN_PY="$SCRIPT_DIR/train.py"
-EVALUATE_PY="$SCRIPT_DIR/evaluate.py"
-INTERPRET_PY="$SCRIPT_DIR/interpret.py"
+PIPELINE_SRC="$SCRIPT_DIR/src"
+EXTRACT_PY="$PIPELINE_SRC/extract.py"
+ANNOTATE_PY="$PIPELINE_SRC/annotate.py"
+TRAIN_PY="$PIPELINE_SRC/train.py"
+EVALUATE_PY="$PIPELINE_SRC/evaluate.py"
+INTERPRET_PY="$PIPELINE_SRC/interpret.py"
 
 for f in "$EXTRACT_PY" "$ANNOTATE_PY" "$TRAIN_PY" "$EVALUATE_PY"; do
     [[ -f "$f" ]] || { echo "ERROR: Missing pipeline script: $f" >&2; exit 1; }

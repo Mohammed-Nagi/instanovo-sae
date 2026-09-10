@@ -5,3 +5,5 @@
 !*.py
 !run_pipeline.sh
 !manifest.yaml
+!src/
+!src/*.py

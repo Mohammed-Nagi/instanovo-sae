@@ -9,7 +9,7 @@ venv/
 env/
 
 # ---------------------------------------------------------------------------
-# Model checkpoints  (instanovo_v1.1.0.ckpt, SAE checkpoint.pt)
+# Model checkpoints  (checkpoints/instanovo_v1.1.0.ckpt, SAE checkpoint.pt)
 # ---------------------------------------------------------------------------
 *.ckpt
 *.pt

@@ -14,8 +14,8 @@ checkpoint and the public nine-species benchmark.
 
 | Path | Contents |
 |---|---|
-| `eval_reports/layer_{2,4,6,8}.json` | Every evaluation phase per layer, including causal ablation |
-| `feature_descriptions/layer_{2,4,6,8}.csv` | LLM feature descriptions with held-out prediction scores |
+| `paper_artifacts/eval_reports/layer_{2,4,6,8}.json` | Every evaluation phase per layer, including causal ablation |
+| `paper_artifacts/feature_descriptions/layer_{2,4,6,8}.csv` | LLM feature descriptions with held-out prediction scores |
 
 Headline numbers, all from the runs these files record:
 
@@ -36,13 +36,13 @@ Headline numbers, all from the runs these files record:
 | File | Role |
 |---|---|
 | `run_pipeline.sh` | Orchestration: resume, artefact reuse, publishing |
-| `instanovo_io.py` | The single boundary against the InstaNovo API |
-| `extract.py` | Multi-layer activation extraction, one forward pass |
-| `annotate.py` | Per-peak fragment-ion annotation: 50 concepts, 14 families |
-| `train.py` | SAE: BatchTopK training, AuxK recovery, JumpReLU inference |
-| `evaluate.py` | Eight-phase evaluation suite |
-| `interpret.py` | LLM feature description, scored by held-out activation prediction |
-| `schema.py` | On-disk schema versions shared across the pipeline |
+| `src/instanovo_io.py` | The single boundary against the InstaNovo API |
+| `src/extract.py` | Multi-layer activation extraction, one forward pass |
+| `src/annotate.py` | Per-peak fragment-ion annotation: 50 concepts, 14 families |
+| `src/train.py` | SAE: BatchTopK training, AuxK recovery, JumpReLU inference |
+| `src/evaluate.py` | Eight-phase evaluation suite |
+| `src/interpret.py` | LLM feature description, scored by held-out activation prediction |
+| `src/schema.py` | On-disk schema versions shared across the pipeline |
 
 Four sequential stages — extract, annotate, train, evaluate — plus `interpret.py` afterwards.
 Every step is idempotent and skips when its output exists, so the pipeline is safe to interrupt.
@@ -62,7 +62,7 @@ Python 3.10–3.13 (`instanovo` pins `<3.14`).
 ```bash
 uv python install 3.13
 uv sync --extra cu126          # GPU; --extra cpu for CPU-only
-uv run python -c "import instanovo_io, extract, annotate, train, evaluate; print('imports OK')"
+PYTHONPATH=src uv run python -c "import instanovo_io, extract, annotate, train, evaluate; print('imports OK')"
 ```
 
 `MODEL_PATH` takes a local `.ckpt` or a pretrained id that InstaNovo resolves and caches
@@ -125,7 +125,7 @@ produce, since each concept's random draws are keyed on its own index.
 finished evaluation directory and needs `OPENAI_API_KEY`.
 
 ```bash
-python interpret.py \
+python src/interpret.py \
   --eval-dir       $OUTPUT_ROOT/sae/layer_2/seed_0/eval \
   --extract-dir    $OUTPUT_ROOT/extract \
   --annotation-dir $OUTPUT_ROOT/annotation \

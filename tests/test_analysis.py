@@ -13,6 +13,7 @@ import csv
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import analysis
@@ -194,3 +195,82 @@ def test_main_writes_both_csvs(tmp_path):
     with open(tmp_path / "analysis" / "f1dom_selectivity.csv", newline="", encoding="utf-8") as fh:
         corr = list(csv.DictReader(fh))
     assert [int(r["layer"]) for r in corr] == list(analysis.LAYERS)
+
+
+# --- blinded vs unblinded descriptions ----------------------------------------------
+
+
+def _desc_record(feat: int, stratum: str, r: float, auroc: float, shuffled: list[float],
+                 beats: bool | None, holdout_tokens: tuple[int, ...] = (1, 2)) -> dict:
+    return {
+        "feature_idx": feat, "stratum": stratum, "pearson_r": r, "detection_auroc": auroc,
+        "model_served": "gpt-4o-2024-08-06", "description_beats_baseline": beats,
+        "shuffled": {"r_values": shuffled},
+        "holdout_examples": [{"chunk_idx": 0, "token_in_chunk": t} for t in holdout_tokens],
+        "describe_keys": [[0, 100 + feat]],
+    }
+
+
+def _desc_runs():
+    blind = {
+        1: _desc_record(1, "concept", 0.5, 0.8, [0.1, 0.0], True),
+        2: _desc_record(2, "concept", 0.3, 0.7, [0.2, -0.1], False),
+        3: _desc_record(3, "unexplained", 0.6, 0.9, [0.05, float("nan")], True),
+    }
+    plain = {
+        1: _desc_record(1, "concept", 0.7, 0.9, [0.3, 0.2], True),
+        2: _desc_record(2, "concept", 0.6, 0.8, [0.1, 0.4], True),
+        3: _desc_record(3, "unexplained", 0.65, 0.95, [0.0, 0.1], None),
+    }
+    return blind, plain
+
+
+def test_description_blinding_per_stratum_numbers():
+    blind, plain = _desc_runs()
+    rows = {r["stratum"]: r for r in analysis.description_blinding(blind, plain, 2)}
+    assert set(rows) == {"concept", "unexplained", "all"}
+    concept = rows["concept"]
+    assert concept["n_features"] == 2 and concept["n_paired"] == 2
+    assert concept["blind_median_r"] == pytest.approx(0.4)
+    assert concept["unblinded_median_r"] == pytest.approx(0.65)
+    assert concept["median_delta_r"] == pytest.approx(-0.25)   # deltas -0.2, -0.3
+    assert concept["delta_r_ci_low"] <= -0.25 <= concept["delta_r_ci_high"]
+    assert concept["blind_median_auroc"] == pytest.approx(0.75)
+    assert (concept["blind_n_beats"], concept["blind_n_tested"]) == (1, 2)
+    # the null is pooled over the whole layer, NaN dropped: 0.1, 0.0, 0.2, -0.1, 0.05
+    assert concept["blind_null_median"] == pytest.approx(0.05)
+    assert rows["all"]["blind_null_p95"] == pytest.approx(
+        float(np.percentile([0.1, 0.0, 0.2, -0.1, 0.05], 95)))
+    assert (rows["unexplained"]["unblinded_n_beats"], rows["unexplained"]["unblinded_n_tested"]) \
+        == (0, 0)
+    assert rows["all"]["n_features"] == 3
+
+
+def test_description_blinding_is_deterministic():
+    blind, plain = _desc_runs()
+    # json, because NaN != NaN (the one-feature stratum has no CI)
+    assert json.dumps(analysis.description_blinding(blind, plain, 2)) == \
+        json.dumps(analysis.description_blinding(blind, plain, 2))
+
+
+def test_description_blinding_rejects_runs_with_different_examples():
+    blind, plain = _desc_runs()
+    plain[2] = _desc_record(2, "concept", 0.6, 0.8, [0.1], True, holdout_tokens=(1, 3))
+    with pytest.raises(ValueError, match="different describe or held-out"):
+        analysis.description_blinding(blind, plain, 2)
+
+
+def test_description_blinding_rejects_different_feature_sets():
+    blind, plain = _desc_runs()
+    del plain[3]
+    with pytest.raises(ValueError, match="different features"):
+        analysis.description_blinding(blind, plain, 2)
+
+
+def test_load_description_run_checks_the_blind_flag(tmp_path):
+    path = tmp_path / "feature_descriptions.json"
+    blind, _ = _desc_runs()
+    path.write_text(json.dumps({"config": {"blind": True}, "results": list(blind.values())}))
+    assert set(analysis.load_description_run(path, blind=True)) == {1, 2, 3}
+    with pytest.raises(ValueError, match="expected False"):
+        analysis.load_description_run(path, blind=False)

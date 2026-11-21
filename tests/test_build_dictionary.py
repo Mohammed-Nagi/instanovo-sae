@@ -90,7 +90,10 @@ def tree(tmp_path) -> Path:
                       "blinded_v1": [(2, "b2", 0.3)]}.items():
         run = tmp_path / "interpret" / "layer_2" / tag
         run.mkdir(parents=True)
-        _descriptions(rows).to_csv(run / "feature_descriptions.csv", index=False)
+        frame = _descriptions(rows)
+        if tag == "blinded_v1":
+            frame["blind"] = True  # interpret.py writes this column; pre-V1-2 runs lack it
+        frame.to_csv(run / "feature_descriptions.csv", index=False)
     return tmp_path
 
 
@@ -244,6 +247,53 @@ def test_blinded_run_alone(tree):
     d = _build(tree, unblinded_run=None, blinded_run="blinded_v1")
     assert list(d["description_blinded"]) == [False, True, False, False]
     assert d["unblinded_description"].isna().all()
+
+
+def test_blind_run_fills_the_baseline_columns(tree):
+    run = tree / "interpret" / "layer_2" / "blinded_v1" / "feature_descriptions.csv"
+
+    def add(frame):
+        frame["shuffled_null_p95"] = 0.21
+        frame["description_beats_baseline"] = True
+    _rewrite_csv(run, add)
+    d = _build(tree, blinded_run="blinded_v1")
+    assert d.loc[2, "description_shuffled_null_r"] == pytest.approx(0.21)
+    assert d.loc[2, "description_beats_baseline"] == True
+    # feature 0's primary is unblinded: no baseline, never "beats"
+    assert pd.isna(d.loc[0, "description_shuffled_null_r"])
+    assert pd.isna(d.loc[0, "description_beats_baseline"])
+
+
+def test_blind_run_with_undefined_baseline_stays_null(tree):
+    run = tree / "interpret" / "layer_2" / "blinded_v1" / "feature_descriptions.csv"
+
+    def add(frame):
+        frame["shuffled_null_p95"] = float("nan")
+        frame["description_beats_baseline"] = None
+    _rewrite_csv(run, add)
+    d = _build(tree, blinded_run="blinded_v1")
+    assert pd.isna(d.loc[2, "description_shuffled_null_r"])
+    assert pd.isna(d.loc[2, "description_beats_baseline"])
+
+
+def test_unblinded_run_baseline_columns_are_ignored(tree):
+    run = tree / "interpret" / "layer_2" / "unblinded_v1" / "feature_descriptions.csv"
+
+    def add(frame):
+        frame["blind"] = False
+        frame["shuffled_null_p95"] = 0.1
+        frame["description_beats_baseline"] = True
+    _rewrite_csv(run, add)
+    d = _build(tree)
+    assert d["description_beats_baseline"].isna().all()
+    assert d["description_shuffled_null_r"].isna().all()
+
+
+def test_runs_passed_in_the_wrong_role_raise(tree):
+    with pytest.raises(ValueError, match="passed as unblinded"):
+        _build(tree, unblinded_run="blinded_v1")
+    with pytest.raises(ValueError, match="passed as blinded"):
+        _build(tree, unblinded_run=None, blinded_run="unblinded_v1")
 
 
 def test_missing_named_run_raises(tree):

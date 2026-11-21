@@ -403,32 +403,63 @@ class ChunkStream:
 
         extract_manifest = json.loads((extract_dir / "manifest.json").read_text())
         annotation_manifest = json.loads((annotation_dir / "annotation_manifest.json").read_text())
-        self._check_manifests(extract_manifest, annotation_manifest)
+        # A consolidated manifest lists only the chunks kept on disk (a subset of
+        # the annotation's, by chunk id); a full one lists every chunk in order.
+        self.subset_manifest = self._check_manifests(extract_manifest, annotation_manifest)
 
-        self.meta_paths, self.acts_paths = self._resolve_layer_paths(
-            extract_dir, extract_manifest, target_layer,
+        self.meta_paths, self.acts_paths, lacking = self._resolve_layer_paths(
+            extract_dir, extract_manifest, target_layer, by_idx=self.subset_manifest,
         )
-        self.annotation_paths = [annotation_dir / c["path"] for c in annotation_manifest["chunks"]]
-        self.n_chunks = extract_manifest["n_chunks"]
-        if self._chunk_indices is None:
-            self._chunk_indices = list(range(self.n_chunks))
+        if self.subset_manifest:
+            self.annotation_paths = {int(c["idx"]): annotation_dir / c["path"]
+                                     for c in annotation_manifest["chunks"]}
+            available = sorted(self.acts_paths)
+            if self._chunk_indices is None:
+                self._chunk_indices = available
+            else:
+                bad = [c for c in self._chunk_indices if c not in self.acts_paths]
+                if bad:
+                    raise ValueError(
+                        f"chunk_indices not in the consolidated manifest for layer "
+                        f"{target_layer}: {bad[:5]}; listed: {available}"
+                    )
+            self.n_chunks = len(available)
+            if lacking:
+                LOG.info("Consolidated manifest: chunks %s have no layer-%d activations; "
+                         "skipping them", [int(c["idx"]) for c in lacking], target_layer)
         else:
-            bad = [c for c in self._chunk_indices if not 0 <= c < self.n_chunks]
-            if bad:
-                raise ValueError(
-                    f"chunk_indices out of range for a {self.n_chunks}-chunk run: {bad[:5]}"
+            if lacking:
+                raise KeyError(
+                    f"Layer {target_layer} not extracted for chunk {lacking[0]['idx']}; "
+                    f"available: {sorted(int(k) for k in lacking[0]['activations'])}"
                 )
+            self.annotation_paths = [annotation_dir / c["path"]
+                                     for c in annotation_manifest["chunks"]]
+            self.n_chunks = extract_manifest["n_chunks"]
+            if self._chunk_indices is None:
+                self._chunk_indices = list(range(self.n_chunks))
+            else:
+                bad = [c for c in self._chunk_indices if not 0 <= c < self.n_chunks]
+                if bad:
+                    raise ValueError(
+                        f"chunk_indices out of range for a {self.n_chunks}-chunk run: {bad[:5]}"
+                    )
         self.concept_names: list[str] = annotation_manifest["registry"]["names"]
         self.diagnostic_concepts: set[str] = set(annotation_manifest["registry"]["diagnostic"])
         self.family_of: dict[str, str] = annotation_manifest["registry"]["family_of"]
         self.base_rates: dict[str, float] = annotation_manifest["base_rates"]
 
     @staticmethod
-    def _check_manifests(extract_manifest: dict, annotation_manifest: dict) -> None:
-        """Reject manifests that cannot be row-joined.
+    def _check_manifests(extract_manifest: dict, annotation_manifest: dict) -> bool:
+        """Reject manifests that cannot be row-joined. Returns True for a consolidated subset.
 
         Fatal rather than a warning: a schema or chunk-count disagreement would
         pair each token with another token's labels.
+
+        A consolidated extract manifest (fewer chunks than the annotation, every
+        chunk id present in it, n_chunks counting the chunks listed) is joined by
+        chunk id rather than by position. Equal counts are the full layout and
+        are checked exactly as before.
         """
         if extract_manifest["schema_version"] != EXTRACT_SCHEMA_VERSION:
             raise ValueError(
@@ -438,32 +469,46 @@ class ChunkStream:
             raise ValueError(
                 f"Annotation schema {annotation_manifest['schema_version']} != {ANNOTATION_SCHEMA_VERSION}"
             )
-        if extract_manifest["n_chunks"] != annotation_manifest["n_chunks"]:
+        if extract_manifest["n_chunks"] == annotation_manifest["n_chunks"]:
+            return False
+        extract_ids = [int(c["idx"]) for c in extract_manifest["chunks"]]
+        annotation_ids = {int(c["idx"]) for c in annotation_manifest["chunks"]}
+        is_subset = (
+            extract_manifest["n_chunks"] < annotation_manifest["n_chunks"]
+            and extract_manifest["n_chunks"] == len(extract_ids) == len(set(extract_ids))
+            and set(extract_ids) <= annotation_ids
+        )
+        if not is_subset:
             raise ValueError(
                 f"Chunk count mismatch: extract={extract_manifest['n_chunks']}, "
                 f"annotation={annotation_manifest['n_chunks']}"
             )
+        return True
 
     @staticmethod
     def _resolve_layer_paths(
-        extract_dir: Path, extract_manifest: dict, target_layer: int
-    ) -> tuple[list[Path], list[Path]]:
-        """Meta and activation paths for the target layer, one per chunk.
+        extract_dir: Path, extract_manifest: dict, target_layer: int, by_idx: bool = False,
+    ) -> tuple[list[Path] | dict[int, Path], list[Path] | dict[int, Path], list[dict]]:
+        """Meta and activation paths for the target layer, plus the chunks lacking it.
 
         Activations are stored per layer, so only this layer's bytes are read.
+        Full layout: lists indexed by position. Consolidated (by_idx): dicts keyed
+        by chunk id, holding only the chunks that have this layer.
         """
         layer_key = str(target_layer)
-        meta_paths: list[Path] = []
-        acts_paths: list[Path] = []
-        for c in extract_manifest["chunks"]:
-            if layer_key not in c["activations"]:
-                raise KeyError(
-                    f"Layer {target_layer} not extracted for chunk {c['idx']}; "
-                    f"available: {sorted(int(k) for k in c['activations'])}"
-                )
-            meta_paths.append(extract_dir / c["meta"])
-            acts_paths.append(extract_dir / c["activations"][layer_key])
-        return meta_paths, acts_paths
+        lacking = [c for c in extract_manifest["chunks"] if layer_key not in c["activations"]]
+        if by_idx:
+            listed = [c for c in extract_manifest["chunks"] if layer_key in c["activations"]]
+            return (
+                {int(c["idx"]): extract_dir / c["meta"] for c in listed},
+                {int(c["idx"]): extract_dir / c["activations"][layer_key] for c in listed},
+                lacking,
+            )
+        if lacking:
+            return [], [], lacking
+        meta_paths = [extract_dir / c["meta"] for c in extract_manifest["chunks"]]
+        acts_paths = [extract_dir / c["activations"][layer_key] for c in extract_manifest["chunks"]]
+        return meta_paths, acts_paths, []
 
     def _encode_chunk(self, activations: torch.Tensor) -> torch.Tensor:
         """SAE forward pass over one chunk, batched to fit memory.

@@ -43,14 +43,18 @@ What the columns do and do not claim
       feature, and the unblinded one is then kept in the ``unblinded_*`` fields.
       Every unblinded description carries the provenance "written with access to
       annotation labels and the true peptide".
-    * ``description_shuffled_null_r`` and ``description_beats_baseline`` stay null
-      until V1-2 defines the shuffled-description test. ``description_beats_baseline``
-      is never true for an unblinded description.
+    * ``description_shuffled_null_r`` is the threshold the blind run compared r
+      against: the 95th percentile of every shuffled-description r in that layer
+      and run (interpret.py ``shuffled_null_p95``; each feature's own shuffled r
+      values stay in the run's CSV). ``description_beats_baseline`` is r above it.
+      Both are filled only for a blinded primary description from a run that has
+      them, and are null otherwise; ``description_beats_baseline`` is never true
+      for an unblinded description.
 
 Usage (from the repo root)::
 
     PYTHONPATH=src uv run python -m build_dictionary
-    PYTHONPATH=src uv run python -m build_dictionary --layers 2 4 --blinded-run blinded_v1
+    PYTHONPATH=src uv run python -m build_dictionary --blinded-run blind_v1 --unblinded-run unblinded_v2
 
 Output: ``<root>/dictionary/layer_{L}.parquet``. The build is deterministic and
 the write is atomic, so rerunning it is idempotent.
@@ -222,12 +226,21 @@ def description_columns(features: np.ndarray, layer: int, unblinded: pd.DataFram
     cols: dict[str, list] = {name: [] for name in (
         "description", "description_run_tag", "description_stratum", "description_blinded",
         "description_provenance", "description_r", "description_n_predicted",
+        "description_shuffled_null_r", "description_beats_baseline",
         "unblinded_description", "unblinded_description_r", "unblinded_description_run_tag",
         "unblinded_description_provenance")}
 
     def number(row, key):
         value = row[key]
         return None if pd.isna(value) else float(value)
+
+    def flag(row, key):
+        if key not in row.index or pd.isna(row[key]):
+            return None
+        text = str(row[key]).strip().lower()
+        if text not in ("true", "false"):
+            raise ValueError(f"layer {layer}: {key} must be True/False/blank, got {row[key]!r}")
+        return text == "true"
 
     for feat in features:
         feat = int(feat)
@@ -240,6 +253,8 @@ def description_columns(features: np.ndarray, layer: int, unblinded: pd.DataFram
                          "description_provenance", "description_r", "description_n_predicted"):
                 cols[name].append(None)
             cols["description_blinded"].append(False)
+            cols["description_shuffled_null_r"].append(None)
+            cols["description_beats_baseline"].append(None)
         else:
             cols["description"].append(str(primary["summary"]))
             cols["description_run_tag"].append(tag)
@@ -249,6 +264,11 @@ def description_columns(features: np.ndarray, layer: int, unblinded: pd.DataFram
             cols["description_r"].append(number(primary, "pearson_r"))
             n_pred = primary["n_predicted"]
             cols["description_n_predicted"].append(None if pd.isna(n_pred) else int(n_pred))
+            has_baseline = is_blind and "shuffled_null_p95" in primary.index
+            cols["description_shuffled_null_r"].append(
+                number(primary, "shuffled_null_p95") if has_baseline else None)
+            cols["description_beats_baseline"].append(
+                flag(primary, "description_beats_baseline") if has_baseline else None)
         secondary = plain_row if is_blind else None
         cols["unblinded_description"].append(None if secondary is None else str(secondary["summary"]))
         cols["unblinded_description_r"].append(None if secondary is None
@@ -316,6 +336,15 @@ def build_layer(root: Path, layer: int, seed: int = DEFAULT_SEED,
         if unblinded_run else None
     blinded = load_descriptions(description_path(root, layer, blinded_run), live_set, layer) \
         if blinded_run else None
+    # Runs written before V1-2 have no blind column; those are all unblinded.
+    for frame, tag, expected in ((unblinded, unblinded_run, False), (blinded, blinded_run, True)):
+        if frame is None:
+            continue
+        flags = (frame["blind"].astype(str).str.lower() == "true") if "blind" in frame.columns \
+            else pd.Series(False, index=frame.index)
+        if (flags != expected).any():
+            raise ValueError(f"layer {layer}: run {tag!r} is passed as "
+                             f"{'blinded' if expected else 'unblinded'} but its CSV says otherwise")
     desc = description_columns(features, layer, unblinded, unblinded_run, blinded, blinded_run)
 
     n = len(features)
@@ -328,8 +357,6 @@ def build_layer(root: Path, layer: int, seed: int = DEFAULT_SEED,
         "latent_token_fraction": latent,
         "unexplained_mass_fraction": live["unexplained_mass_fraction"],
         **causal, **desc,
-        "description_shuffled_null_r": [None] * n,
-        "description_beats_baseline": [None] * n,
     }
     table = pa.table({field.name: _array(values[field.name], field.type) for field in _SCHEMA},
                      schema=_SCHEMA)

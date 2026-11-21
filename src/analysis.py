@@ -32,13 +32,25 @@ F1dom vs ablation selectivity
     selectivity of that concept's group ablation. Concepts whose selectivity is
     NaN (a tercile split that is empty) are dropped; the count is reported.
 
+Blinded vs unblinded descriptions (``--descriptions BLIND UNBLINDED``)
+    Compares two interpret.py runs that differ only in ``--blind``: same
+    features, same describe and held-out examples (checked, and an error if
+    not). Per layer and stratum (plus "all"): median held-out r and detection
+    AUROC of each run, each run's shuffled-description null (pooled over the
+    layer: 95th percentile and median), the number of features whose r beats
+    that run's threshold, and the paired median difference in r (blind minus
+    unblinded) with a seeded percentile-bootstrap 95% CI over features. Reads
+    ``interpret/layer_{L}/<tag>/feature_descriptions.json``.
+
 Usage (from the repo root)::
 
     PYTHONPATH=src uv run python -m analysis
     PYTHONPATH=src uv run python -m analysis --root sae_pipeline_outputs --layers 2 4
+    PYTHONPATH=src uv run python -m analysis --descriptions blind_v1 unblinded_v2
 
 Outputs under ``<root>/analysis/``: ``hubs.csv`` (a ranked list, no flag) and
-``f1dom_selectivity.csv``.
+``f1dom_selectivity.csv``; with ``--descriptions``, only
+``description_blinding.csv``.
 """
 from __future__ import annotations
 
@@ -49,6 +61,7 @@ import math
 from pathlib import Path
 from statistics import median
 
+import numpy as np
 from scipy.stats import spearmanr
 
 from schema import EVAL_SCHEMA_VERSION
@@ -62,6 +75,15 @@ HUB_COLUMNS = [
     "n_single_concepts", "single_concepts", "n_group_concepts", "group_concepts",
 ]
 CORRELATION_COLUMNS = ["layer", "spearman_rho", "p_value", "n_concepts", "n_dropped_nan"]
+BLINDING_COLUMNS = [
+    "layer", "stratum", "n_features",
+    "blind_median_r", "unblinded_median_r",
+    "blind_median_auroc", "unblinded_median_auroc",
+    "blind_null_p95", "unblinded_null_p95", "blind_null_median", "unblinded_null_median",
+    "blind_n_beats", "blind_n_tested", "unblinded_n_beats", "unblinded_n_tested",
+    "n_paired", "median_delta_r", "delta_r_ci_low", "delta_r_ci_high",
+]
+N_BOOTSTRAP = 10_000
 
 
 def report_path(root: Path, layer: int, seed: int = DEFAULT_SEED) -> Path:
@@ -163,6 +185,92 @@ def f1dom_selectivity_correlation(report: dict, layer: int) -> dict:
     }
 
 
+def description_run_path(root: Path, layer: int, tag: str) -> Path:
+    return root / "interpret" / f"layer_{layer}" / tag / "feature_descriptions.json"
+
+
+def load_description_run(path: Path, blind: bool) -> dict[int, dict]:
+    """feature_idx -> result record of one interpret.py run, checked to be blind (or not) as claimed."""
+    with open(path, encoding="utf-8") as fh:
+        payload = json.load(fh)
+    if bool(payload["config"].get("blind", False)) != blind:
+        raise ValueError(f"{path}: config.blind is {payload['config'].get('blind')}, expected {blind}")
+    results = {int(r["feature_idx"]): r for r in payload["results"]}
+    undescribed = sorted(f for f, r in results.items() if not r.get("model_served"))
+    if undescribed:
+        raise ValueError(f"{path}: features without a description: {undescribed[:5]}")
+    return results
+
+
+def _finite(values) -> list[float]:
+    return [float(v) for v in values if v is not None and not math.isnan(float(v))]
+
+
+def _median_or_nan(values) -> float:
+    finite = _finite(values)
+    return float(np.median(finite)) if finite else float("nan")
+
+
+def _bootstrap_median_ci(values: list[float], seed: int,
+                         n_boot: int = N_BOOTSTRAP) -> tuple[float, float]:
+    """Percentile-bootstrap 95% CI of the median, resampling the values."""
+    if len(values) < 2:
+        return float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    data = np.asarray(values, dtype=np.float64)
+    medians = np.median(data[rng.integers(0, len(data), size=(n_boot, len(data)))], axis=1)
+    low, high = np.percentile(medians, [2.5, 97.5])
+    return float(low), float(high)
+
+
+def _example_keys(record: dict) -> tuple[list, list]:
+    holdout = [(e["chunk_idx"], e["token_in_chunk"]) for e in record["holdout_examples"]]
+    describe = [tuple(k) for k in record["describe_keys"]]
+    return describe, holdout
+
+
+def description_blinding(blind: dict[int, dict], plain: dict[int, dict], layer: int,
+                         seed: int = DEFAULT_SEED) -> list[dict]:
+    """Rows of BLINDING_COLUMNS for one layer (see the module docstring)."""
+    if set(blind) != set(plain):
+        raise ValueError(f"layer {layer}: runs describe different features "
+                         f"({sorted(set(blind) ^ set(plain))[:5]} differ)")
+    for feat, record in blind.items():
+        if record["stratum"] != plain[feat]["stratum"]:
+            raise ValueError(f"layer {layer}: feature {feat} is in different strata")
+        if _example_keys(record) != _example_keys(plain[feat]):
+            raise ValueError(f"layer {layer}: feature {feat} has different describe or held-out "
+                             f"examples in the two runs; they do not differ only in blinding")
+
+    def null(run: dict[int, dict]) -> list[float]:
+        return _finite(v for r in run.values()
+                       for v in (r.get("shuffled") or {}).get("r_values", []))
+
+    null_blind, null_plain = null(blind), null(plain)
+    strata = sorted({r["stratum"] for r in blind.values()})
+    rows = []
+    for stratum in [*strata, "all"]:
+        feats = sorted(f for f in blind if stratum == "all" or blind[f]["stratum"] == stratum)
+        deltas = [blind[f]["pearson_r"] - plain[f]["pearson_r"] for f in feats
+                  if not math.isnan(blind[f]["pearson_r"])
+                  and not math.isnan(plain[f]["pearson_r"])]
+        low, high = _bootstrap_median_ci(deltas, seed)
+        row = {"layer": layer, "stratum": stratum, "n_features": len(feats),
+               "n_paired": len(deltas), "median_delta_r": _median_or_nan(deltas),
+               "delta_r_ci_low": low, "delta_r_ci_high": high}
+        for name, run, null_r in (("blind", blind, null_blind), ("unblinded", plain, null_plain)):
+            tested = [b for b in (run[f].get("description_beats_baseline") for f in feats)
+                      if b is not None]
+            row[f"{name}_median_r"] = _median_or_nan(run[f]["pearson_r"] for f in feats)
+            row[f"{name}_median_auroc"] = _median_or_nan(run[f].get("detection_auroc") for f in feats)
+            row[f"{name}_null_p95"] = float(np.percentile(null_r, 95)) if null_r else float("nan")
+            row[f"{name}_null_median"] = _median_or_nan(null_r)
+            row[f"{name}_n_beats"] = sum(tested)
+            row[f"{name}_n_tested"] = len(tested)
+        rows.append(row)
+    return rows
+
+
 def _write_csv(path: Path, columns: list[str], rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as fh:
@@ -176,7 +284,30 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="pipeline output root")
     parser.add_argument("--layers", type=int, nargs="+", default=list(LAYERS))
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--descriptions", nargs=2, metavar=("BLIND", "UNBLINDED"),
+                        help="compare two description run tags instead of the report analyses")
     args = parser.parse_args(argv)
+
+    if args.descriptions:
+        blind_tag, plain_tag = args.descriptions
+        blinding_rows: list[dict] = []
+        for layer in args.layers:
+            blind = load_description_run(description_run_path(args.root, layer, blind_tag), True)
+            plain = load_description_run(description_run_path(args.root, layer, plain_tag), False)
+            layer_rows = description_blinding(blind, plain, layer, args.seed)
+            blinding_rows += layer_rows
+            for r in layer_rows:
+                print(f"layer {layer} {r['stratum']:<11} n={r['n_features']:>3}  "
+                      f"r blind {r['blind_median_r']:.3f} / unblinded {r['unblinded_median_r']:.3f}"
+                      f"  dr {r['median_delta_r']:+.3f} [{r['delta_r_ci_low']:+.3f}, "
+                      f"{r['delta_r_ci_high']:+.3f}]  AUROC {r['blind_median_auroc']:.3f} / "
+                      f"{r['unblinded_median_auroc']:.3f}  null p95 {r['blind_null_p95']:.3f} / "
+                      f"{r['unblinded_null_p95']:.3f}  beats {r['blind_n_beats']}/"
+                      f"{r['blind_n_tested']} / {r['unblinded_n_beats']}/{r['unblinded_n_tested']}")
+        out = args.root / "analysis" / "description_blinding.csv"
+        _write_csv(out, BLINDING_COLUMNS, blinding_rows)
+        print(f"wrote {out}")
+        return
 
     hub_rows: list[dict] = []
     corr_rows: list[dict] = []

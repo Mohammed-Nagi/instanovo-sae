@@ -133,20 +133,33 @@ python src/interpret.py \
   --annotation-dir $OUTPUT_ROOT/annotation \
   --sae-checkpoint $OUTPUT_ROOT/sae/layer_2/seed_0/checkpoint.pt \
   --output-dir     $OUTPUT_ROOT/interpret/layer_2 \
-  --target-layer   2
+  --target-layer   2 \
+  --run-tag        blind_v1 --blind
 ```
 
-`--dry-run` builds prompts without calling the API. Features are assigned to exactly one stratum,
-in precedence order: `causal` (needs Phase 8), `unexplained` (the discovery set: activation mass
-on peaks the theory cannot label), `concept` (positive control), `unlabelled`.
+Each run writes to `<output-dir>/<run-tag>/` and records its settings in `run_config.json`; a
+resume with different settings fails. `--dry-run` builds the prompts, prints one of each and a
+cost estimate, and calls and writes nothing. `--chunk-indices` pins the chunks to encode (all must
+be on disk). Features are assigned to exactly one stratum, in precedence order: `causal` (needs
+Phase 8), `unexplained` (the discovery set: activation mass on peaks the theory cannot label),
+`concept` (positive control), `unlabelled`.
 
-Only the `concepts` column is withheld from prompts. The prompts behind the released descriptions
-(`paper_artifacts/feature_descriptions/`) still carried the annotator's matched-ion labels,
-neighbour-peak labels and the true peptide sequence, so those descriptions were generated with
-annotation labels and the true peptide in the prompt and are not inferred from spectra alone. A
-blinded mode is in progress. Each description is scored by showing held-out examples without
-activations, asking the model to predict each, and correlating against measured values. Results
-append to a resume log as each feature completes, so an interrupted run does not pay twice.
+`--blind` withholds the annotator's matched-ion label, the neighbour-peak labels and the true
+peptide from both the description and the prediction prompt, keeping only what the model receives
+(peak m/z and intensity, neighbours as m/z@intensity, precursor, the latent-summary-token marker).
+Without it those columns are shown, as they were behind the released descriptions
+(`paper_artifacts/feature_descriptions/`), which were therefore written with annotation labels and
+the true peptide in the prompt and are not inferred from spectra alone. Concept labels are shown
+only with `--include-concept-labels`, which `--blind` refuses.
+
+Each description is scored by showing held-out examples without activations, asking the model to
+predict each, and correlating against measured values (Pearson r), plus detection AUROC (firing vs
+non-firing held-out tokens) from the same predictions. Examples are split by spectrum, with random
+example ids and row order, all drawn from an RNG keyed on (seed, layer, feature). As a baseline,
+each feature's held-out set is also predicted from `--n-shuffles` (default 3) other features'
+descriptions; `description_beats_baseline` is r above the 95th percentile of those shuffled r in
+the layer. Results append to resume logs as they complete, so an interrupted run does not pay
+twice.
 
 Expect `unlabelled` to come back empty. With 12,288 features against 50 concepts, everything that
 fires appreciably picks up some significant association, leaving that pool to the near-dead tail.
@@ -173,7 +186,7 @@ $OUTPUT_ROOT/
 │   └── eval/     report.json, per_feature_stats.csv,
 │                 feature_label_associations.csv, top_activating_tokens.csv,
 │                 causal_ablation.csv, cross_layer_matches.csv
-└── interpret/layer_{L}/   feature_descriptions.{csv,json}
+└── interpret/layer_{L}/<run_tag>/   feature_descriptions.{csv,json}, run_config.json
 ```
 
 None of these is committed except the summaries listed under **Results** above; see `.gitignore`.

@@ -6,8 +6,9 @@ sync with InstaNovo's Python API. The rest of the pipeline imports this module
 and never touches `instanovo.*` directly, which is what lets the pipeline live
 outside the InstaNovo repo and depend on it as an ordinary package.
 
-Only four upstream symbols are used, all imported below:
-    InstaNovo, TransformerDataProcessor, SpectrumDataFrame, LEGACY_PTM_TO_UNIMOD
+Only six upstream symbols are used, all imported below:
+    InstaNovo, TransformerDataProcessor, SpectrumDataFrame, BeamSearchDecoder,
+    ANNOTATED_COLUMN, LEGACY_PTM_TO_UNIMOD
 
 All function bodies below are grounded in the InstaNovo source:
   - transformer/model.py   InstaNovo.load / from_pretrained / forward / encoder
@@ -16,6 +17,7 @@ All function bodies below are grounded in the InstaNovo source:
   - utils/data_handler.py  SpectrumDataFrame.load / to_dataset
   - common/dataset.py      DataProcessor.collate_fn
   - utils/residues.py      ResidueSet (PAD/SOS/EOS, decode)
+  - inference/beam_search.py  BeamSearchDecoder (the inspector's prediction)
 """
 from __future__ import annotations
 
@@ -34,6 +36,8 @@ from torch.utils.data import DataLoader
 from instanovo.transformer.model import InstaNovo            # transformer/model.py:44
 from instanovo.transformer.data import TransformerDataProcessor  # transformer/data.py:21
 from instanovo.utils.data_handler import SpectrumDataFrame   # utils/data_handler.py:50
+from instanovo.inference import BeamSearchDecoder           # inference/beam_search.py:17
+from instanovo.constants import ANNOTATED_COLUMN            # constants.py:70, processor's peptide column
 # isort: on
 
 # Canonical legacy-PTM -> UNIMOD remapping (e.g. "M(+15.99)" -> "M[UNIMOD:35]").
@@ -208,6 +212,111 @@ def load_spectrum_dataframe(
     )
 
 
+def make_processor(
+    residue_set: Any,
+    n_peaks: int = DEFAULT_N_PEAKS,
+    annotated: bool = True,
+    metadata_columns: list[str] | None = None,
+    use_spectrum_utils: bool = True,
+) -> TransformerDataProcessor:
+    """The TransformerDataProcessor every consumer in this repo preprocesses with.
+
+    One constructor for extraction's DataLoader and the inspector's single
+    spectra, so both see the same peaks. use_spectrum_utils=True is the
+    processor's default, what extraction ran with, and the standard input for
+    the v1.1.0 checkpoint (InstaNovo 1.1.0 always preprocessed with
+    spectrum_utils; only 1.2.x's predict.py passes False). The two paths keep
+    different peaks: spectrum_utils' min_intensity is relative to the base peak
+    and its output is m/z-sorted, the fallback's is absolute and top-k ordered.
+    """
+    return TransformerDataProcessor(
+        residue_set,
+        n_peaks=n_peaks,
+        annotated=annotated,
+        metadata_columns=metadata_columns,
+        use_spectrum_utils=use_spectrum_utils,
+    )
+
+
+def preprocess_spectrum(
+    processor: TransformerDataProcessor,
+    mz_array,
+    intensity_array,
+    precursor_mz: float,
+    precursor_charge: int,
+    peptide: str | None = None,
+) -> dict:
+    """Preprocess ONE raw spectrum into a model-ready batch of size 1.
+
+    The same two steps the DataLoader runs per row and per batch
+    (process_row, then collate_fn), so a spectrum preprocessed here gets
+    exactly the peaks and padding layout extraction gave it. `peptide` is the
+    sequence to teacher-force (InstaNovo notation, e.g. "PEPM(+15.99)K" or
+    "PEPM[UNIMOD:35]K"); it requires an annotated processor and is stored
+    under the processor's annotated column, as SpectrumDataFrame does with
+    `modified_sequence`.
+    """
+    row = {
+        "mz_array": list(map(float, mz_array)),
+        "intensity_array": list(map(float, intensity_array)),
+        "precursor_mz": float(precursor_mz),
+        "precursor_charge": int(precursor_charge),
+    }
+    if peptide is not None:
+        if not processor.annotated:
+            raise ValueError("preprocess_spectrum: a peptide needs an annotated processor")
+        row[ANNOTATED_COLUMN] = peptide
+    elif processor.annotated:
+        raise ValueError("preprocess_spectrum: an annotated processor needs a peptide")
+    processed = processor.process_row(row)
+    # The DataLoader path hands collate_fn 0-d tensors in the dataset's dtypes
+    # (precursor_mz float64, precursor_charge int64), and collate_fn computes
+    # the precursor mass before casting to float32; python floats would make
+    # that arithmetic float32 and shift the decoder input slightly.
+    processed["precursor_mz"] = torch.tensor(row["precursor_mz"], dtype=torch.float64)
+    processed["precursor_charge"] = torch.tensor(row["precursor_charge"], dtype=torch.int64)
+    return processor.collate_fn([processed])
+
+
+def residue_delta_mass(residue_set: Any, token: str) -> float | None:
+    """Modification mass carried by a vocabulary token, or None if it has none.
+
+    "M[UNIMOD:35]" -> mass(token) - mass("M"); an N-terminal token such as
+    "[UNIMOD:1]" carries its whole mass; a plain residue returns None.
+    """
+    if "[" not in token and "(" not in token:
+        return None
+    base = token[0] if token[0].isalpha() else None
+    mass = float(residue_set.get_mass(token))
+    return mass - float(residue_set.get_mass(base)) if base else mass
+
+
+def beam_search(
+    model: InstaNovo,
+    batch: dict,
+    device: str,
+    num_beams: int,
+    max_length: int,
+) -> dict:
+    """InstaNovo's beam search on a preprocessed batch.
+
+    Mirrors transformer/predict.py: BeamSearchDecoder(model, float_dtype=float64)
+    and decode(spectra, precursors, beam_size, max_length, return_beam). Returns
+    the decoder's dict: "predictions" (residue token lists, N->C, empty when no
+    beam completes), "prediction_log_probability" and
+    "prediction_token_log_probabilities" (N->C), one entry per spectrum.
+    """
+    decoder = BeamSearchDecoder(model, float_dtype=torch.float64)
+    with torch.inference_mode():
+        return decoder.decode(
+            spectra=batch["spectra"].to(device),
+            precursors=batch["precursors"].to(device),
+            beam_size=num_beams,
+            max_length=max_length,
+            return_beam=num_beams > 1,
+        )
+
+
 def make_dataloader(
     sdf: SpectrumDataFrame,
     residue_set: Any,
@@ -246,7 +355,7 @@ def make_dataloader(
     with SpectrumDataFrame index order.
     """
     dataset = sdf.to_dataset(in_memory=in_memory)
-    processor = TransformerDataProcessor(
+    processor = make_processor(
         residue_set,
         n_peaks=n_peaks,
         annotated=annotated,
@@ -290,6 +399,19 @@ def model_forward_logits(
         x_mask=batch["spectra_mask"].to(device, non_blocking=True),
         y_mask=batch["peptides_mask"].to(device, non_blocking=True),
     )
+
+
+def encoder_forward(model: InstaNovo, batch: dict, device: str) -> torch.Tensor:
+    """Run the encoder alone (peak embedding, latent prepend, encoder stack, and
+    the precursor prepend after it) and return its output, firing any hooks on
+    model.encoder.layers. Used when there is no peptide to teacher-force.
+    Calling model.encoder directly would skip the embedding and latent token."""
+    out, _mask = model._encoder(
+        x=batch["spectra"].to(device),
+        p=batch["precursors"].to(device),
+        x_mask=batch["spectra_mask"].to(device),
+    )
+    return out
 
 
 def per_token_ce_and_top1(

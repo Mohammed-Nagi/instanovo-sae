@@ -43,6 +43,10 @@ EVAL_SCHEMA_VERSION = 1
 # pipeline and the inspector tool. Recorded in the parquet's schema metadata.
 DICTIONARY_SCHEMA_VERSION = 1
 
+# inspector/runtime.py: the Explanation JSON returned by explain(), consumed by
+# the dashboard. Explanation.from_json rejects any other version.
+EXPLAIN_SCHEMA_VERSION = 1
+
 # interpret.py: description runs live in interpret/layer_{L}/<run_tag>/. The
 # archive directory beside them keeps superseded runs as provenance; no stage
 # reads from it or writes to it, so a run tag must be one plain directory name

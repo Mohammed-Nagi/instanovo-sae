@@ -578,8 +578,15 @@ def run_spectrum_utils(
     fragment_tol_mass: float,
     fragment_tol_mode: str,
     enable_internal: bool,
+    strict: bool = False,
 ) -> list[dict]:
-    """Annotate one spectrum and return a flat label dict per peak."""
+    """Annotate one spectrum and return a flat label dict per peak.
+
+    strict=False (the batch annotator) turns a spectrum_utils failure into an
+    all-noise result with a warning, so one bad peptide cannot stop a run.
+    strict=True (the inspector) raises instead, since an all-noise result would
+    be indistinguishable from a spectrum with no matching ions.
+    """
     mz_np = mz_array.detach().cpu().numpy().astype(np.float64)
     int_np = intensity_array.detach().cpu().numpy().astype(np.float64)
 
@@ -605,9 +612,11 @@ def run_spectrum_utils(
             max_isotope=0,                               # monoisotopic fragments only
             neutral_losses=NEUTRAL_LOSSES,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         # Bad ProForma or unsupported residue: all-noise keeps the run going.
         # spectrum_utils raises several unrelated types here, so this stays broad.
+        if strict:
+            raise ValueError(f"spectrum_utils could not annotate {proforma!r}: {exc}") from exc
         LOG.warning("spectrum_utils annotation failed for %r: %s", proforma, exc)
         return [dict(_NOISE) for _ in range(len(mz_np))]
 
@@ -918,21 +927,34 @@ class _SpectrumTokens:
         self.intensity[row] = intensity
 
 
-def _annotate_spectrum(
-    chunk_data: dict,
-    s: int,
+def annotate_spectrum(
+    peptide: str,
+    proforma: str,
+    modifications: list[dict],
+    mz_array: torch.Tensor,
+    intensity_array: torch.Tensor,
+    precursor_mz: float,
+    precursor_charge: int,
     config: AnnotationConfig,
     registry: ConceptRegistry,
-    name_to_idx: dict[str, int],
-) -> _SpectrumTokens:
-    """Annotate spectrum `s` of a chunk into its per-token tensors, ordered as
-    extract.py flattened it: the latent summary token, then one token per peak.
+    name_to_idx: dict[str, int] | None = None,
+    strict: bool = False,
+) -> tuple[list[dict], _SpectrumTokens]:
+    """Annotate one spectrum against `peptide`: the latent summary token, then
+    one token per peak, in extract.py's flattening order.
+
+    Returns (annotations, tokens): the per-peak label dicts from spectrum_utils
+    (ion_type, ion_index -- int, (start, end) for internal ions, or the residue
+    for immonium -- charge, neutral_loss) and the per-token tensors
+    annotate_chunk stores. `peptide` is the bare sequence, `proforma` the
+    bracketed form spectrum_utils parses (delta masses, not UNIMOD tags: those
+    are resolved over the network), and `modifications` the
+    {position, mod_name, unimod_id} dicts, position 0 for N-terminal.
+    Used by the chunk annotator and by the inspector on a predicted peptide;
+    strict is passed to run_spectrum_utils.
     """
-    peptide = chunk_data["peptides"][s]
-    modifications = chunk_data["modifications"][s]
-    mz_array = chunk_data["mz_arrays"][s]
-    intensity_array = chunk_data["intensity_arrays"][s]
-    precursor_charge = int(chunk_data["precursor_charges"][s])
+    if name_to_idx is None:
+        name_to_idx = registry.index
     peptide_length = len(peptide)
 
     spectrum_concepts = compute_spectrum_concepts(
@@ -942,15 +964,16 @@ def _annotate_spectrum(
 
     # One label dict per peak (noise if unmatched).
     annotations = run_spectrum_utils(
-        proforma=chunk_data["proforma_strings"][s],
+        proforma=proforma,
         mz_array=mz_array,
         intensity_array=intensity_array,
-        precursor_mz=float(chunk_data["precursor_mzs"][s]),
+        precursor_mz=float(precursor_mz),
         precursor_charge=precursor_charge,
         ion_types=config.ion_types,
         fragment_tol_mass=config.fragment_tol_mass,
         fragment_tol_mode=config.fragment_tol_mode,
         enable_internal=config.enable_internal,
+        strict=strict,
     )
 
     tokens = _SpectrumTokens(1 + len(mz_array), len(registry.names))
@@ -983,6 +1006,31 @@ def _annotate_spectrum(
         tokens.set_concepts(row, peak_concepts, name_to_idx)
         tokens.set_peak_metadata(row, ann, mz, intensity)
 
+    return annotations, tokens
+
+
+def _annotate_spectrum(
+    chunk_data: dict,
+    s: int,
+    config: AnnotationConfig,
+    registry: ConceptRegistry,
+    name_to_idx: dict[str, int],
+) -> _SpectrumTokens:
+    """Annotate spectrum `s` of a chunk into its per-token tensors, ordered as
+    extract.py flattened it: the latent summary token, then one token per peak.
+    """
+    _annotations, tokens = annotate_spectrum(
+        peptide=chunk_data["peptides"][s],
+        proforma=chunk_data["proforma_strings"][s],
+        modifications=chunk_data["modifications"][s],
+        mz_array=chunk_data["mz_arrays"][s],
+        intensity_array=chunk_data["intensity_arrays"][s],
+        precursor_mz=float(chunk_data["precursor_mzs"][s]),
+        precursor_charge=int(chunk_data["precursor_charges"][s]),
+        config=config,
+        registry=registry,
+        name_to_idx=name_to_idx,
+    )
     return tokens
 
 

@@ -40,7 +40,9 @@ Blinded vs unblinded descriptions (``--descriptions BLIND UNBLINDED``)
     layer: 95th percentile and median), the number of features whose r beats
     that run's threshold, and the paired median difference in r (blind minus
     unblinded) with a seeded percentile-bootstrap 95% CI over features. Reads
-    ``interpret/layer_{L}/<tag>/feature_descriptions.json``.
+    ``interpret/layer_{L}/<tag>/feature_descriptions.json``. A second table
+    gives each run's shuffled r per layer (median, p95), overall and split by
+    whether the donor description came from a feature in the same stratum.
 
 Usage (from the repo root)::
 
@@ -50,7 +52,7 @@ Usage (from the repo root)::
 
 Outputs under ``<root>/analysis/``: ``hubs.csv`` (a ranked list, no flag) and
 ``f1dom_selectivity.csv``; with ``--descriptions``, only
-``description_blinding.csv``.
+``description_blinding.csv`` and ``description_shuffled_null.csv``.
 """
 from __future__ import annotations
 
@@ -64,7 +66,7 @@ from statistics import median
 import numpy as np
 from scipy.stats import spearmanr
 
-from schema import EVAL_SCHEMA_VERSION
+from schema import EVAL_SCHEMA_VERSION, check_run_tag
 
 LAYERS = (2, 4, 6, 8)
 DEFAULT_ROOT = Path("sae_pipeline_outputs")
@@ -82,6 +84,11 @@ BLINDING_COLUMNS = [
     "blind_null_p95", "unblinded_null_p95", "blind_null_median", "unblinded_null_median",
     "blind_n_beats", "blind_n_tested", "unblinded_n_beats", "unblinded_n_tested",
     "n_paired", "median_delta_r", "delta_r_ci_low", "delta_r_ci_high",
+]
+NULL_COLUMNS = [
+    "layer", "run", "n", "n_undefined", "median", "p95",
+    "same_stratum_n", "same_stratum_median", "same_stratum_p95",
+    "other_stratum_n", "other_stratum_median", "other_stratum_p95",
 ]
 N_BOOTSTRAP = 10_000
 
@@ -186,7 +193,7 @@ def f1dom_selectivity_correlation(report: dict, layer: int) -> dict:
 
 
 def description_run_path(root: Path, layer: int, tag: str) -> Path:
-    return root / "interpret" / f"layer_{layer}" / tag / "feature_descriptions.json"
+    return root / "interpret" / f"layer_{layer}" / check_run_tag(tag) / "feature_descriptions.json"
 
 
 def load_description_run(path: Path, blind: bool) -> dict[int, dict]:
@@ -271,6 +278,46 @@ def description_blinding(blind: dict[int, dict], plain: dict[int, dict], layer: 
     return rows
 
 
+def shuffled_null_by_donor(run: dict[int, dict], layer: int, run_name: str) -> dict:
+    """One run's shuffled-description r, overall and split by whether the donor shares the stratum.
+
+    A high null driven by same-stratum donors means the baseline partly measures
+    how alike the features in a stratum are, not only what a description adds.
+    """
+    pooled: dict[str, list[float]] = {"all": [], "same": [], "other": []}
+    n_undefined = 0
+    for feat, record in run.items():
+        shuffled = record.get("shuffled") or {}
+        donors, values = shuffled.get("donors", []), shuffled.get("r_values", [])
+        if len(donors) != len(values):
+            raise ValueError(f"layer {layer} {run_name}: feature {feat} has {len(donors)} donors "
+                             f"but {len(values)} shuffled r values")
+        for donor, r in zip(donors, values):
+            if int(donor) not in run:
+                raise ValueError(f"layer {layer} {run_name}: donor {donor} is not in the run")
+            if r is None or math.isnan(float(r)):
+                # A constant prediction (usually all zeros) leaves r undefined;
+                # counted here, left out of the null as interpret.py does.
+                n_undefined += 1
+                continue
+            side = "same" if run[int(donor)]["stratum"] == record["stratum"] else "other"
+            pooled["all"].append(float(r))
+            pooled[side].append(float(r))
+
+    def p95(values: list[float]) -> float:
+        return float(np.percentile(values, 95)) if values else float("nan")
+
+    return {
+        "layer": layer, "run": run_name,
+        "n": len(pooled["all"]), "n_undefined": n_undefined, "median": _median_or_nan(pooled["all"]), "p95": p95(pooled["all"]),
+        "same_stratum_n": len(pooled["same"]), "same_stratum_median": _median_or_nan(pooled["same"]),
+        "same_stratum_p95": p95(pooled["same"]),
+        "other_stratum_n": len(pooled["other"]),
+        "other_stratum_median": _median_or_nan(pooled["other"]),
+        "other_stratum_p95": p95(pooled["other"]),
+    }
+
+
 def _write_csv(path: Path, columns: list[str], rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as fh:
@@ -291,11 +338,21 @@ def main(argv: list[str] | None = None) -> None:
     if args.descriptions:
         blind_tag, plain_tag = args.descriptions
         blinding_rows: list[dict] = []
+        null_rows: list[dict] = []
         for layer in args.layers:
             blind = load_description_run(description_run_path(args.root, layer, blind_tag), True)
             plain = load_description_run(description_run_path(args.root, layer, plain_tag), False)
             layer_rows = description_blinding(blind, plain, layer, args.seed)
             blinding_rows += layer_rows
+            for name, run in ((blind_tag, blind), (plain_tag, plain)):
+                n = shuffled_null_by_donor(run, layer, name)
+                null_rows.append(n)
+                print(f"layer {layer} {name:<13} shuffled r median {n['median']:.3f} p95 "
+                      f"{n['p95']:.3f} (n={n['n']}, {n['n_undefined']} undefined) | same-stratum donors median "
+                      f"{n['same_stratum_median']:.3f} p95 {n['same_stratum_p95']:.3f} "
+                      f"(n={n['same_stratum_n']}) | other-stratum median "
+                      f"{n['other_stratum_median']:.3f} p95 {n['other_stratum_p95']:.3f} "
+                      f"(n={n['other_stratum_n']})")
             for r in layer_rows:
                 print(f"layer {layer} {r['stratum']:<11} n={r['n_features']:>3}  "
                       f"r blind {r['blind_median_r']:.3f} / unblinded {r['unblinded_median_r']:.3f}"
@@ -305,8 +362,10 @@ def main(argv: list[str] | None = None) -> None:
                       f"{r['unblinded_null_p95']:.3f}  beats {r['blind_n_beats']}/"
                       f"{r['blind_n_tested']} / {r['unblinded_n_beats']}/{r['unblinded_n_tested']}")
         out = args.root / "analysis" / "description_blinding.csv"
+        null_out = args.root / "analysis" / "description_shuffled_null.csv"
         _write_csv(out, BLINDING_COLUMNS, blinding_rows)
-        print(f"wrote {out}")
+        _write_csv(null_out, NULL_COLUMNS, null_rows)
+        print(f"wrote {out} and {null_out}")
         return
 
     hub_rows: list[dict] = []

@@ -347,6 +347,116 @@ def test_detection_auroc():
     assert math.isnan(it.detection_auroc([(0.9, 0.0), (0.2, 0.0)]))
 
 
+def test_constant_prediction_scores_zero_and_nan_is_reserved_for_untestable_pairs():
+    varying = [0.0, 0.4, 0.9, 0.0]
+    assert it.pearson_r([(0.3, m) for m in varying]) == 0.0
+    assert it.pearson_r([(0.3, 0.0), (0.3, 0.5), (0.3, 1.0)]) == 0.0    # exactly 3
+    assert math.isnan(it.pearson_r([(0.1, 0.0), (0.9, 0.5)]))           # < 3 predictions
+    assert math.isnan(it.pearson_r([(0.1, 0.5), (0.4, 0.5), (0.9, 0.5)]))  # constant measured
+    assert math.isnan(it.pearson_r([(0.3, 0.5)] * 4))                    # both constant
+    assert it.pearson_r([(0.0, 0.0), (0.5, 0.5), (1.0, 1.0)]) == pytest.approx(1.0)
+    # A constant prediction scores AUROC 0.5 (all ties), unchanged by the rule.
+    assert it.detection_auroc([(0.3, m) for m in varying]) == 0.5
+
+
+class _SometimesConstantClient(_FakeClient):
+    """Every other prediction call answers one value for every row."""
+
+    def __init__(self):
+        super().__init__()
+        self.n_predict = 0
+
+    def create(self, model, messages, **kw):
+        reply = super().create(model, messages, **kw)
+        if "predicted_activation" in messages[0]["content"]:
+            self.n_predict += 1
+            if self.n_predict % 2:
+                _header, rows = _table_cells(messages[0]["content"])
+                reply.choices[0].message.content = "example_id,predicted_activation\n" + \
+                    "\n".join(f"{row[0]},0.30" for row in rows)
+        return reply
+
+
+def _as_legacy_log(path: Path, field: str) -> int:
+    """Rewrite a resume log the way the pre-rule code wrote it: constant-prediction r as NaN."""
+    lines, n = [], 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        rec = json.loads(line)
+        if field == "pearson_r" and rec["pearson_r"] == 0.0:
+            rec["pearson_r"], n = float("nan"), n + 1
+        if field == "r_values":
+            n += sum(v == 0.0 for v in rec["r_values"])
+            rec["r_values"] = [float("nan") if v == 0.0 else v for v in rec["r_values"]]
+        lines.append(json.dumps(rec))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return n
+
+
+def test_rescore_recomputes_legacy_logs_without_api_calls(tmp_path):
+    """Logs written under the NaN rule rescore to what a fresh run under the 0 rule gives."""
+    client = _SometimesConstantClient()
+    config = _config(tmp_path, blind=True, n_shuffles=3)
+    config.output_dir.mkdir(parents=True)
+    fresh = []
+    for fi in (3, 5, 9, 11, 13):
+        result = it.interpret_feature(client, config, fi, "concept", *_prepare(fi))
+        fresh.append(result)
+        it.append_completed(config.output_dir, result)
+    it.run_shuffled_baseline(client, config, fresh)
+    fresh_threshold = it.apply_baseline(fresh)
+    n_calls = len(client.prompts)
+    assert any(r["pearson_r"] == 0.0 for r in fresh)
+    assert any(v == 0.0 for r in fresh for v in r["shuffled"]["r_values"])
+
+    n_own = _as_legacy_log(it._resume_path(config.output_dir), "pearson_r")
+    n_null = _as_legacy_log(it._shuffled_resume_path(config.output_dir), "r_values")
+    assert n_own and n_null
+
+    loaded = it.load_completed(config.output_dir)
+    assert sum(math.isnan(r["pearson_r"]) for r in loaded.values()) == n_own
+    assert sum(it.rescore_result(r) for r in loaded.values()) == n_own
+    rescored = [loaded[fi] for fi in sorted(loaded)]
+    it.run_shuffled_baseline(None, config, rescored)       # client=None: logs only
+    assert len(client.prompts) == n_calls
+    assert it.apply_baseline(rescored) == pytest.approx(fresh_threshold)
+    by_fi = {r["feature_idx"]: r for r in fresh}
+    for r in rescored:
+        f = by_fi[r["feature_idx"]]
+        assert r["pearson_r"] == pytest.approx(f["pearson_r"])
+        assert r["detection_auroc"] == pytest.approx(f["detection_auroc"])
+        assert r["shuffled"]["r_values"] == pytest.approx(f["shuffled"]["r_values"])
+        assert r["description_beats_baseline"] == f["description_beats_baseline"]
+
+
+def test_rescore_without_a_shuffled_record_refuses_to_call(tmp_path):
+    client = _FakeClient()
+    config = _config(tmp_path, blind=True, n_shuffles=1)
+    config.output_dir.mkdir(parents=True)
+    results = [it.interpret_feature(client, config, fi, "concept", *_prepare(fi))
+               for fi in (3, 5, 9)]
+    with pytest.raises(RuntimeError, match="--rescore"):
+        it.run_shuffled_baseline(None, config, results)
+
+
+def test_rescore_shuffled_keeps_nan_it_cannot_decide(split):
+    _describe, holdout = split
+    measured = [e.activation for e in holdout]
+    largest_tie = max(measured.count(m) for m in set(measured))
+    n = len(holdout)
+    record = {"feature_idx": 1, "donors": [2, 3, 4, 5],
+              "r_values": [float("nan"), float("nan"), float("nan"), 0.42],
+              "n_predicted": [n, 2, largest_tie, n]}
+    assert it.rescore_shuffled(record, holdout) == 1
+    assert record["r_values"][0] == 0.0                   # full coverage: constant prediction
+    assert math.isnan(record["r_values"][1])              # < 3 predictions
+    assert math.isnan(record["r_values"][2])              # subset could be all-equal measured
+    assert record["r_values"][3] == 0.42                  # finite r untouched
+    flat = [dataclasses.replace(e, activation=0.5) for e in holdout]
+    nan_record = {"feature_idx": 1, "donors": [2], "r_values": [float("nan")],
+                  "n_predicted": [n]}
+    assert it.rescore_shuffled(nan_record, flat) == 0     # constant measured stays NaN
+
+
 def test_baseline_threshold_and_beats():
     null = [float(v) for v in range(101)] + [float("nan")]
     assert it.baseline_threshold(null) == pytest.approx(95.0)
@@ -431,3 +541,12 @@ def test_holdout_examples_round_trip_through_json(split):
     rebuilt = [it._example_from_dict(d) for d in stored]
     assert it.build_prediction_prompt("d", rebuilt, False, blind=True) == \
         it.build_prediction_prompt("d", holdout, False, blind=True)
+
+
+@pytest.mark.parametrize("tag", ["archive", "archive/unblinded_v1"])
+def test_interpret_refuses_an_archive_run_tag(monkeypatch, tag):
+    monkeypatch.setattr("sys.argv", [
+        "interpret.py", "--eval-dir", "e", "--extract-dir", "x", "--annotation-dir", "a",
+        "--sae-checkpoint", "c.pt", "--output-dir", "o", "--target-layer", "2",
+        "--run-tag", tag])
+    assert it.main() == 2

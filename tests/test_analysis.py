@@ -267,6 +267,26 @@ def test_description_blinding_rejects_different_feature_sets():
         analysis.description_blinding(blind, plain, 2)
 
 
+def test_shuffled_null_split_by_donor_stratum():
+    blind, _ = _desc_runs()
+    # features 1, 2 are concept; 3 is unexplained
+    blind[1]["shuffled"] = {"donors": [2, 3], "r_values": [0.8, 0.1]}
+    blind[2]["shuffled"] = {"donors": [1, 3], "r_values": [0.6, float("nan")]}
+    blind[3]["shuffled"] = {"donors": [1, 2], "r_values": [0.2, 0.0]}
+    row = analysis.shuffled_null_by_donor(blind, 2, "blind_v1")
+    assert row["n"] == 5 and row["n_undefined"] == 1 and row["median"] == pytest.approx(0.2)
+    assert row["same_stratum_n"] == 2 and row["same_stratum_median"] == pytest.approx(0.7)
+    assert row["other_stratum_n"] == 3 and row["other_stratum_median"] == pytest.approx(0.1)
+    assert row["p95"] == pytest.approx(float(np.percentile([0.8, 0.1, 0.6, 0.2, 0.0], 95)))
+
+
+def test_shuffled_null_with_mismatched_donors_raises():
+    blind, _ = _desc_runs()
+    blind[1]["shuffled"] = {"donors": [2], "r_values": [0.8, 0.1]}
+    with pytest.raises(ValueError, match="donors"):
+        analysis.shuffled_null_by_donor(blind, 2, "blind_v1")
+
+
 def test_load_description_run_checks_the_blind_flag(tmp_path):
     path = tmp_path / "feature_descriptions.json"
     blind, _ = _desc_runs()
@@ -274,3 +294,10 @@ def test_load_description_run_checks_the_blind_flag(tmp_path):
     assert set(analysis.load_description_run(path, blind=True)) == {1, 2, 3}
     with pytest.raises(ValueError, match="expected False"):
         analysis.load_description_run(path, blind=False)
+
+
+@pytest.mark.parametrize("tag", ["archive", "archive/unblinded_v1", "../layer_4/blind_v1"])
+def test_description_runs_are_never_read_from_the_archive(tmp_path, tag):
+    with pytest.raises(ValueError, match="archive"):
+        analysis.description_run_path(tmp_path, 2, tag)
+    assert analysis.description_run_path(tmp_path, 2, "blind_v1").parent.name == "blind_v1"

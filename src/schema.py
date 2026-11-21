@@ -11,7 +11,8 @@ that reusing a cached copy would give a different answer. Existing artefacts of
 that type must then be regenerated.
 
 This module deliberately has no imports, so any consumer can read the constants
-without pulling in torch, spectrum_utils, or the InstaNovo package.
+(and the run-tag check) without pulling in torch, spectrum_utils, or the
+InstaNovo package.
 """
 
 # extract.py: manifest.json, ChunkMeta, and the per-layer activation files.
@@ -41,3 +42,21 @@ EVAL_SCHEMA_VERSION = 1
 # build_dictionary.py: dictionary/layer_{L}.parquet, the contract between the
 # pipeline and the inspector tool. Recorded in the parquet's schema metadata.
 DICTIONARY_SCHEMA_VERSION = 1
+
+# interpret.py: description runs live in interpret/layer_{L}/<run_tag>/. The
+# archive directory beside them keeps superseded runs as provenance; no stage
+# reads from it or writes to it, so a run tag must be one plain directory name
+# that is not the archive.
+INTERPRET_ARCHIVE_DIR = "archive"
+
+
+def check_run_tag(tag: str) -> str:
+    """Return tag if it names one description-run directory; raise ValueError otherwise."""
+    if (not tag or tag in (".", "..") or any(c in tag for c in "/\\:")
+            or tag.lower() == INTERPRET_ARCHIVE_DIR):
+        raise ValueError(
+            f"run tag {tag!r} must be a single directory name under interpret/layer_L/, "
+            f"not a path and not {INTERPRET_ARCHIVE_DIR!r} (superseded runs kept as "
+            f"provenance, which nothing reads)"
+        )
+    return tag

@@ -53,8 +53,13 @@ What the columns do and do not claim
 
 Usage (from the repo root)::
 
-    PYTHONPATH=src uv run python -m build_dictionary
-    PYTHONPATH=src uv run python -m build_dictionary --blinded-run blind_v1 --unblinded-run unblinded_v2
+    PYTHONPATH=src uv run python -m build_dictionary --layers 2 4 6 --blinded-run blind_v1
+    PYTHONPATH=src uv run python -m build_dictionary --layers 8     # no descriptions yet
+
+Both runs default to none, so a layer is described only by a run named on the
+command line. The current dictionary uses blinded descriptions only. Superseded
+runs sit in ``interpret/layer_{L}/archive/`` as provenance; ``schema.check_run_tag``
+refuses any tag that would read from there.
 
 Output: ``<root>/dictionary/layer_{L}.parquet``. The build is deterministic and
 the write is atomic, so rerunning it is idempotent.
@@ -80,13 +85,12 @@ from analysis import (
     per_feature_delta_ce,
     report_path,
 )
-from schema import DICTIONARY_SCHEMA_VERSION
+from schema import DICTIONARY_SCHEMA_VERSION, check_run_tag
 
 TOP_CONCEPTS = 3
 LATENT_CONCEPT = "is_latent_token"
 # float32 rounding in the stored F1 spreads the recovered concept count by ~4e-5.
 CONCEPT_COUNT_REL_TOL = 1e-3
-DEFAULT_UNBLINDED_RUN = "unblinded_v1"
 
 UNBLINDED_PROVENANCE = "written with access to annotation labels and the true peptide"
 BLINDED_PROVENANCE = "blinded: annotation labels and the true peptide withheld from the prompt"
@@ -101,7 +105,7 @@ def eval_dir(root: Path, layer: int, seed: int) -> Path:
 
 
 def description_path(root: Path, layer: int, run_tag: str) -> Path:
-    return root / "interpret" / f"layer_{layer}" / run_tag / "feature_descriptions.csv"
+    return root / "interpret" / f"layer_{layer}" / check_run_tag(run_tag) / "feature_descriptions.csv"
 
 
 def dictionary_path(root: Path, layer: int) -> Path:
@@ -308,7 +312,7 @@ def _array(values, dtype: pa.DataType) -> pa.Array:
 
 
 def build_layer(root: Path, layer: int, seed: int = DEFAULT_SEED,
-                unblinded_run: str | None = DEFAULT_UNBLINDED_RUN,
+                unblinded_run: str | None = None,
                 blinded_run: str | None = None) -> pa.Table:
     """Build one layer's dictionary table (see the module docstring)."""
     ev = eval_dir(root, layer, seed)
@@ -377,7 +381,12 @@ def write_atomic(table: pa.Table, path: Path) -> None:
 
 
 def _run_tag(value: str) -> str | None:
-    return None if value.lower() == "none" else value
+    if value.lower() == "none":
+        return None
+    try:
+        return check_run_tag(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -385,9 +394,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="pipeline output root")
     parser.add_argument("--layers", type=int, nargs="+", default=list(LAYERS))
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    parser.add_argument("--unblinded-run", type=_run_tag, default=DEFAULT_UNBLINDED_RUN,
+    parser.add_argument("--unblinded-run", type=_run_tag, default=None,
                         help="description run tag written with labels (interpret/layer_L/<tag>); "
-                             "'none' to skip")
+                             "default none")
     parser.add_argument("--blinded-run", type=_run_tag, default=None,
                         help="description run tag written blind; takes precedence; default none")
     args = parser.parse_args(argv)

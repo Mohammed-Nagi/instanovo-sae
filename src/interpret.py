@@ -68,7 +68,10 @@ Baselines. Each feature also gets detection AUROC (do predicted activations
 separate firing from non-firing held-out tokens?) from the same predictions as
 r, and --n-shuffles predictions of its held-out table from other features'
 descriptions in the same run. description_beats_baseline is r above the 95th
-percentile of all shuffled r in the layer.
+percentile of all shuffled r in the layer. A constant prediction against
+varying measured activations scores r = 0 (no information), in the null and
+for the feature's own description alike; r is NaN only with fewer than 3
+predictions or constant measured activations.
 
 Outputs under --output-dir/--run-tag:
     run_config.json                     settings a resume must match
@@ -78,7 +81,9 @@ Outputs under --output-dir/--run-tag:
     shuffled_baseline.partial.jsonl     resume log for the shuffled baseline
 
 Rerunning skips features already in the resume logs, so an interrupted run does
-not pay for them twice. --dry-run builds the prompts, prints examples and a cost
+not pay for them twice; logged records are rescored under the current r rule
+on load. --rescore does only that: it rewrites the outputs from the logs and
+calls nothing. --dry-run builds the prompts, prints examples and a cost
 estimate, and writes nothing.
 """
 from __future__ import annotations
@@ -95,6 +100,7 @@ import random
 import re
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -102,6 +108,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 from evaluate import ChunkStream
+from schema import check_run_tag
 from train import load_sae_from_checkpoint
 
 LOG = logging.getLogger("interpret")
@@ -147,6 +154,11 @@ DEFAULT_MODEL = "gpt-4o"
 DEFAULT_N_SHUFFLES = 3
 # description_beats_baseline: r above this percentile of the layer's shuffled r.
 BASELINE_PERCENTILE = 95.0
+
+# r is NaN below this many predictions; a correlation over two points is +-1
+# whatever the description says.
+MIN_SCORED_PREDICTIONS = 3
+CONSTANT_STD = 1e-12
 
 # --- Cost estimate (dry run only) ---------------------------------------------
 # USD per million tokens (input, output). Check against current OpenAI pricing
@@ -197,6 +209,7 @@ class InterpretConfig:
     device: str = "cpu"   # resolved from --device before construction
     batch_size: int = 4096
     dry_run: bool = False       # build prompts, skip the API
+    rescore: bool = False       # recompute scores from the resume logs, skip the API
 
     def as_jsonable(self) -> dict:
         out = dataclasses.asdict(self)
@@ -1269,16 +1282,24 @@ def parse_predictions(text: str, valid_ids: set[int]) -> dict[int, float]:
 
 
 def pearson_r(pairs: list[tuple[float, float]]) -> float:
-    """Correlation between predicted and measured activations."""
-    if len(pairs) < 3:
+    """Correlation between predicted and measured activations.
+
+    NaN only when the pairs cannot test a description: fewer than
+    MIN_SCORED_PREDICTIONS, or measured activations that are constant. A
+    constant prediction against varying measurements scores 0: the description
+    led the model to predict nothing about this feature, which is a result
+    (no information), not a missing value. Dropping it as NaN would remove
+    exactly the uninformative descriptions from the shuffled null and inflate
+    its percentiles.
+    """
+    if len(pairs) < MIN_SCORED_PREDICTIONS:
         return float("nan")
     predicted = np.array([p for p, _ in pairs], dtype=np.float64)
     measured = np.array([m for _, m in pairs], dtype=np.float64)
-    if predicted.std() < 1e-12 or measured.std() < 1e-12:
-        # A constant prediction has no correlation defined; report NaN rather
-        # than a spurious 0, which would read as "uncorrelated" instead of
-        # "uninformative".
+    if measured.std() < CONSTANT_STD:
         return float("nan")
+    if predicted.std() < CONSTANT_STD:
+        return 0.0
     return float(np.corrcoef(predicted, measured)[0, 1])
 
 
@@ -1446,7 +1467,8 @@ def run_shuffled_baseline(client, config: InterpretConfig, results: list[dict]) 
     """Predict each feature's held-out table from other features' descriptions.
 
     Adds a "shuffled" record to each result in place. Records are appended to a
-    resume log as they finish. A logged record whose donors differ from a fresh
+    resume log as they finish, and logged ones are rescored under the current r
+    rule (rescore_shuffled). With client=None a missing record is an error. A logged record whose donors differ from a fresh
     draw means the set of described features changed, and is an error rather
     than a silent mix of two nulls.
     """
@@ -1474,8 +1496,14 @@ def run_shuffled_baseline(client, config: InterpretConfig, results: list[dict]) 
                     f"a fresh draw {donors}; the set of described features changed since "
                     f"{path.name} was written"
                 )
+            holdout = [_example_from_dict(d) for d in described[fi]["holdout_examples"]]
+            rescore_shuffled(done[fi], holdout)
             described[fi]["shuffled"] = done[fi]
             continue
+        if client is None:
+            raise RuntimeError(
+                f"feature {fi} has no record in {path.name}; --rescore makes no API calls"
+            )
         holdout = [_example_from_dict(d) for d in described[fi]["holdout_examples"]]
         record = {"feature_idx": fi, "donors": donors, "r_values": [], "auroc_values": [],
                   "n_predicted": [], "prompt_tokens": 0, "completion_tokens": 0}
@@ -1514,6 +1542,59 @@ def apply_baseline(results: list[dict]) -> float:
         r["shuffled_null_p95"] = threshold
         r["description_beats_baseline"] = beats_baseline(r["pearson_r"], threshold)
     return threshold
+
+
+def rescore_result(result: dict) -> bool:
+    """Recompute a stored feature's r and AUROC from its logged predictions. Returns True if r changed.
+
+    Logs written before the constant-prediction rule (pearson_r) hold NaN where
+    r is now 0; rescoring on load brings them under the current rule without
+    an API call.
+    """
+    preds = result.get("predictions")
+    if not preds:
+        return False
+    pairs = [(p["predicted"], p["measured"]) for p in preds]
+    old = result["pearson_r"]
+    result["pearson_r"] = pearson_r(pairs)
+    result["detection_auroc"] = detection_auroc(pairs)
+    return not _same_float(old, result["pearson_r"])
+
+
+def rescore_shuffled(record: dict, holdout: list[TokenExample]) -> int:
+    """Reapply the constant-prediction rule to a logged shuffled record. Returns NaNs reclassified.
+
+    The shuffled log keeps r and n_predicted per donor, not the predictions.
+    With at least MIN_SCORED_PREDICTIONS predictions and measured activations
+    that vary over the predicted subset, pearson_r's only NaN case is a
+    constant prediction, so that NaN becomes 0. The subset is known to vary
+    when the full held-out set varies and n_predicted exceeds the size of its
+    largest group of equal activations. Anything else stays NaN, with a
+    warning when the log cannot decide the case.
+    """
+    measured = [e.activation for e in holdout]
+    varies = len(measured) >= 2 and float(np.std(measured)) >= CONSTANT_STD
+    largest_tie = max(Counter(measured).values()) if measured else 0
+    changed = 0
+    for i, (r, n) in enumerate(zip(record["r_values"], record["n_predicted"])):
+        if not math.isnan(r) or n < MIN_SCORED_PREDICTIONS or not varies:
+            continue
+        if n > largest_tie:
+            record["r_values"][i] = 0.0
+            changed += 1
+        else:
+            LOG.warning("Feature %d, donor %d: shuffled r is NaN over %d of %d held-out "
+                        "examples and the log cannot tell a constant prediction from a "
+                        "constant measured subset; left NaN.",
+                        record["feature_idx"], record["donors"][i], n, len(measured))
+    return changed
+
+
+def _same_float(a: float, b: float) -> bool:
+    """Equal, or both NaN. Logged predictions are re-summed in id order, so allow rounding."""
+    if math.isnan(a) or math.isnan(b):
+        return math.isnan(a) and math.isnan(b)
+    return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-12)
 
 
 # --- Output -------------------------------------------------------------------
@@ -1742,6 +1823,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true",
                    help="Build the prompts, print an example of each and a cost "
                         "estimate, call nothing and write nothing.")
+    p.add_argument("--rescore", action="store_true",
+                   help="Recompute r, AUROC and the shuffled baseline from this run's resume "
+                        "logs under the current scoring rule and rewrite its outputs. Calls "
+                        "nothing; fails if any feature or shuffled record is missing.")
     p.add_argument("--log-level", default="INFO")
     return p.parse_args()
 
@@ -1848,6 +1933,14 @@ def main() -> int:
     if args.n_shuffles < 0:
         LOG.error("--n-shuffles must be >= 0")
         return 2
+    try:
+        check_run_tag(args.run_tag)
+    except ValueError as exc:
+        LOG.error("--run-tag: %s", exc)
+        return 2
+    if args.rescore and args.dry_run:
+        LOG.error("--rescore and --dry-run are separate modes; pass one.")
+        return 2
 
     config = InterpretConfig(
         eval_dir=args.eval_dir,
@@ -1871,6 +1964,7 @@ def main() -> int:
         device=resolve_device(args.device),
         batch_size=args.batch_size,
         dry_run=args.dry_run,
+        rescore=args.rescore,
     )
     LOG.info("Run %s (%s), layer %d, output %s%s", config.run_tag,
              "blind" if config.blind else "unblinded", config.target_layer,
@@ -1934,13 +2028,14 @@ def main() -> int:
     client = None
     completed: dict[int, dict] = {}
     if not config.dry_run:
-        env_file = args.env_file or Path(__file__).parent / ".env"
-        n_loaded = load_dotenv(env_file)
-        if n_loaded:
-            LOG.info("Loaded %d variable(s) from %s", n_loaded, env_file)
-        client = _make_client()
-        if client is None:
-            return 1
+        if not config.rescore:
+            env_file = args.env_file or Path(__file__).parent / ".env"
+            n_loaded = load_dotenv(env_file)
+            if n_loaded:
+                LOG.info("Loaded %d variable(s) from %s", n_loaded, env_file)
+            client = _make_client()
+            if client is None:
+                return 1
         try:
             check_run_config(config.output_dir, config.resume_key(chosen))
         except ValueError as exc:
@@ -1950,6 +2045,9 @@ def main() -> int:
         if completed:
             LOG.info("Resuming: %d feature(s) already described in %s",
                      len(completed), _resume_path(config.output_dir).name)
+        n_rescored = sum(rescore_result(r) for r in completed.values())
+        if n_rescored:
+            LOG.info("Rescored %d logged feature(s) under the current r rule", n_rescored)
         # A feature can change stratum between runs without its description
         # becoming wrong: adding Phase 8 promotes features into `causal` that a
         # Phase-8-less run filed under `concept` or `unexplained`, since causal
@@ -1963,6 +2061,11 @@ def main() -> int:
 
     todo = [fi for fi in feature_ids if fi not in completed]
     results: list[dict] = [completed[fi] for fi in feature_ids if fi in completed]
+    if config.rescore and todo:
+        LOG.error("--rescore: %d selected feature(s) have no record in %s (first: %s); "
+                  "rescoring would need API calls.", len(todo),
+                  _resume_path(config.output_dir).name, todo[:5])
+        return 1
     prepared: dict[int, tuple[list[TokenExample], list[TokenExample]]] = {}
     skipped = failed = 0
     stopped = False
@@ -2034,6 +2137,10 @@ def main() -> int:
                 run_shuffled_baseline(client, config, results)
             except (PermanentAPIError, RuntimeError, ValueError) as exc:
                 LOG.error("Shuffled baseline stopped: %s", exc)
+                if config.rescore:
+                    # Rescoring rewrites finished outputs; never replace them
+                    # with a version missing its baseline.
+                    return 1
                 complete = False
         else:
             LOG.warning("Shuffled baseline not run: %d feature(s) failed or the run stopped. "

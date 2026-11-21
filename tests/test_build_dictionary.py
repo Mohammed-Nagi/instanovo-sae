@@ -98,6 +98,8 @@ def tree(tmp_path) -> Path:
 
 
 def _build(root: Path, **kwargs) -> pd.DataFrame:
+    # The fixture's unblinded run, unless a test names the runs itself.
+    kwargs.setdefault("unblinded_run", "unblinded_v1")
     return bd.build_layer(root, 2, **kwargs).to_pandas().set_index("feature_idx")
 
 
@@ -334,7 +336,9 @@ def test_main_writes_parquet_with_schema_metadata_and_is_idempotent(tree):
     meta = {k.decode(): v.decode() for k, v in first.schema.metadata.items()}
     assert meta["schema_version"] == str(DICTIONARY_SCHEMA_VERSION)
     assert meta["layer"] == "2" and meta["n_live_features"] == "4"
-    assert meta["unblinded_run"] == "unblinded_v1" and meta["blinded_run"] == ""
+    # Both description runs default to none: nothing is described unless named.
+    assert meta["unblinded_run"] == "" and meta["blinded_run"] == ""
+    assert first.column("description").null_count == first.num_rows
     assert not any(p.suffix == ".tmp" for p in out.parent.iterdir())
     bd.main(["--root", str(tree), "--layers", "2"])
     assert pq.read_table(out).equals(first)
@@ -369,3 +373,18 @@ def test_local_layer_has_every_live_feature_and_the_finding_2_hubs_measured(laye
     d = table.to_pandas().set_index("feature_idx")
     for feat in FINDING_2_HUBS[layer]:
         assert d.loc[feat, "causal_measured"] and d.loc[feat, "phase8_delta_ce"] > 0.01
+
+
+@pytest.mark.parametrize("tag", ["archive", "Archive", "archive/unblinded_v1",
+                                 "archive\\unblinded_v1", ".."])
+def test_no_run_tag_reads_from_the_archive(tree, tag):
+    archived = tree / "interpret" / "layer_2" / "archive" / "unblinded_v1"
+    archived.mkdir(parents=True)
+    (tree / "interpret" / "layer_2" / "unblinded_v1" / "feature_descriptions.csv").rename(
+        archived / "feature_descriptions.csv")
+    with pytest.raises(ValueError, match="archive"):
+        bd.build_layer(tree, 2, unblinded_run=None, blinded_run=tag)
+    with pytest.raises(ValueError, match="archive"):
+        bd.build_layer(tree, 2, unblinded_run=tag, blinded_run=None)
+    with pytest.raises(SystemExit):
+        bd.main(["--root", str(tree), "--layers", "2", "--unblinded-run", tag])

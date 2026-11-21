@@ -37,3 +37,7 @@ SAE_SCHEMA_VERSION = 1
 # report plus feature_label_associations.csv and per_feature_stats.csv -- so a
 # report whose layout has changed must be rejected rather than half-parsed.
 EVAL_SCHEMA_VERSION = 1
+
+# build_dictionary.py: dictionary/layer_{L}.parquet, the contract between the
+# pipeline and the inspector tool. Recorded in the parquet's schema metadata.
+DICTIONARY_SCHEMA_VERSION = 1

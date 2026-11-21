@@ -10,20 +10,21 @@ Hub inventory
     distinct single-ablated feature:
 
     * ranked by mean delta-CE, rank 1 = the feature whose removal hurts most;
-    * flagged as a hub when delta-CE exceeds ``multiplier`` x the layer median;
+    * ``ratio_to_median``: delta-CE over the layer median |delta-CE|, a
+      descriptive scale only -- there is no hub flag or threshold, because any
+      cut would be an arbitrary label on a continuous effect size;
     * listing the concepts whose single-ablation list contains it
       (``single_concepts``) and the concepts whose group ablation contains it
-      (``group_concepts``). Group membership is what lets one hub dominate a
-      group result.
+      (``group_concepts``). Group membership is what lets one large-effect
+      feature dominate a group result.
 
     The median is taken over the ablated features, not over all d_dict features:
     those are the top F1dom detectors of each concept, a selected population, and
     only they have a single-feature delta-CE in the report. It is the median of
-    |delta-CE|, because at layer 8 the signed median is slightly negative and
-    "10x a negative number" would flag nearly everything.
+    |delta-CE|, because at layer 8 the signed median is slightly negative.
 
     A feature's delta-CE does not depend on which concept it was listed under;
-    the code checks this and fails if a report disagrees.
+    ``per_feature_delta_ce`` checks this and fails if a report disagrees.
 
 F1dom vs ablation selectivity
     ``f1dom_selectivity_correlation`` is the Spearman correlation, across
@@ -36,7 +37,8 @@ Usage (from the repo root)::
     PYTHONPATH=src uv run python -m analysis
     PYTHONPATH=src uv run python -m analysis --root sae_pipeline_outputs --layers 2 4
 
-Outputs under ``<root>/analysis/``: ``hubs.csv`` and ``f1dom_selectivity.csv``.
+Outputs under ``<root>/analysis/``: ``hubs.csv`` (a ranked list, no flag) and
+``f1dom_selectivity.csv``.
 """
 from __future__ import annotations
 
@@ -52,13 +54,12 @@ from scipy.stats import spearmanr
 from schema import EVAL_SCHEMA_VERSION
 
 LAYERS = (2, 4, 6, 8)
-HUB_MULTIPLIER = 10.0
 DEFAULT_ROOT = Path("sae_pipeline_outputs")
 DEFAULT_SEED = 0
 
 HUB_COLUMNS = [
-    "layer", "feature_idx", "rank", "mean_delta_ce", "ratio_to_median", "hub_threshold",
-    "is_hub", "n_single_concepts", "single_concepts", "n_group_concepts", "group_concepts",
+    "layer", "feature_idx", "rank", "mean_delta_ce", "ratio_to_median",
+    "n_single_concepts", "single_concepts", "n_group_concepts", "group_concepts",
 ]
 CORRELATION_COLUMNS = ["layer", "spearman_rho", "p_value", "n_concepts", "n_dropped_nan"]
 
@@ -81,14 +82,14 @@ def load_report(path: Path) -> dict:
     return report
 
 
-def hub_inventory(report: dict, layer: int, multiplier: float = HUB_MULTIPLIER) -> list[dict]:
-    """One row per single-ablated feature, ranked by mean delta-CE (see module docstring)."""
-    per_concept = report["phase_8"]["per_concept"]
+def per_feature_delta_ce(report: dict, layer: int) -> dict[int, float]:
+    """Mean delta-CE of every single-ablated feature in a report (Phase 8, SAE-patched).
 
+    A feature listed under several concepts must carry the same value under each;
+    NaN or disagreement is an error, not something to average over.
+    """
     delta_ce: dict[int, float] = {}
-    single: dict[int, list[str]] = {}
-    group: dict[int, list[str]] = {}
-    for concept, info in per_concept.items():
+    for concept, info in report["phase_8"]["per_concept"].items():
         for entry in info["per_feature_ablation"]:
             feat, d = int(entry["feature_idx"]), float(entry["mean_delta_ce"])
             if math.isnan(d):
@@ -99,16 +100,26 @@ def hub_inventory(report: dict, layer: int, multiplier: float = HUB_MULTIPLIER) 
                     f"under different concepts; it should not depend on the concept"
                 )
             delta_ce[feat] = d
-            single.setdefault(feat, []).append(concept)
+    return delta_ce
+
+
+def hub_inventory(report: dict, layer: int) -> list[dict]:
+    """One row per single-ablated feature, ranked by mean delta-CE (see module docstring)."""
+    delta_ce = per_feature_delta_ce(report, layer)
+    if not delta_ce:
+        raise ValueError(f"layer {layer}: report has no per-feature ablations")
+
+    single: dict[int, list[str]] = {}
+    group: dict[int, list[str]] = {}
+    for concept, info in report["phase_8"]["per_concept"].items():
+        for entry in info["per_feature_ablation"]:
+            single.setdefault(int(entry["feature_idx"]), []).append(concept)
         for feat in info["top_n_features"]:
             group.setdefault(int(feat), []).append(concept)
 
-    if not delta_ce:
-        raise ValueError(f"layer {layer}: report has no per-feature ablations")
     median_abs = median(abs(d) for d in delta_ce.values())
     if median_abs <= 0.0:
-        raise ValueError(f"layer {layer}: median |delta-CE| is {median_abs}; no hub threshold")
-    threshold = multiplier * median_abs
+        raise ValueError(f"layer {layer}: median |delta-CE| is {median_abs}; no ratio to report")
 
     ranked = sorted(delta_ce.items(), key=lambda kv: (-kv[1], kv[0]))
     return [
@@ -118,8 +129,6 @@ def hub_inventory(report: dict, layer: int, multiplier: float = HUB_MULTIPLIER) 
             "rank": rank,
             "mean_delta_ce": d,
             "ratio_to_median": d / median_abs,
-            "hub_threshold": threshold,
-            "is_hub": d > threshold,
             "n_single_concepts": len(single[feat]),
             "single_concepts": "|".join(sorted(single[feat])),
             "n_group_concepts": len(group.get(feat, [])),
@@ -167,21 +176,17 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="pipeline output root")
     parser.add_argument("--layers", type=int, nargs="+", default=list(LAYERS))
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    parser.add_argument("--multiplier", type=float, default=HUB_MULTIPLIER,
-                        help="hub = delta-CE above this multiple of the layer median |delta-CE|")
     args = parser.parse_args(argv)
 
     hub_rows: list[dict] = []
     corr_rows: list[dict] = []
     for layer in args.layers:
         report = load_report(report_path(args.root, layer, args.seed))
-        rows = hub_inventory(report, layer, args.multiplier)
+        rows = hub_inventory(report, layer)
         corr = f1dom_selectivity_correlation(report, layer)
         hub_rows += rows
         corr_rows.append(corr)
-        hubs = [r for r in rows if r["is_hub"]]
-        print(f"layer {layer}: {len(rows)} ablated features, {len(hubs)} hubs "
-              f"(threshold {rows[0]['hub_threshold']:.2e}); top: "
+        print(f"layer {layer}: {len(rows)} ablated features; top: "
               + ", ".join(f"F{r['feature_idx']} {r['mean_delta_ce']:+.3f}" for r in rows[:3]))
         print(f"         F1dom vs selectivity: rho {corr['spearman_rho']:+.3f} "
               f"(p {corr['p_value']:.2f}, n {corr['n_concepts']}, dropped {corr['n_dropped_nan']})")

@@ -27,9 +27,11 @@ Headline numbers, all from the runs these files record:
   0.648 / 0.569 / 0.646 / 0.616.
 - **Depth organisation.** Mean peak layer per concept family runs monotonically from 2.0
   (peptide length, intensity) to 8.0 (fragment charge, cleavage specificity).
-- **Association is not use.** Rank correlation between `F1dom` and ablation selectivity is
-  +0.04 / +0.53 / +0.13 / +0.06 across the four depths. Only the structural positive control is
-  causally significant at all of them.
+- **Association is not use.** Spearman correlation, across concepts, between a concept's best
+  `F1dom` among its single-ablated detectors and the selectivity of its group ablation is
+  +0.23 / -0.15 / -0.05 / +0.17 across the four depths (n = 35 concepts per layer, 15 dropped for
+  undefined selectivity; p >= 0.18 at every depth; `python -m analysis` reproduces it). Only the
+  structural positive control is causally significant at all of them.
 
 ## Layout
 
@@ -138,10 +140,13 @@ python src/interpret.py \
 in precedence order: `causal` (needs Phase 8), `unexplained` (the discovery set: activation mass
 on peaks the theory cannot label), `concept` (positive control), `unlabelled`.
 
-Concept labels are withheld from prompts by default, so any chemistry named is inferred from
-spectra alone. Each description is scored by showing held-out examples without activations, asking
-the model to predict each, and correlating against measured values. Results append to a resume log
-as each feature completes, so an interrupted run does not pay twice.
+Only the `concepts` column is withheld from prompts. The prompts behind the released descriptions
+(`paper_artifacts/feature_descriptions/`) still carried the annotator's matched-ion labels,
+neighbour-peak labels and the true peptide sequence, so those descriptions were generated with
+annotation labels and the true peptide in the prompt and are not inferred from spectra alone. A
+blinded mode is in progress. Each description is scored by showing held-out examples without
+activations, asking the model to predict each, and correlating against measured values. Results
+append to a resume log as each feature completes, so an interrupted run does not pay twice.
 
 Expect `unlabelled` to come back empty. With 12,288 features against 50 concepts, everything that
 fires appreciably picks up some significant association, leaving that pool to the near-dead tail.

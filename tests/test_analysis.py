@@ -1,6 +1,6 @@
 """Tests for analysis.py.
 
-Run from the repo root: ``PYTHONPATH=src uv run pytest tests``.
+Run from the repo root: ``PYTHONPATH=src uv run python -m pytest tests``.
 
 The released reports in paper_artifacts/ are tracked, so the Finding 2 and
 Finding 3 checks run anywhere. They pin the reproduced numbers, which makes a
@@ -43,8 +43,8 @@ def released() -> dict[int, dict]:
 # --- synthetic cases -------------------------------------------------------------
 
 
-def test_hub_flag_ranking_and_membership():
-    # |delta-CE| values 0.001, 0.001, 0.002, 0.5 -> median 0.0015, threshold 0.015
+def test_ranking_and_membership():
+    # |delta-CE| values 0.001, 0.001, 0.002, 0.5 -> median 0.0015
     report = _report({
         "a": _concept([_entry(1, 0.001), _entry(2, 0.5)], group=[2, 3]),
         "b": _concept([_entry(2, 0.5), _entry(3, 0.002), _entry(4, 0.001)], group=[4]),
@@ -52,22 +52,30 @@ def test_hub_flag_ranking_and_membership():
     rows = analysis.hub_inventory(report, layer=2)
     assert [r["feature_idx"] for r in rows] == [2, 3, 1, 4]  # rank by delta-CE, ties by index
     assert [r["rank"] for r in rows] == [1, 2, 3, 4]
-    assert [r["is_hub"] for r in rows] == [True, False, False, False]
-    hub = rows[0]
-    assert hub["single_concepts"] == "a|b" and hub["n_single_concepts"] == 2
-    assert hub["group_concepts"] == "a" and hub["n_group_concepts"] == 1
-    assert hub["hub_threshold"] == pytest.approx(0.015)
-    assert hub["ratio_to_median"] == pytest.approx(0.5 / 0.0015)
+    top = rows[0]
+    assert top["single_concepts"] == "a|b" and top["n_single_concepts"] == 2
+    assert top["group_concepts"] == "a" and top["n_group_concepts"] == 1
+    assert top["ratio_to_median"] == pytest.approx(0.5 / 0.0015)
+    assert "is_hub" not in top and "hub_threshold" not in top
     assert rows[1]["feature_idx"] == 3 and rows[1]["group_concepts"] == "a"
     assert rows[2]["feature_idx"] == 1 and rows[2]["group_concepts"] == ""
 
 
-def test_negative_signed_median_still_gives_a_sane_threshold():
+def test_ratio_uses_median_of_absolute_values():
+    # signed median is -0.00025, |median| = 0.0015; a signed median would flip the ratios' sign
     report = _report({"a": _concept(
         [_entry(1, -0.002), _entry(2, -0.001), _entry(3, 0.0005), _entry(4, 0.05)], group=[])})
     rows = {r["feature_idx"]: r for r in analysis.hub_inventory(report, layer=8)}
-    assert rows[4]["is_hub"]
-    assert not rows[1]["is_hub"] and not rows[2]["is_hub"] and not rows[3]["is_hub"]
+    assert rows[4]["ratio_to_median"] == pytest.approx(0.05 / 0.0015)
+    assert rows[1]["ratio_to_median"] == pytest.approx(-0.002 / 0.0015)
+
+
+def test_per_feature_delta_ce_returns_one_value_per_feature():
+    report = _report({
+        "a": _concept([_entry(1, 0.01), _entry(2, 0.02)], group=[]),
+        "b": _concept([_entry(2, 0.02)], group=[]),
+    })
+    assert analysis.per_feature_delta_ce(report, layer=2) == {1: 0.01, 2: 0.02}
 
 
 def test_inconsistent_delta_ce_across_concepts_fails_loudly():
@@ -125,10 +133,10 @@ FINDING_2_HUBS = {
 
 
 @pytest.mark.parametrize("layer", analysis.LAYERS)
-def test_finding_2_hubs_are_flagged_with_the_reported_delta_ce(released, layer):
+def test_finding_2_hubs_rank_at_the_top_with_the_reported_delta_ce(released, layer):
     rows = {r["feature_idx"]: r for r in analysis.hub_inventory(released[layer], layer)}
     for feat, expected in FINDING_2_HUBS[layer].items():
-        assert rows[feat]["is_hub"], f"L{layer} F{feat} not flagged"
+        assert rows[feat]["rank"] <= 3, f"L{layer} F{feat} ranks {rows[feat]['rank']}"
         assert rows[feat]["mean_delta_ce"] == pytest.approx(expected, abs=5e-4)
 
 
@@ -160,11 +168,14 @@ def test_finding_3_correlations_reproduce(released):
     assert rho[8] == pytest.approx(0.168, abs=5e-3)
 
 
-def test_readme_correlations_are_not_reproduced(released):
-    # README states +0.04 / +0.53 / +0.13 / +0.06. No code produced them; the
-    # recomputation disagrees, most visibly at layer 4 (+0.53 claimed).
-    rho4 = analysis.f1dom_selectivity_correlation(released[4], 4)["spearman_rho"]
-    assert abs(rho4 - 0.53) > 0.3
+def test_readme_correlations_match_the_code(released):
+    # The README quotes these values to two decimals; they must be what the code gives.
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    for layer in analysis.LAYERS:
+        rho = analysis.f1dom_selectivity_correlation(released[layer], layer)["spearman_rho"]
+        quoted = f"{rho:+.2f}"
+        assert quoted in readme, f"README does not quote layer {layer}'s rho {quoted}"
+    assert "+0.53" not in readme  # the earlier, unreproducible claim
 
 
 # --- CLI -------------------------------------------------------------------------

@@ -150,6 +150,9 @@ CONTEXT_PEAKS = 6
 
 DEFAULT_MODEL = "gpt-4o"
 
+# The repo root's .env, beside .env.example (this file is src/interpret.py).
+DEFAULT_ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+
 # Shuffled-description predictions per feature, for the baseline null.
 DEFAULT_N_SHUFFLES = 3
 # description_beats_baseline: r above this percentile of the layer's shuffled r.
@@ -1173,8 +1176,8 @@ def _make_client():
         return None
     if not os.environ.get("OPENAI_API_KEY"):
         LOG.error(
-            "OPENAI_API_KEY is not set. Put it in a .env file beside this script "
-            "(see .env.example), export it, or pass --env-file."
+            "OPENAI_API_KEY is not set. Put it in .env at the repo root (see "
+            ".env.example there), export it, or pass --env-file."
         )
         return None
     return OpenAI()
@@ -1812,8 +1815,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--env-file", type=Path, default=None,
                    help="File of KEY=value pairs holding OPENAI_API_KEY. Defaults to "
-                        "'.env' beside this script. Existing environment variables "
-                        "take precedence over the file.")
+                        "'.env' at the repo root, beside .env.example. Existing "
+                        "environment variables take precedence over the file.")
     p.add_argument("--max-tokens", type=int, default=2048)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="auto",
@@ -2029,7 +2032,7 @@ def main() -> int:
     completed: dict[int, dict] = {}
     if not config.dry_run:
         if not config.rescore:
-            env_file = args.env_file or Path(__file__).parent / ".env"
+            env_file = args.env_file or DEFAULT_ENV_FILE
             n_loaded = load_dotenv(env_file)
             if n_loaded:
                 LOG.info("Loaded %d variable(s) from %s", n_loaded, env_file)

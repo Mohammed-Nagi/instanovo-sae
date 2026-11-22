@@ -65,10 +65,12 @@ def _report() -> dict:
     }
 
 
-def _descriptions(rows: list[tuple[int, str, float]]) -> pd.DataFrame:
+def _descriptions(rows: list[tuple[int, str, float]], blind: bool = False) -> pd.DataFrame:
+    # interpret.py writes the `blind` column for every run (build_dictionary requires it).
     return pd.DataFrame({
         "feature_idx": [r[0] for r in rows], "stratum": "concept",
         "pearson_r": [r[2] for r in rows], "n_predicted": 12, "summary": [r[1] for r in rows],
+        "blind": blind,
     })
 
 
@@ -90,10 +92,8 @@ def tree(tmp_path) -> Path:
                       "blinded_v1": [(2, "b2", 0.3)]}.items():
         run = tmp_path / "interpret" / "layer_2" / tag
         run.mkdir(parents=True)
-        frame = _descriptions(rows)
-        if tag == "blinded_v1":
-            frame["blind"] = True  # interpret.py writes this column; pre-V1-2 runs lack it
-        frame.to_csv(run / "feature_descriptions.csv", index=False)
+        _descriptions(rows, blind=tag == "blinded_v1").to_csv(run / "feature_descriptions.csv",
+                                                              index=False)
     return tmp_path
 
 
@@ -300,6 +300,15 @@ def test_runs_passed_in_the_wrong_role_raise(tree):
         _build(tree, unblinded_run="blinded_v1")
     with pytest.raises(ValueError, match="passed as blinded"):
         _build(tree, unblinded_run=None, blinded_run="unblinded_v1")
+
+
+@pytest.mark.parametrize("tag, role", [("unblinded_v1", "unblinded_run"), ("blinded_v1", "blinded_run")])
+def test_run_without_blind_column_raises(tree, tag, role):
+    run = tree / "interpret" / "layer_2" / tag / "feature_descriptions.csv"
+    _rewrite_csv(run, lambda frame: frame.drop(columns="blind", inplace=True))
+    kwargs = {"unblinded_run": None, role: tag}
+    with pytest.raises(ValueError, match="no 'blind' column"):
+        _build(tree, **kwargs)
 
 
 def test_missing_named_run_raises(tree):

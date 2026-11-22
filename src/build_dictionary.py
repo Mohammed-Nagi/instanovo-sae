@@ -347,12 +347,16 @@ def build_layer(root: Path, layer: int, seed: int = DEFAULT_SEED,
         if unblinded_run else None
     blinded = load_descriptions(description_path(root, layer, blinded_run), live_set, layer) \
         if blinded_run else None
-    # Runs written before V1-2 have no blind column; those are all unblinded.
+    # Every run interpret.py writes since V1-2 records `blind`. The only runs
+    # without it (pre-V1-2) are archived and unreadable (schema.check_run_tag),
+    # so a missing column means an unknown file, not an unblinded run.
     for frame, tag, expected in ((unblinded, unblinded_run, False), (blinded, blinded_run, True)):
         if frame is None:
             continue
-        flags = (frame["blind"].astype(str).str.lower() == "true") if "blind" in frame.columns \
-            else pd.Series(False, index=frame.index)
+        if "blind" not in frame.columns:
+            raise ValueError(f"layer {layer}: run {tag!r} has no 'blind' column, so whether it "
+                             f"was written blind is unknown; rerun it with interpret.py")
+        flags = frame["blind"].astype(str).str.lower() == "true"
         if (flags != expected).any():
             raise ValueError(f"layer {layer}: run {tag!r} is passed as "
                              f"{'blinded' if expected else 'unblinded'} but its CSV says otherwise")

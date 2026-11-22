@@ -278,8 +278,8 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a.
 
 ## Behaviour changes
 
-Changes to existing pipeline modules, each meant to preserve behaviour, with the
-tests that show it (`tests/test_inspector_runtime.py`).
+Changes to existing pipeline modules, each meant to preserve behaviour unless
+stated, with the tests that show it (V1-4a's in `tests/test_inspector_runtime.py`).
 
 - V1-4a, `instanovo_io.make_dataloader`: builds its TransformerDataProcessor
   through the new `make_processor` (same arguments; `use_spectrum_utils=True`,
@@ -302,6 +302,19 @@ tests that show it (`tests/test_inspector_runtime.py`).
   flag, default False (the batch annotator's all-noise-with-warning behaviour
   is unchanged); the inspector passes True so a failed annotation raises.
   Shown by `test_strict_annotation_raises_instead_of_all_noise`.
+- 2026-11-22, `build_dictionary.build_layer`: a description run without a
+  `blind` column now raises instead of being read as unblinded. Only pre-V1-2
+  runs lacked the column; they are archived and unreadable
+  (`schema.check_run_tag`), and all eight live runs (blind_v1, unblinded_v2 ×
+  4 layers) carry it, so the dictionary build is unchanged. The test fixture now
+  writes `blind` for every run. Shown by `test_run_without_blind_column_raises`
+  and the existing dictionary tests.
+- 2026-11-22, `interpret.py`: the default `--env-file` is the repo root's `.env`
+  (beside `.env.example`, where the README and the real key put it), not
+  `src/.env`; error and help text say so. Nothing relied on the old default:
+  no `src/.env` exists, the Docker/AIchor ignore files ship only `src/*.py`, and
+  `run_pipeline.sh` passes `--env-file` from `INTERPRET_ENV_FILE`. Shown by
+  `test_default_env_file_is_the_repo_root_dotenv`.
 
 ## Backlog (after v1; do not start early)
 
@@ -465,3 +478,4 @@ any result on the test split must state it.
 - 2026-11-22 — V1-4a follow-ups. (1) Dictionary `causal_provenance` for measured features now ends "targets ignore modifications for ~10% of spectra (Finding 5)" (`0522bd4`): ~10%, not 13%, because 13% was chunk 0 alone; over the local part of Phase 8's spectra (chunks 0–1) 208/2,048 = 10.2% are modified. All four layers rebuilt, counts unchanged; Phase 7/8 rerun moved to the GPU backlog. (2) Accuracy check, `python -m inspector.runtime accuracy --parquet <HF test> --n 200 --seed 0` (200 random yeast test spectra, 48 with a modified true peptide): our 5-beam BeamSearchDecoder 123/200 exact (modified_sequence in InstaNovo tokens, I=L) = 0.615 [Wilson 95% CI 0.546, 0.680]; InstaNovo's own peptide recall (Metrics, mass-matched residues) 0.635, aa recall 0.646; 167/200 meet the precursor (min |ppm| over isotope 0–1 ≤ 20, InstaNovo's filter_precursor_ppm) and every exact prediction is among them; exact 106/152 unmodified vs 17/48 modified; median 4.2 s/spectrum. Greedy (InstaNovo 1.1.0's predict.py default, num_beams 1, before InstaNovo+ refinement): 0.570 [0.501, 0.637], recall 0.590, 142/200 meet precursor, 1.0 s. Published: InstaNovo v1.1 yeast peptide accuracy 0.618 at full coverage, knapsack beam search, zero-shot (instadeepai.github.io/InstaNovo/explanation/performance; I/L treatment not stated; InstaNovo+ refined 0.645). Our setup is in line with it, so no stop. Not run: knapsack beam search (chart 40,000,001 × 33 bools plus a pure-Python DFS over up to 40M masses; too much for this machine). Settings vs 1.1.0: 1.1.0 ships its own older BeamSearchDecoder; we run 1.2.2's with the 1.1.0 weights; max_length 40 in both; 1.1.0 preprocesses with spectrum_utils (`SpectrumDataset._process_peaks(use_sus_preprocess=True)`), as we do. Some true peptides exceed max_length 40 and cannot be predicted. (3) `checkpoints/instanovo_v1.1.0.ckpt` replaced with the full release asset: 1,136,412,059 bytes (GitHub's listed size; no published digest), sha256 c75d1f80fcf912031ed348ffdef4894acc09fa8142d13fec2c269a2f48df564b, pinned in `test_default_checkpoint_is_the_v1_1_0_release`. CLI and `Inspector` default to it, anchored at the repo root; tests no longer fall back to InstaNovo's cache. (4) Slim JSON (schema 2) is V1-4b's first step. 127 tests pass.
 - 2026-11-22 — STATUS moved from `docs/STATUS.md` to the repo root; `STATUS.md` and `CLAUDE.md` are now committed (repo is public; checked for secrets), `docs/` stays gitignored. E1 moved ahead of V1-4b and specified (strong baseline, raw-activation control, peptide-grouped CV, paired AUROC differences). SAE-fit calibration added to V1-5; the backlog's corpus-FVE item folded into it.
 - 2026-11-22 — E1 planned, then moved to v1.1 as V1.1-3 (pre-specified, for the paper; the tool's v1 does not depend on it) with a revised design: Winnow baseline, top-32 class-mean-difference selection, random-encoder control S_rand in place of the raw-activation block, gradient boosting. Beam margin is available from the decoder (`return_beam`, already passed). Finding 7 added (every test-split chunk was SAE training data, with file and log evidence); V1-4c (audit case study) added after V1-4b; two cluster backlog items (exclude the test split at retraining; v1.2.0 is now InstaNovo's default model). Housekeeping: CLAUDE.md and STATUS.md tracked, `docs/` stays ignored (`4cea931`). No code changed.
+- 2026-11-22 — Public-facing fixes (`c1b7c35`), then a staleness audit: stale docs and comments fixed and the V1-7 README note extended (`b1ef982`); `build_dictionary` raises on a description run without a `blind` column and `interpret.py` defaults `--env-file` to the repo-root `.env` (see Behaviour changes). Rebuilding layers 2/4/6 in memory with `blind_v1` reproduces the stored dictionaries exactly. `extract.load_layer_activations` (unused) kept; `run_pipeline.sh` Step 6 stays in the backlog. 130 tests pass. No API calls.

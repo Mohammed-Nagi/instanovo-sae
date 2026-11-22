@@ -550,3 +550,10 @@ def test_interpret_refuses_an_archive_run_tag(monkeypatch, tag):
         "--sae-checkpoint", "c.pt", "--output-dir", "o", "--target-layer", "2",
         "--run-tag", tag])
     assert it.main() == 2
+
+
+def test_default_env_file_is_the_repo_root_dotenv():
+    # .env.example and the README put the key in the repo root's .env, not src/.
+    repo_root = Path(__file__).resolve().parents[1]
+    assert it.DEFAULT_ENV_FILE == repo_root / ".env"
+    assert (it.DEFAULT_ENV_FILE.parent / ".env.example").is_file()

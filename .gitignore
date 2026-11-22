@@ -50,11 +50,9 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Research documents and assistant config -- excluded from the anonymous
-# submission: these identify the author, institution and supervision context.
-# The whole docs/ tree stays local, alongside CLAUDE.md which points into it.
+# Research documents stay local: docs/ is never committed. Local assistant
+# config (.claude/) likewise. CLAUDE.md and STATUS.md at the root are tracked.
 docs/
-CLAUDE.md
 .claude/
 
 # Local log of submitted AIchor experiment ids.

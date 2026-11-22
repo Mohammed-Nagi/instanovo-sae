@@ -31,7 +31,8 @@ src/                       one source root (run with PYTHONPATH=src)
     ├── dictionary.py      loads the feature dictionary
     └── app.py             dashboard                                      (V1-6, not yet)
 tests/                     pytest
-paper_artifacts/           released report.json per layer, description CSVs (read-only)
+paper_artifacts/           released report.json per layer, description CSVs (unblinded,
+                           Finding 1) (read-only)
 run_pipeline.sh            pipeline orchestration
 STATUS.md                  task list, findings, backlog, log
 docs/                      paper material (gitignored, local only)

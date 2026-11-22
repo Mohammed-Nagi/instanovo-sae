@@ -199,8 +199,8 @@ CROSS_LAYER_TOKENS="${CROSS_LAYER_TOKENS:-100000}"
 #
 # The key is read from a file, never from the environment of this script and
 # never from the manifest, so it stays out of git and out of `ps`. Point
-# INTERPRET_ENV_FILE at a file holding OPENAI_API_KEY=sk-... . See
-# docs/aichor_deployment.md for placing one on the PVC.
+# INTERPRET_ENV_FILE at a file holding OPENAI_API_KEY=sk-... ; on the cluster,
+# place it on the PVC (the Step 6 example below uses /app/fm_mount/secrets/).
 RUN_INTERPRET="${RUN_INTERPRET:-0}"
 INTERPRET_ENV_FILE="${INTERPRET_ENV_FILE:-}"
 INTERPRET_STRATA="${INTERPRET_STRATA:-}"          # blank = interpret.py's default set

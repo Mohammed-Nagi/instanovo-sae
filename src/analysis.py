@@ -1,7 +1,8 @@
 """analysis.py -- post-hoc analysis over the released evaluate.py reports.
 
-Everything here reads only each layer's ``report.json`` (Phase 8 results) and
-needs neither torch nor the activation chunks, so it runs on any machine.
+Everything here reads each layer's ``report.json`` (Phase 8 results) and, with
+``--descriptions``, the interpret.py description runs. It needs neither torch nor
+the activation chunks, so it runs on any machine.
 
 Hub inventory
     Phase 8 ablates, for every concept, its top ``ablation_per_feature_top``

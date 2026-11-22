@@ -67,8 +67,8 @@ spec:
       # The PVC is the only real filesystem here: AIchor does not mount its
       # buckets. Bucket storage is reached separately, over S3 -- see the publish
       # step at the end of run_pipeline.sh.
-      # Redacted for anonymous review: the real name identifies the cluster and
-      # therefore the institution. Substitute your own PVC name to run this.
+      # Redacted: the real name identifies a private cluster and is useless
+      # outside it. Substitute your own PVC name to run this.
       - name: "<PVC-NAME>"
         mountPoint: "app/fm_mount"
   debug:

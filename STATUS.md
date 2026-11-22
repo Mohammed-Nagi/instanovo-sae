@@ -7,7 +7,8 @@ move new ideas to the backlog.
 
 Done when: a scientist can load a benchmark spectrum in the dashboard, see
 InstaNovo's prediction, inspect the active features on any peak at any layer
-with honest labels and trust indicators, and ablate a feature to see the effect
+with honest labels and evidence indicators (association, causal and
+description coverage, with their effect sizes), and ablate a feature to see the effect
 on each predicted residue.
 
 Open, in order: V1-4b, V1-4c, V1-5, V1-6, V1-2c (when API credit is
@@ -18,6 +19,8 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a.
       mean ΔCE, flag features > 10× the layer median, list the concept groups
       each falls in. Check against Finding 2. Also recompute the F1dom-vs-
       selectivity rank correlation per layer (Finding 3), one function, no more.
+      (The flag was removed in V1-3: `hubs.csv` is a ranked list with
+      `ratio_to_median`.)
 - [x] **V1-2a Blinded interpretation: code** — `src/interpret.py` gets
       `--blind` (no `matched_ion`, neighbour labels, `peptide_proforma`;
       `token_kind` keeps the latent marker; own preamble), a spectrum-level
@@ -88,6 +91,8 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a.
       `description_beats_baseline`; the last stays null until V1-2 defines it,
       never true for unblinded) — no combined score or trust level. Works with
       partial descriptions. Existing run moves to `interpret/layer_L/unblinded_v1/`.
+      (Since then: V1-2a defined `description_beats_baseline`, and V1-2b moved
+      unblinded_v1 to `interpret/layer_L/archive/`.)
 - [x] **V1-4a Runtime forward pass** (`2a3166c`) — `src/inspector/runtime.py`,
       `dictionary.py`. Input: a raw spectrum (m/z array, intensity array,
       precursor m/z, charge), preprocessed by InstaNovo's own pipeline via
@@ -144,9 +149,9 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a.
       hypothesis for each failure; test it by exact ablation; record what
       held and what didn't. Candidates feed the V1-5 demo set.
 - [ ] **V1-5 Data for the tool** — feature examples; demo set from the HF test
-      split. Verify that chunk 520's spectrum IDs start at row 532,480 and that
-      the SAE validation chunks are 17, 116, 135, 141, 230, 292, 316, 397, 448,
-      462, 489, 495. Calibrate the per-spectrum SAE-fit indicator: the
+      split. Verified by Finding 7 from code and logs: chunk 520's spectrum
+      IDs start at row 532,480, and the SAE validation chunks are 17, 116, 135,
+      141, 230, 292, 316, 397, 448, 462, 489, 495. Calibrate the per-spectrum SAE-fit indicator: the
       per-spectrum centred FVE is not comparable to the corpus FVE in the
       eval reports, so compute its distribution per layer over local
       spectra and show a spectrum's value as a percentile of that reference
@@ -154,11 +159,36 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a.
       metadata).
 - [ ] **V1-6 Dashboard** — `src/inspector/app.py`, Streamlit.
       Spectrum plot with peaks coloured by annotation, layer selector, per-peak
-      feature panel, feature card (labels, trust, top examples), ablate button
+      feature panel, feature card (labels, evidence indicators, top examples), ablate button
       showing per-residue change, an "encoder-only" scope note.
 - [ ] **V1-7 README** — Update README claims once all work is finished.
-      (Still stale: the discovery-vs-concept claim, lines 24–27, r 0.806 vs
-      0.648 from label-leaking descriptions; the blinded result is in V1-2b.)
+      Still stale (README line numbers as of 2026-11-22):
+      - 10: "Code for the paper of the same name". The paper is on hold, and
+        the repo's goal is now the tool.
+      - 17–18: the results table lists the released descriptions without
+        saying they were written with labels and the true peptide in the
+        prompt (only said at 150–152).
+      - 22–23: "over 99.5% of sequencing loss preserved". Phase 7
+        teacher-forced the bare sequence (Finding 5).
+      - 24–27: the discovery-vs-concept claim, r 0.806 vs 0.648, from
+        label-leaking descriptions; the blinded result is in V1-2b.
+      - 28–29: depth organisation rests on argmax over near-ties (Finding 3).
+      - 33–34: "Only the structural positive control is causally significant
+        at all of them" is unsupported (backlog, layer-6 sel_z = 1.97).
+      - 38–47: the layout table lacks `analysis.py`, `build_dictionary.py`,
+        `inspector/`, `tests/`, `STATUS.md`, `CLAUDE.md`. 49: "Four sequential
+        stages … plus interpret.py" omits analysis, the dictionary and the tool.
+      - 57–58: "Only four upstream symbols"; there are eight
+        (`instanovo_io.py` docstring).
+      - 70–71: `MODEL_PATH` setup omits the repo default
+        `checkpoints/instanovo_v1.1.0.ckpt`; `.env` lives at the repo root.
+      - 95: `RUN_INTERPRET=1` fails until Step 6 passes `--run-tag` (backlog).
+      - 178–190: the outputs tree lacks `analysis/`, `dictionary/`, `logs/`,
+        `interpret/layer_L/archive/`.
+      - 194–195 and 199: "redacted for review" and "Withheld for anonymous
+        review" are stale now that the author is named (pyproject).
+      - No section on the inspector tool or dashboard. It must state which
+        InstaNovo version the SAEs explain (v1.1.0; backlog item on v1.2.0).
 
 ## v1.1
 
@@ -280,7 +310,7 @@ Tool:
 - Corpus builder: run InstaNovo + the SAEs on an arbitrary spectra file (mgf/mzML/parquet) to produce feature examples, so the dictionary can be rebuilt on other datasets without the extraction pipeline
 
 Pipeline:
-- `run_pipeline.sh` Step 6 does not pass `--run-tag`, which is now required, so it fails loudly. Add `INTERPRET_RUN_TAG`, `INTERPRET_BLIND`, `INTERPRET_CHUNK_INDICES` and `INTERPRET_N_SHUFFLES`. The publish pattern `interpret/layer_*/*` already matches run-tag subdirectories (fnmatch `*` crosses `/`).
+- `run_pipeline.sh` Step 6 does not pass `--run-tag`, which is now required, so it fails loudly. Add `INTERPRET_RUN_TAG`, `INTERPRET_BLIND`, `INTERPRET_CHUNK_INDICES` and `INTERPRET_N_SHUFFLES`. The publish pattern `interpret/layer_*/*` already matches run-tag subdirectories (fnmatch `*` crosses `/`). Also fix the success log line (`run_pipeline.sh:1494`), which still prints the pre-run-tag path `$INTERPRET_OUT/feature_descriptions.csv`.
 - Residue-to-peak attribution (gradient × input / integrated gradients, peak deletion)
 - Failure diagnostics: features that predict wrong residues; I/L, deamidation, K/Q cases
 - Four-way cross-layer matching on the 12 shared local chunks
@@ -317,7 +347,8 @@ Paper: revisit once v1 and the rigour items are done.
 The SAEs are sound; do not retrain. All headline numbers in the released reports
 reproduce exactly. Problems are downstream.
 
-**1. LLM descriptions leak labels (critical).** `format_example_table` in
+**1. LLM descriptions leak labels (critical; addressed in V1-2a/V1-2b, and
+the dictionary uses blinded runs only).** `format_example_table` in
 `interpret.py` puts `matched_ion` (the annotation result; 7 of 50 concepts), a
 latent-token marker, neighbour labels (`mz@int/label`) and `peptide_proforma`
 (the ground-truth peptide) in both the description and prediction prompts. Only
@@ -348,7 +379,7 @@ error dropped), which is consistent for the paper but not what the tool needs.
 
 **3. Unsupported claims (medium).** README rank correlations
 (+0.04/+0.53/+0.13/+0.06) have no code; recomputation gives roughly
-+0.23/−0.15/−0.05/+0.17. Immonium null holds at L2 only (L4 sel_z −6.0). The
++0.23/−0.15/−0.05/+0.17 (README corrected in V1-3). Immonium null holds at L2 only (L4 sel_z −6.0). The
 causal description stratum is absent. 143.118 as acetyl-lysine is unexplained
 (no acetylation in the labels); 199.18 recurs in 11 discovery descriptions.
 Lead only: 143.118 → 157.134 is +CH₂, 157.134 → 173.129 is +O.

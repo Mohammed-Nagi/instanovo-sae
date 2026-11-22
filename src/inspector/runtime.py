@@ -33,6 +33,8 @@ CLI (from the repo root)::
         --parquet <raw spectra parquet> --rows 4506 4507 4508
     PYTHONPATH=src uv run python -m inspector.runtime compare-preprocessing \\
         --parquet <raw spectra parquet> --rows 4506 ...
+    PYTHONPATH=src uv run python -m inspector.runtime accuracy \\
+        --parquet <HF test parquet> --n 200 --seed 0
 
 --checkpoint defaults to checkpoints/instanovo_v1.1.0.ckpt and --outputs-root
 to sae_pipeline_outputs/, both under the repo root.

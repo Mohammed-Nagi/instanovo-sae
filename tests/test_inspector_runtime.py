@@ -4,8 +4,8 @@ Run from the repo root: ``PYTHONPATH=src uv run python -m pytest tests``.
 
 Pure tests run anywhere. Data-backed tests need the local InstaNovo checkpoint,
 the chunks and SAEs under ``sae_pipeline_outputs/`` and the HF nine-species
-cache, and skip without them. The checkpoint is $INSTANOVO_CKPT, else the first
-readable of ``checkpoints/instanovo_v1.1.0.ckpt`` and InstaNovo's own cache.
+cache, and skip without them. The checkpoint is $INSTANOVO_CKPT, else
+``checkpoints/instanovo_v1.1.0.ckpt`` (the runtime's default).
 
 Ground truth for the data-backed tests is chunk 0, whose spectra are the first
 1,024 rows of the merged corpus (HF train shard 0, rows 0..1023): all four
@@ -18,10 +18,10 @@ before it is used.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import socket
-import zipfile
 from pathlib import Path
 
 import pyarrow as pa
@@ -32,6 +32,7 @@ import torch
 import annotate
 from inspector.dictionary import FeatureDictionary
 from inspector.runtime import (
+    DEFAULT_CHECKPOINT,
     Explanation,
     Inspector,
     Spectrum,
@@ -51,22 +52,10 @@ HF_SNAPSHOTS = (Path.home() / ".cache" / "huggingface" / "hub"
                 / "datasets--InstaDeepAI--ms_ninespecies_benchmark" / "snapshots")
 
 
-def _readable_zip(path: Path) -> bool:
-    try:
-        with zipfile.ZipFile(path):
-            return True
-    except (OSError, zipfile.BadZipFile):
-        return False
-
-
 def _checkpoint() -> Path | None:
     if os.environ.get("INSTANOVO_CKPT"):
         return Path(os.environ["INSTANOVO_CKPT"])
-    for p in (REPO / "checkpoints" / "instanovo_v1.1.0.ckpt",
-              Path.home() / ".cache" / "instanovo" / "instanovo-v1.1.0.ckpt"):
-        if p.is_file() and _readable_zip(p):
-            return p
-    return None
+    return DEFAULT_CHECKPOINT if DEFAULT_CHECKPOINT.is_file() else None
 
 
 def _hf_train_shard() -> Path | None:
@@ -442,3 +431,42 @@ def test_make_dataloader_reproduces_extraction(inspector, chunk0):
     width = min(ce.size(1), chunk0["baseline_ce"].size(1))
     assert torch.equal(valid[:, :width], chunk0["baseline_decoder_mask"][:n, :width])
     torch.testing.assert_close(ce[:, :width], chunk0["baseline_ce"][:n, :width].float(), rtol=0, atol=1e-4)
+
+
+# The v1.1.0 release asset: GitHub lists this size; it publishes no digest, so
+# the sha256 is the one measured on the downloaded file (2026-11-22).
+V1_1_0_BYTES = 1_136_412_059
+V1_1_0_SHA256 = "c75d1f80fcf912031ed348ffdef4894acc09fa8142d13fec2c269a2f48df564b"
+
+
+@pytest.mark.skipif(not DEFAULT_CHECKPOINT.is_file(), reason="no checkpoint at the default path")
+def test_default_checkpoint_is_the_v1_1_0_release():
+    assert DEFAULT_CHECKPOINT.stat().st_size == V1_1_0_BYTES
+    h = hashlib.sha256()
+    with open(DEFAULT_CHECKPOINT, "rb") as f:
+        for block in iter(lambda: f.read(1 << 22), b""):
+            h.update(block)
+    assert h.hexdigest() == V1_1_0_SHA256
+
+
+def test_normalise_peptide_maps_only_isoleucine_tokens():
+    from inspector.runtime import normalise_peptide
+    assert normalise_peptide(["I", "L", "M[UNIMOD:35]", "[UNIMOD:1]"]) == ["L", "L", "M[UNIMOD:35]", "[UNIMOD:1]"]
+
+
+def test_wilson_interval():
+    from scipy.stats import binomtest
+
+    from inspector.runtime import wilson_interval
+    for k, n in ((120, 200), (0, 10), (37, 41)):
+        ref = binomtest(k, n).proportion_ci(method="wilson")
+        assert wilson_interval(k, n) == pytest.approx((ref.low, ref.high), abs=1e-8)
+
+
+def test_read_raw_records_groups_and_keeps_order(tmp_path):
+    from inspector.runtime import read_raw_records
+    path = tmp_path / "s.parquet"
+    pq.write_table(pa.table({"x": list(range(10))}), path, row_group_size=3)
+    assert [r["x"] for r in read_raw_records(path, [7, 0, 4, 8], ["x"])] == [7, 0, 4, 8]
+    with pytest.raises(IndexError):
+        read_raw_records(path, [10], ["x"])

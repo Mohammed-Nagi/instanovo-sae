@@ -6,9 +6,9 @@ sync with InstaNovo's Python API. The rest of the pipeline imports this module
 and never touches `instanovo.*` directly, which is what lets the pipeline live
 outside the InstaNovo repo and depend on it as an ordinary package.
 
-Only six upstream symbols are used, all imported below:
+Only eight upstream symbols are used, all imported below:
     InstaNovo, TransformerDataProcessor, SpectrumDataFrame, BeamSearchDecoder,
-    ANNOTATED_COLUMN, LEGACY_PTM_TO_UNIMOD
+    GreedyDecoder, Metrics, ANNOTATED_COLUMN, LEGACY_PTM_TO_UNIMOD
 
 All function bodies below are grounded in the InstaNovo source:
   - transformer/model.py   InstaNovo.load / from_pretrained / forward / encoder
@@ -18,6 +18,8 @@ All function bodies below are grounded in the InstaNovo source:
   - common/dataset.py      DataProcessor.collate_fn
   - utils/residues.py      ResidueSet (PAD/SOS/EOS, decode)
   - inference/beam_search.py  BeamSearchDecoder (the inspector's prediction)
+  - inference/greedy_search.py GreedyDecoder (accuracy comparison only)
+  - utils/metrics.py       Metrics (InstaNovo's peptide recall, precursor match)
 """
 from __future__ import annotations
 
@@ -37,6 +39,8 @@ from instanovo.transformer.model import InstaNovo            # transformer/model
 from instanovo.transformer.data import TransformerDataProcessor  # transformer/data.py:21
 from instanovo.utils.data_handler import SpectrumDataFrame   # utils/data_handler.py:50
 from instanovo.inference import BeamSearchDecoder           # inference/beam_search.py:17
+from instanovo.inference import GreedyDecoder               # inference/greedy_search.py:17
+from instanovo.utils.metrics import Metrics                 # utils/metrics.py:12
 from instanovo.constants import ANNOTATED_COLUMN            # constants.py:70, processor's peptide column
 # isort: on
 
@@ -315,6 +319,35 @@ def beam_search(
             max_length=max_length,
             return_beam=num_beams > 1,
         )
+
+
+def greedy_search(
+    model: InstaNovo,
+    batch: dict,
+    device: str,
+    max_length: int,
+) -> dict:
+    """InstaNovo's greedy decoding, the 1.1.0 default (num_beams=1) before
+    InstaNovo+ refinement. 1.1.0's config suppresses "(+25.98)", which the
+    v1.1.0 vocabulary no longer contains, so no residue is suppressed here;
+    disable_terminal_residues_anywhere=True as in 1.1.0. Same return layout as
+    beam_search."""
+    decoder = GreedyDecoder(model, disable_terminal_residues_anywhere=True,
+                            float_dtype=torch.float64)
+    with torch.inference_mode():
+        return decoder.decode(
+            spectra=batch["spectra"].to(device),
+            precursors=batch["precursors"].to(device),
+            max_length=max_length,
+        )
+
+
+def instanovo_metrics(residue_set: Any, isotope_error_range: tuple[int, int] = (0, 1)) -> Metrics:
+    """InstaNovo's Metrics: compute_precision_recall (peptide recall with
+    Novor-style mass matching of residues, 0.1 Da each, 0.5 Da cumulative) and
+    matches_precursor (ppm error at each isotope offset). The same definitions
+    as InstaNovo 1.1.0's predict.py."""
+    return Metrics(residue_set, list(isotope_error_range))
 
 
 def make_dataloader(

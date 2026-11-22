@@ -30,9 +30,12 @@ spectrum_utils as delta masses, never UNIMOD tags.
 CLI (from the repo root)::
 
     PYTHONPATH=src uv run python -m inspector.runtime time \\
-        --checkpoint <instanovo .ckpt> --parquet <raw spectra parquet> --rows 4506 4507 4508
+        --parquet <raw spectra parquet> --rows 4506 4507 4508
     PYTHONPATH=src uv run python -m inspector.runtime compare-preprocessing \\
-        --checkpoint <instanovo .ckpt> --parquet <raw spectra parquet> --rows 4506 ...
+        --parquet <raw spectra parquet> --rows 4506 ...
+
+--checkpoint defaults to checkpoints/instanovo_v1.1.0.ckpt and --outputs-root
+to sae_pipeline_outputs/, both under the repo root.
 """
 from __future__ import annotations
 
@@ -59,6 +62,11 @@ from inspector.dictionary import FeatureDictionary
 from schema import EXPLAIN_SCHEMA_VERSION
 from train import load_sae_from_checkpoint
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+# The InstaNovo v1.1.0 release asset (1,136,412,059 bytes, the size GitHub
+# lists; no published digest, so the sha256 is our own, pinned in the tests).
+DEFAULT_CHECKPOINT = REPO_ROOT / "checkpoints" / "instanovo_v1.1.0.ckpt"
+DEFAULT_OUTPUTS_ROOT = REPO_ROOT / "sae_pipeline_outputs"
 DEFAULT_LAYERS = (2, 4, 6, 8)
 DEFAULT_TOP_K = 8
 MAX_TOP_K = 32
@@ -105,23 +113,40 @@ class Spectrum:
             raise ValueError(f"invalid precursor m/z {self.precursor_mz}")
 
 
+_SPECTRUM_COLUMNS = ["mz_array", "intensity_array", "precursor_mz", "precursor_charge"]
+
+
+def parquet_num_rows(parquet_path: Path) -> int:
+    return pq.ParquetFile(parquet_path).metadata.num_rows
+
+
+def read_raw_records(parquet_path: Path, rows: list[int], columns: list[str]) -> list[dict]:
+    """The given rows of a parquet as dicts, in the order asked, reading each
+    row group that holds any of them once."""
+    pf = pq.ParquetFile(parquet_path)
+    starts = np.cumsum([0] + [pf.metadata.row_group(i).num_rows
+                              for i in range(pf.metadata.num_row_groups)])
+    by_group: dict[int, list[int]] = {}
+    for row in rows:
+        if not 0 <= row < starts[-1]:
+            raise IndexError(f"row {row} outside {parquet_path} ({starts[-1]} rows)")
+        by_group.setdefault(int(np.searchsorted(starts, row, side="right") - 1), []).append(row)
+    found: dict[int, dict] = {}
+    for group, members in by_group.items():
+        table = pf.read_row_group(group, columns=columns)
+        for row in members:
+            found[row] = table.slice(row - int(starts[group]), 1).to_pylist()[0]
+    return [found[row] for row in rows]
+
+
 def read_raw_spectra(parquet_path: Path, rows: list[int]) -> list[Spectrum]:
     """Read rows of a raw-spectra parquet (InstaNovo columns mz_array,
     intensity_array, precursor_mz, precursor_charge), touching only the row
     groups that hold them. spectrum_id is "<file stem>:<row>"."""
-    pf = pq.ParquetFile(parquet_path)
-    starts = np.cumsum([0] + [pf.metadata.row_group(i).num_rows
-                              for i in range(pf.metadata.num_row_groups)])
-    columns = ["mz_array", "intensity_array", "precursor_mz", "precursor_charge"]
-    out = []
-    for row in rows:
-        if not 0 <= row < starts[-1]:
-            raise IndexError(f"row {row} outside {parquet_path} ({starts[-1]} rows)")
-        group = int(np.searchsorted(starts, row, side="right") - 1)
-        rec = pf.read_row_group(group, columns=columns).slice(row - int(starts[group]), 1).to_pylist()[0]
-        out.append(Spectrum(rec["mz_array"], rec["intensity_array"], rec["precursor_mz"],
-                            rec["precursor_charge"], spectrum_id=f"{Path(parquet_path).stem}:{row}"))
-    return out
+    return [Spectrum(rec["mz_array"], rec["intensity_array"], rec["precursor_mz"],
+                     rec["precursor_charge"], spectrum_id=f"{Path(parquet_path).stem}:{row}")
+            for row, rec in zip(rows, read_raw_records(parquet_path, rows, _SPECTRUM_COLUMNS),
+                                strict=True)]
 
 
 # --- Output -------------------------------------------------------------------
@@ -347,8 +372,8 @@ class Inspector:
 
     def __init__(
         self,
-        instanovo_checkpoint: Path,
-        outputs_root: Path,
+        instanovo_checkpoint: Path = DEFAULT_CHECKPOINT,
+        outputs_root: Path = DEFAULT_OUTPUTS_ROOT,
         layers: tuple[int, ...] = DEFAULT_LAYERS,
         seed: int = 0,
         device: str = "cpu",
@@ -452,10 +477,20 @@ class Inspector:
             raise ValueError("no peak survives preprocessing (m/z range, precursor removal, intensity)")
         return batch
 
-    def predict(self, spectrum: Spectrum, use_spectrum_utils: bool | None = None) -> dict:
-        """Beam search: {"tokens", "log_prob", "token_log_probs"}; tokens empty if no beam completed."""
+    def predict(self, spectrum: Spectrum, use_spectrum_utils: bool | None = None,
+                decoder: str = "beam") -> dict:
+        """Decode: {"tokens", "log_prob", "token_log_probs"}; tokens empty if no beam completed.
+
+        decoder "beam" is what explain() uses; "greedy" (InstaNovo 1.1.0's
+        default before refinement) is for the accuracy comparison only.
+        """
         batch = self.preprocess(spectrum, use_spectrum_utils=use_spectrum_utils)
-        out = instanovo_io.beam_search(self.model, batch, self.device, self.num_beams, self.max_length)
+        if decoder == "beam":
+            out = instanovo_io.beam_search(self.model, batch, self.device, self.num_beams, self.max_length)
+        elif decoder == "greedy":
+            out = instanovo_io.greedy_search(self.model, batch, self.device, self.max_length)
+        else:
+            raise ValueError(f"decoder must be 'beam' or 'greedy', got {decoder!r}")
         tokens = list(out["predictions"][0])
         return {"tokens": tokens,
                 "log_prob": float(out["prediction_log_probability"][0]) if tokens else None,
@@ -697,17 +732,116 @@ def _cmd_compare(args, inspector: Inspector) -> None:
     print(f"{n_diff} of {len(spectra)} predictions differ between use_spectrum_utils True and False")
 
 
+# --- Accuracy check --------------------------------------------------------------
+
+def normalise_peptide(tokens: list[str]) -> list[str]:
+    """Tokens compared at peptide level: I and L are one residue (isobaric)."""
+    return ["L" if t == "I" else t for t in tokens]
+
+
+def wilson_interval(k: int, n: int, z: float = 1.959964) -> tuple[float, float]:
+    """95% Wilson score interval for a binomial proportion k/n."""
+    if n == 0:
+        return float("nan"), float("nan")
+    p = k / n
+    centre = (p + z * z / (2 * n)) / (1 + z * z / n)
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+    return centre - half, centre + half
+
+
+def accuracy_check(inspector: Inspector, parquet_path: Path, rows: list[int],
+                   decoders: tuple[str, ...] = ("beam", "greedy"), precursor_ppm: float = 20.0) -> dict:
+    """Peptide-level accuracy of InstaNovo's prediction against modified_sequence.
+
+    exact: predicted tokens equal the true ones after mapping the dataset's
+    notation to InstaNovo's ("M(+15.99)" -> "M[UNIMOD:35]") and I -> L.
+    instanovo_recall: InstaNovo's own peptide recall (Metrics.compute_precision_recall,
+    mass-matched residues; I/L and other near-isobaric pairs count as equal).
+    meets_precursor: min |ppm| over isotope offsets 0..1 <= precursor_ppm (20,
+    InstaNovo's filter_precursor_ppm), via Metrics.matches_precursor.
+    """
+    rs = inspector.residue_set
+    metrics = instanovo_io.instanovo_metrics(rs)
+    records = read_raw_records(parquet_path, rows, _SPECTRUM_COLUMNS + ["modified_sequence"])
+    truths = [[rs.residue_remapping.get(t, t) for t in rs.tokenize(r["modified_sequence"])]
+              for r in records]
+    modified = [any("[" in t for t in tr) for tr in truths]
+    report = {"n": len(rows), "parquet": str(parquet_path), "precursor_ppm": precursor_ppm,
+              "n_modified_truth": int(sum(modified)), "decoders": {}}
+    for dec in decoders:
+        preds, seconds, exact, meets = [], [], [], []
+        for row, rec, truth in zip(rows, records, truths, strict=True):
+            spec = Spectrum(rec["mz_array"], rec["intensity_array"], rec["precursor_mz"],
+                            rec["precursor_charge"], spectrum_id=str(row))
+            t0 = time.perf_counter()
+            tokens = inspector.predict(spec, decoder=dec)["tokens"]
+            seconds.append(time.perf_counter() - t0)
+            preds.append(tokens)
+            exact.append(bool(tokens) and normalise_peptide(tokens) == normalise_peptide(truth))
+            if tokens:
+                _ok, ppm = metrics.matches_precursor(tokens, rec["precursor_mz"], rec["precursor_charge"])
+                meets.append(min(abs(p) for p in ppm) <= precursor_ppm)
+            else:
+                meets.append(False)
+        _aa_prec, aa_recall, pep_recall, _pep_prec = metrics.compute_precision_recall(truths, preds)
+        n, k = len(rows), int(sum(exact))
+        meet_idx = [i for i, m in enumerate(meets) if m]
+        report["decoders"][dec] = {
+            "exact": k, "exact_rate": k / n, "exact_ci95": wilson_interval(k, n),
+            "instanovo_peptide_recall": pep_recall, "instanovo_aa_recall": aa_recall,
+            "n_empty": sum(not p for p in preds),
+            "meets_precursor": len(meet_idx),
+            "exact_among_meeting": sum(exact[i] for i in meet_idx),
+            "exact_unmodified": sum(e for e, m in zip(exact, modified, strict=True) if not m),
+            "exact_modified": sum(e for e, m in zip(exact, modified, strict=True) if m),
+            "seconds_median": float(np.median(seconds)), "seconds_total": float(sum(seconds)),
+            "examples_wrong": [("".join(truths[i]), "".join(preds[i]))
+                               for i in range(n) if not exact[i]][:10],
+        }
+    return report
+
+
+def _cmd_accuracy(args, inspector: Inspector) -> None:
+    if args.rows:
+        rows = sorted(args.rows)
+    else:
+        rows = sorted(np.random.default_rng(args.seed).choice(
+            parquet_num_rows(args.parquet), size=args.n, replace=False).tolist())
+    rep = accuracy_check(inspector, args.parquet, rows, decoders=tuple(args.decoders))
+    n = rep["n"]
+    print(f"{n} spectra from {Path(args.parquet).name} (seed {args.seed}; rows {rows[0]}..{rows[-1]}); "
+          f"{rep['n_modified_truth']} with a modified true peptide; num_beams {inspector.num_beams}, "
+          f"max_length {inspector.max_length}")
+    for dec, r in rep["decoders"].items():
+        lo, hi = r["exact_ci95"]
+        print(f"[{dec}] exact (I=L) {r['exact']}/{n} = {r['exact_rate']:.3f} [95% CI {lo:.3f}, {hi:.3f}]; "
+              f"InstaNovo peptide recall {r['instanovo_peptide_recall']:.3f}, aa recall "
+              f"{r['instanovo_aa_recall']:.3f}; meets precursor (<= {rep['precursor_ppm']:g} ppm, "
+              f"isotope 0-1) {r['meets_precursor']}/{n}, exact among those {r['exact_among_meeting']}; "
+              f"exact unmodified {r['exact_unmodified']}/{n - rep['n_modified_truth']}, modified "
+              f"{r['exact_modified']}/{rep['n_modified_truth']}; empty {r['n_empty']}; "
+              f"median {r['seconds_median']:.2f} s/spectrum")
+        for truth, pred in r["examples_wrong"][:5]:
+            print(f"    truth {truth}  pred {pred}")
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("command", choices=["time", "compare-preprocessing"])
-    p.add_argument("--checkpoint", type=Path, default=Path("checkpoints/instanovo_v1.1.0.ckpt"))
-    p.add_argument("--outputs-root", type=Path, default=Path("sae_pipeline_outputs"))
+    p.add_argument("command", choices=["time", "compare-preprocessing", "accuracy"])
+    p.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
+    p.add_argument("--outputs-root", type=Path, default=DEFAULT_OUTPUTS_ROOT)
     p.add_argument("--parquet", type=Path, required=True, help="raw spectra parquet (InstaNovo columns)")
-    p.add_argument("--rows", type=int, nargs="+", required=True)
+    p.add_argument("--rows", type=int, nargs="+", help="rows to use (accuracy: default a random sample)")
+    p.add_argument("--n", type=int, default=200, help="accuracy: sample size")
+    p.add_argument("--seed", type=int, default=0, help="accuracy: sampling seed")
+    p.add_argument("--decoders", nargs="+", default=["beam", "greedy"], choices=["beam", "greedy"])
     p.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     args = p.parse_args(argv)
+    if args.command != "accuracy" and not args.rows:
+        p.error(f"{args.command} needs --rows")
     inspector = Inspector(args.checkpoint, args.outputs_root, top_k=args.top_k)
-    {"time": _cmd_time, "compare-preprocessing": _cmd_compare}[args.command](args, inspector)
+    {"time": _cmd_time, "compare-preprocessing": _cmd_compare,
+     "accuracy": _cmd_accuracy}[args.command](args, inspector)
     return 0
 
 

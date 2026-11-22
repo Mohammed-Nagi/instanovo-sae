@@ -32,7 +32,9 @@ What the columns do and do not claim
       otherwise.
     * Causal fields are Phase 8's single-feature mean delta-CE, SAE-patched (the
       reconstruction error is dropped), over the spectra the report states, with
-      no confidence interval. A feature Phase 8 did not ablate on its own is
+      no confidence interval, and teacher-forced on the bare sequence, so the
+      targets of modified peptides (~10% of spectra) omit the modification;
+      the provenance string says so. A feature Phase 8 did not ablate on its own is
       "untested" with a null delta-CE -- not zero and not "unimportant". A
       feature that appears only in a concept's group ablation is untested here.
     * No hub flag, tier, threshold, combined score or ordinal trust level.
@@ -95,6 +97,11 @@ CONCEPT_COUNT_REL_TOL = 1e-3
 UNBLINDED_PROVENANCE = "written with access to annotation labels and the true peptide"
 BLINDED_PROVENANCE = "blinded: annotation labels and the true peptide withheld from the prompt"
 UNTESTED = "untested"
+# Phase 8 (like Phase 7) teacher-forced the dataset's bare `sequence`, so for a
+# modified peptide the delta-CE targets are the unmodified residues (STATUS
+# Finding 5). Measured on the local part of Phase 8's 5,000 spectra: 208 of
+# the 2,048 in chunks 0-1 carry a modification (132/1,024 and 76/1,024).
+PHASE8_TARGET_CAVEAT = "targets ignore modifications for ~10% of spectra (Finding 5)"
 
 _ASSOC_COLUMNS = ["feature_idx", "concept", "f1", "f1_dom", "lift", "n_co", "p_value_bh_significant"]
 _DESCRIPTION_COLUMNS = {"feature_idx", "stratum", "pearson_r", "n_predicted", "summary"}
@@ -113,7 +120,7 @@ def dictionary_path(root: Path, layer: int) -> Path:
 
 
 def _causal_provenance(n_spectra: int) -> str:
-    return f"SAE-patched, mean over {n_spectra:,} spectra, no CI"
+    return f"SAE-patched, mean over {n_spectra:,} spectra, no CI; {PHASE8_TARGET_CAVEAT}"
 
 
 # --- inputs ------------------------------------------------------------------------

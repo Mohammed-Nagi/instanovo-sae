@@ -186,7 +186,9 @@ def test_causal_measured_vs_untested(tree):
     assert list(d["causal_measured"]) == [True, True, False, False]
     assert d.loc[0, "phase8_delta_ce"] == pytest.approx(0.01)
     assert d.loc[2, "phase8_delta_ce"] == pytest.approx(0.03)
-    assert d.loc[0, "causal_provenance"] == "SAE-patched, mean over 5,000 spectra, no CI"
+    assert d.loc[0, "causal_provenance"] == (
+        "SAE-patched, mean over 5,000 spectra, no CI; "
+        "targets ignore modifications for ~10% of spectra (Finding 5)")
     assert d.loc[0, "phase8_n_spectra"] == 5000
     # feature 3 is only in a group ablation: untested on its own, never zero
     assert d.loc[3, "causal_provenance"] == "untested"
@@ -200,7 +202,9 @@ def test_spectrum_count_comes_from_the_report(tree):
     for info in report["phase_8"]["per_concept"].values():
         info["causal"]["n_spectra"] = 1234
     (ev / "report.json").write_text(json.dumps(report))
-    assert _build(tree).loc[0, "causal_provenance"] == "SAE-patched, mean over 1,234 spectra, no CI"
+    assert _build(tree).loc[0, "causal_provenance"] == (
+        "SAE-patched, mean over 1,234 spectra, no CI; "
+        "targets ignore modifications for ~10% of spectra (Finding 5)")
 
 
 def test_differing_spectrum_counts_fail_loudly(tree):

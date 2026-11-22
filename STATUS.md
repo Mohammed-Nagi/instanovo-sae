@@ -10,8 +10,8 @@ InstaNovo's prediction, inspect the active features on any peak at any layer
 with honest labels and trust indicators, and ablate a feature to see the effect
 on each predicted residue.
 
-Open, in order: E1, V1-4b, V1-5, V1-6, V1-2c (when API credit is available),
-V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a.
+Open, in order: V1-4b, V1-4c, V1-5, V1-6, V1-2c (when API credit is
+available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a.
 
 - [x] **V1-1 Hub inventory** — `src/analysis.py`, output `analysis/hubs.csv`.
       From existing per-feature ablations in each layer's report.json: rank by
@@ -126,40 +126,6 @@ V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a.
       6 of 20 test predictions (rows 4506–4525) differ between
       `use_spectrum_utils` True and False, 5 only by I↔L, 1 a different
       peptide.
-- [ ] **E1 Error-detection pilot** (moved ahead of V1-4b, 2026-11-22) — do
-      SAE features add information about whether InstaNovo's prediction is
-      wrong, beyond what a strong baseline already gives? Plan first, then run.
-      - Data: yeast spectra from the HF test split (held out from InstaNovo's
-        training); 5-beam BeamSearchDecoder as in V1-4a, decoder settings
-        recorded. Check and report whether any test-split chunks were in the
-        SAE training data (unsupervised exposure, not a label leak, but it
-        must be stated).
-      - Label: peptide-level correctness, prediction == `modified_sequence`
-        in InstaNovo tokens with I=L (the V1-4a accuracy definition). Spectra
-        whose true peptide exceeds max_length 40 stay in, counted as wrong,
-        and are reported. Residue-level labels are out of scope for E1.
-      - Baseline features: InstaNovo confidence summaries (sequence log p,
-        mean and min per-residue log p), precursor ppm error (min over
-        isotopes 0–1), predicted length, predicted-has-modification,
-        precursor charge, number of peaks. The precursor error is the key
-        one: in V1-4a every exact prediction met the precursor, and
-        modified peptides are a confounder (17/48 vs 106/152 correct).
-      - SAE features: per-layer summaries fixed before any result is seen
-        (e.g. the latent-token code and the max over peak tokens), fed to a
-        regularised logistic regression with the regularisation strength
-        chosen by nested CV.
-      - Control: the same summaries of the raw encoder activations at the
-        same layers, so a gain can be attributed to the SAE basis rather
-        than to the encoder activations themselves.
-      - Evaluation: cross-validation grouped by peptide. AUROC for baseline,
-        SAE, raw, baseline+SAE and baseline+raw, with bootstrap 95% CIs
-        resampling peptides. Headline: the paired difference baseline+SAE
-        minus baseline, and baseline+SAE minus baseline+raw.
-      - All choices above are written into the plan before running; any
-        later change is logged as a deviation with its reason.
-      - The plan states the number of spectra, the expected class balance
-        (~38% wrong at V1-4a's accuracy), and the CPU time (~2.7–4.2 s per
-        spectrum for beam search).
 - [ ] **V1-4b Attribution patching and verify** — first step: slim the
       Explanation JSON as `EXPLAIN_SCHEMA_VERSION` 2. Each listed feature
       carries a per-feature summary instead of its full dictionary row (V1-4a
@@ -173,6 +139,10 @@ V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a.
       The per-peak view uses peak tokens only; latent-token features get a
       separate spectrum-summary panel. First measure the timings (AtP pass,
       exact ablation) on a few spectra. Tests on one spectrum.
+- [ ] **V1-4c Audit case study** — pick 3–5 confidently wrong predictions
+      from the V1-4a accuracy run (seed 0); use the inspector to form a
+      hypothesis for each failure; test it by exact ablation; record what
+      held and what didn't. Candidates feed the V1-5 demo set.
 - [ ] **V1-5 Data for the tool** — feature examples; demo set from the HF test
       split. Verify that chunk 520's spectrum IDs start at row 532,480 and that
       the SAE validation chunks are 17, 116, 135, 141, 230, 292, 316, 397, 448,
@@ -201,6 +171,80 @@ V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a.
 - [ ] **V1.1-2 Descriptions at scale** — pilot a cheaper model on the V1-2
       features against gpt-4o, then describe features in priority order (hubs,
       then by firing rate) with the Batch API; rebuild the dictionary.
+- [ ] **V1.1-3 Error-detection test (pre-specified, for the paper)** (planned
+      as E1 in v1, moved here 2026-11-22: the tool's v1 does not depend on
+      its result). Every choice below is fixed before running; any later
+      change is logged as a deviation with its reason.
+      - Question. Δ₁: do SAE features add information about InstaNovo's
+        errors beyond InstaDeep's own calibration features? Δ₂: is any gain
+        due to learned SAE structure rather than any sparse code of the
+        encoder?
+      - Data: 2,000 HF test rows (yeast, per the HF dataset card; there is no
+        species column), drawn with `np.random.default_rng(1)`, excluding the
+        200 V1-4a accuracy rows (`default_rng(0)`, n = 200). Decoder:
+        InstaNovo 1.2.2 BeamSearchDecoder with the v1.1.0 checkpoint (as in
+        V1-4a); line references are to the installed 1.2.2 package. 5 beams,
+        `Inspector` defaults (float64, max_length 40, `use_spectrum_utils=True`,
+        n_peaks 200), recorded. On this draw: 1,773 peptide groups (bare
+        sequence, I=L; at most 10 spectra per group), 490 with a modified true
+        peptide, 103 with a true peptide longer than 40. Expected ~38.5% wrong
+        (V1-4a 77/200, Wilson 95% [32.0%, 45.4%]), i.e. ~770 wrong.
+      - Labels: wrong = not exact (prediction vs `modified_sequence` in
+        InstaNovo tokens, I=L, one helper shared with `accuracy_check`). True
+        peptides longer than 40 stay in as wrong and are reported. Empty
+        predictions (no beam completed) are excluded and counted.
+      - Baseline B: Winnow's computable features (Mabona et al. 2025, arXiv
+        2509.24952): sequence confidence, signed precursor ppm error, beam
+        margin, ion match rate, ion match intensity fraction (our annotator on
+        the predicted peptide). No retention time (not in the data). Why: it
+        is InstaDeep's own published calibrator, so not a straw man, and
+        margin and ion matches are its most important features. Beam margin =
+        log p(beam 0) − log p(beam 1), in the decoder's own ranking order;
+        negative values allowed; NaN when fewer than two beams complete.
+        Checked: `instanovo_io.beam_search` already passes
+        `return_beam=num_beams > 1` (`src/instanovo_io.py:320`), so
+        `BeamSearchDecoder.decode` returns `predictions_log_probability_beam_{i}`
+        (`inference/beam_search.py:469-486`). Beams are ranked by
+        (meets_precursor, log p) (`beam_search.py:542`), so beam 1 can
+        outscore beam 0; slots beyond the completed beams are padded with
+        −inf (`beam_search.py:532-549`), which becomes NaN.
+        `Inspector.predict` keeps only beam 0 today and needs extending.
+      - SAE features S: latent-token code and max over peak tokens at layers
+        2/4/6/8 (2 × 12,288 × 4 columns). Within each training fold, keep the
+        32 with the largest absolute class-mean difference (Kantamneni et al.
+        2025, ICML). Why: a published, fixed-size selection rule; the list is
+        short enough to inspect and feeds the audit case study (V1-4c).
+      - Control S_rand: per layer, a seeded random encoder of the same shape
+        with the same top-32 per-token sparsity, summarised and selected
+        identically. Why: random SAEs score close to trained ones on sparse
+        probing (Korznikov et al. 2026, arXiv 2602.14111), and a random code
+        also retains most raw-activation information, so this one control
+        replaces the raw-activation block.
+      - Model: `HistGradientBoostingClassifier` with defaults, identical for
+        B, B+S and B+S_rand. Why: Winnow reports a non-monotonic mass-error
+        effect; trees are scale-free (no scaling or rare-feature rules) and
+        need no stacking or nested tuning.
+      - Evaluation: `StratifiedGroupKFold(5, shuffle=True, random_state=0)`,
+        grouped by bare sequence with I=L, the same folds for all models.
+        AUROC (positive = wrong) on pooled out-of-fold predictions. Paired
+        bootstrap over peptide groups (10,000, seed 0). Report
+        Δ₁ = AUROC(B+S) − AUROC(B) and Δ₂ = AUROC(B+S) − AUROC(B+S_rand) with
+        95% CIs, on all spectra and on the precursor-matching subset (≤ 20 ppm,
+        min over isotopes 0–1, as in V1-4a; same predictions, since trees can
+        condition on precursor error). Also report the selected S features,
+        how often each is chosen across folds, and their dictionary
+        descriptions.
+      - Caveats stated with the results: encoder features can only signal
+        spectrum difficulty (the encoder never sees the prediction);
+        in-distribution only (yeast); every test spectrum was SAE training
+        data, unsupervised (Finding 7).
+      - Considered and dropped: the raw-activation block, stacking with
+        nested CV, L2 logistic regression on 98k columns, extra baseline
+        features (length, charge, peak count, has-modification), per-layer
+        models.
+      - Cost: featurisation ~2.5–4.5 s per spectrum (beam search 2.2–4.2 s in
+        V1-4a), ~1.5–2.5 h for 2,000 on this machine, single process, peak RAM
+        ~3 GB.
 
 ## Behaviour changes
 
@@ -263,6 +307,8 @@ Rigour (cluster/GPU):
 - Seed stability (2–3 more seeds per layer)
 - Phase 4 on the updated annotations
 - Check InstaNovo v1.1 training data vs the nine-species benchmark
+- If the SAEs are retrained, exclude the test split (chunks ≥ 515) (Finding 7)
+- InstaNovo v1.2.0 (instanovo-v1.2.0.ckpt) is now the default release model; the SAEs explain v1.1.0. At the next retraining, decide whether to retrain on v1.2.0 (check its preprocessing, since 1.2.x predict passes use_spectrum_utils=False), excluding the test split (Finding 7). The tool and dashboard must state the model version.
 
 Paper: revisit once v1 and the rigour items are done.
 
@@ -333,6 +379,25 @@ fails, which the annotator turns into an all-noise spectrum with a warning. No
 local spectrum has an N-terminal mod; InstaNovo does predict them (e.g.
 `[UNIMOD:385]` on chunk 0 spectrum 4), so the inspector writes the hyphen.
 
+**7. Every test-split chunk (515–624; 515 is mixed) was SAE training data at
+all four layers, for 3 epochs (found 2026-11-22).** `run_pipeline.sh:584-588`
+merges the HF splits in order (`concatenate_datasets([dd[k] for k in
+dd.keys()])`), and `logs/run1_layers2-4/prepare_dataset.log:48-49` gives
+train 499,402, validation 28,572, test 111,312, so the test split is merged
+rows 527,974–639,285. `extract.py:137` writes 1,024 spectra per chunk, in
+dataset order (checked at `extract.py:559`); the extract logs end "Wrote final
+chunk 624 (n_spectra=310)" (624 · 1,024 + 310 = 639,286) and
+`manifest_run{1,3,4}.json` have `n_chunks` 625. Chunk 515 holds rows
+527,360–528,383 (410 of them test); chunks 516–624 are all test. `train.py:775-776`
+splits the manifest's chunks with `_split_chunks` (`train.py:596-600`:
+round(0.02 · 625) = 12 held out by `random.Random(seed)`; `config.json`:
+`val_fraction` 0.02, seed 0, `n_epochs` 3). Every
+`train_layer{2,4,6,8}_seed0.log` starts "613 train chunks, 12 val chunks", and
+recomputing the split gives val chunks 17, 116, 135, 141, 230, 292, 316, 397,
+448, 462, 489, 495, all below 515. The exposure is unsupervised (activations
+only, no labels or peptides), but no test spectrum is unseen by the SAEs, so
+any result on the test split must state it.
+
 ## Log
 
 - 2026-11-20 — Review of paper, thesis and repo; findings above.
@@ -364,3 +429,4 @@ local spectrum has an N-terminal mod; InstaNovo does predict them (e.g.
 - 2026-11-21 — V1-4a done (`2a3166c`): `src/inspector/{runtime,dictionary}.py`, `tests/test_inspector_runtime.py`; 123 tests pass (23 new). Results and timings under V1-4a; refactors under Behaviour changes. Findings 5 (Phase 7/8 CE used bare-sequence targets) and 6 (N-terminal ProForma) added. `use_spectrum_utils=True` is the v1.1.0 checkpoint's standard input (InstaNovo 1.1.0 always used spectrum_utils; only 1.2.x's predict.py passes False), a recorded parameter, not a deviation. The repo checkpoint is truncated; tests and timings used `~/.cache/instanovo/instanovo-v1.1.0.ckpt` (backlog). InstaNovo on the first 40 chunk-0 spectra: 18 correct up to I/L; wrong predictions can miss the precursor by > 10⁴ ppm (beam search keeps them), which the output reports as `precursor_mz_error_ppm`. Beam search uses `max_length` from the checkpoint config (40).
 - 2026-11-22 — V1-4a follow-ups. (1) Dictionary `causal_provenance` for measured features now ends "targets ignore modifications for ~10% of spectra (Finding 5)" (`0522bd4`): ~10%, not 13%, because 13% was chunk 0 alone; over the local part of Phase 8's spectra (chunks 0–1) 208/2,048 = 10.2% are modified. All four layers rebuilt, counts unchanged; Phase 7/8 rerun moved to the GPU backlog. (2) Accuracy check, `python -m inspector.runtime accuracy --parquet <HF test> --n 200 --seed 0` (200 random yeast test spectra, 48 with a modified true peptide): our 5-beam BeamSearchDecoder 123/200 exact (modified_sequence in InstaNovo tokens, I=L) = 0.615 [Wilson 95% CI 0.546, 0.680]; InstaNovo's own peptide recall (Metrics, mass-matched residues) 0.635, aa recall 0.646; 167/200 meet the precursor (min |ppm| over isotope 0–1 ≤ 20, InstaNovo's filter_precursor_ppm) and every exact prediction is among them; exact 106/152 unmodified vs 17/48 modified; median 4.2 s/spectrum. Greedy (InstaNovo 1.1.0's predict.py default, num_beams 1, before InstaNovo+ refinement): 0.570 [0.501, 0.637], recall 0.590, 142/200 meet precursor, 1.0 s. Published: InstaNovo v1.1 yeast peptide accuracy 0.618 at full coverage, knapsack beam search, zero-shot (instadeepai.github.io/InstaNovo/explanation/performance; I/L treatment not stated; InstaNovo+ refined 0.645). Our setup is in line with it, so no stop. Not run: knapsack beam search (chart 40,000,001 × 33 bools plus a pure-Python DFS over up to 40M masses; too much for this machine). Settings vs 1.1.0: 1.1.0 ships its own older BeamSearchDecoder; we run 1.2.2's with the 1.1.0 weights; max_length 40 in both; 1.1.0 preprocesses with spectrum_utils (`SpectrumDataset._process_peaks(use_sus_preprocess=True)`), as we do. Some true peptides exceed max_length 40 and cannot be predicted. (3) `checkpoints/instanovo_v1.1.0.ckpt` replaced with the full release asset: 1,136,412,059 bytes (GitHub's listed size; no published digest), sha256 c75d1f80fcf912031ed348ffdef4894acc09fa8142d13fec2c269a2f48df564b, pinned in `test_default_checkpoint_is_the_v1_1_0_release`. CLI and `Inspector` default to it, anchored at the repo root; tests no longer fall back to InstaNovo's cache. (4) Slim JSON (schema 2) is V1-4b's first step. 127 tests pass.
 - 2026-11-22 — STATUS moved from `docs/STATUS.md` to the repo root; `STATUS.md` and `CLAUDE.md` are now committed (repo is public; checked for secrets), `docs/` stays gitignored. E1 moved ahead of V1-4b and specified (strong baseline, raw-activation control, peptide-grouped CV, paired AUROC differences). SAE-fit calibration added to V1-5; the backlog's corpus-FVE item folded into it.
+- 2026-11-22 — E1 planned, then moved to v1.1 as V1.1-3 (pre-specified, for the paper; the tool's v1 does not depend on it) with a revised design: Winnow baseline, top-32 class-mean-difference selection, random-encoder control S_rand in place of the raw-activation block, gradient boosting. Beam margin is available from the decoder (`return_beam`, already passed). Finding 7 added (every test-split chunk was SAE training data, with file and log evidence); V1-4c (audit case study) added after V1-4b; two cluster backlog items (exclude the test split at retraining; v1.2.0 is now InstaNovo's default model). Housekeeping: CLAUDE.md and STATUS.md tracked, `docs/` stays ignored (`4cea931`). No code changed.

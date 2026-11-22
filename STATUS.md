@@ -382,17 +382,21 @@ local spectrum has an N-terminal mod; InstaNovo does predict them (e.g.
 **7. Every test-split chunk (515–624; 515 is mixed) was SAE training data at
 all four layers, for 3 epochs (found 2026-11-22).** `run_pipeline.sh:584-588`
 merges the HF splits in order (`concatenate_datasets([dd[k] for k in
-dd.keys()])`), and `logs/run1_layers2-4/prepare_dataset.log:48-49` gives
+dd.keys()])`), and
+`sae_pipeline_outputs/logs/run1_layers2-4/prepare_dataset.log:48-49` gives
 train 499,402, validation 28,572, test 111,312, so the test split is merged
 rows 527,974–639,285. `extract.py:137` writes 1,024 spectra per chunk, in
-dataset order (checked at `extract.py:559`); the extract logs end "Wrote final
-chunk 624 (n_spectra=310)" (624 · 1,024 + 310 = 639,286) and
-`manifest_run{1,3,4}.json` have `n_chunks` 625. Chunk 515 holds rows
-527,360–528,383 (410 of them test); chunks 516–624 are all test. `train.py:775-776`
-splits the manifest's chunks with `_split_chunks` (`train.py:596-600`:
-round(0.02 · 625) = 12 held out by `random.Random(seed)`; `config.json`:
-`val_fraction` 0.02, seed 0, `n_epochs` 3). Every
-`train_layer{2,4,6,8}_seed0.log` starts "613 train chunks, 12 val chunks", and
+dataset order (checked at `extract.py:559`); the extract logs
+(`sae_pipeline_outputs/logs/run*/extract.log`) end "Wrote final chunk 624
+(n_spectra=310)" (624 · 1,024 + 310 = 639,286) and
+`sae_pipeline_outputs/extract/manifest_run{1,3,4}.json` have `n_chunks` 625.
+Chunk 515 holds rows 527,360–528,383 (410 of them test); chunks 516–624 are
+all test. `train.py:775-776` splits the manifest's chunks with `_split_chunks`
+(`train.py:596-600`: round(0.02 · 625) = 12 held out by `random.Random(seed)`;
+`sae_pipeline_outputs/sae/layer_L/seed_0/config.json`: `val_fraction` 0.02,
+seed 0, `n_epochs` 3). Every
+`sae_pipeline_outputs/logs/run*/train_layer{2,4,6,8}_seed0.log` starts "613
+train chunks, 12 val chunks", and
 recomputing the split gives val chunks 17, 116, 135, 141, 230, 292, 316, 397,
 448, 462, 489, 495, all below 515. The exposure is unsupervised (activations
 only, no labels or peptides), but no test spectrum is unseen by the SAEs, so

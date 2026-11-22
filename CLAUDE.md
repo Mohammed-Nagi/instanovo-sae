@@ -6,7 +6,7 @@ fragment-ion annotator, an evaluation suite, and LLM feature descriptions.
 ## Goal
 
 An **interpretability tool used alongside InstaNovo**: a Python API plus a
-dashboard that lets InstaDeep scientists inspect a spectrum as the model
+dashboard that lets scientists using InstaNovo inspect a spectrum as the model
 processes it — which SAE features fire on each peak at each layer, what they
 mean, how well that meaning is validated, and what happens to the prediction
 when a feature is ablated. Scope is the encoder; the tool explains what the
@@ -27,7 +27,7 @@ src/                       one source root (run with PYTHONPATH=src)
 ├── analysis.py            post-hoc analysis over eval outputs           (v1, new)
 ├── build_dictionary.py    builds the feature dictionary                  (v1, new)
 └── inspector/             the tool                                       (v1, new)
-    ├── runtime.py         explain(spectrum), ablation
+    ├── runtime.py         explain(spectrum), ablation (V1-4b, not yet)
     ├── dictionary.py      loads the feature dictionary
     └── app.py             dashboard                                      (V1-6, not yet)
 tests/                     pytest
@@ -58,6 +58,7 @@ sae_pipeline_outputs/
 ├── interpret/layer_{L}/archive/      superseded runs (unblinded_v1), provenance only;
 │                                      nothing reads it (schema.check_run_tag)
 ├── analysis/                          outputs of analysis.py
+├── logs/                              pipeline run logs
 └── dictionary/layer_{L}.parquet       the contract between pipeline and tool
 ```
 

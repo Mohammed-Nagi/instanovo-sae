@@ -5,9 +5,8 @@ description = "Sparse autoencoders for interpretability of InstaNovo"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
 license = "Apache-2.0"
-# Withheld for double-blind review; restore at camera-ready.
 authors = [
-    { name = "Anonymous" },
+    { name = "Mohammed Nagi" },
 ]
 keywords = [
     "mechanistic interpretability",

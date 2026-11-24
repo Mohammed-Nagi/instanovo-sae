@@ -34,6 +34,9 @@ import annotate
 from inspector.dictionary import SUMMARY_FIELDS, SUMMARY_KEYS, FeatureDictionary
 from inspector.runtime import (
     DEFAULT_CHECKPOINT,
+    EVIDENCE_AMBIGUOUS,
+    EVIDENCE_FOR_PRED,
+    EVIDENCE_FOR_TRUE,
     LATENT_LABEL,
     SPECTRUM_SUMMARY_KEYS,
     AblationContext,
@@ -45,11 +48,17 @@ from inspector.runtime import (
     ablation_positions,
     ablation_provenance,
     decoder_to_residue_order,
+    differing_region,
+    distinguishing_peaks,
+    evidence_class,
     feature_row,
     fve,
     joint_delta,
+    mean_residue_log_prob,
+    mismatch_type,
     peak_label,
     read_raw_spectra,
+    select_audit_cases,
     top_k_features,
 )
 from schema import DICTIONARY_SCHEMA_VERSION, EXPLAIN_SCHEMA_VERSION
@@ -588,6 +597,121 @@ def test_read_raw_records_groups_and_keeps_order(tmp_path):
     assert [r["x"] for r in read_raw_records(path, [7, 0, 4, 8], ["x"])] == [7, 0, 4, 8]
     with pytest.raises(IndexError):
         read_raw_records(path, [10], ["x"])
+
+
+# --- Audit case selection (V1-4c part A), toy inputs ----------------------------------
+
+def _t(s: str) -> list[str]:
+    return list(s)
+
+
+@pytest.mark.parametrize("a, b, expected", [
+    ("PEPTIDEK", "PEPSIDEK", (3, 4, 4)),       # middle substitution
+    ("APEPK", "GPEPK", (0, 1, 1)),             # first token only
+    ("PEPKA", "PEPKG", (4, 5, 5)),             # last token only
+    ("PEGGK", "PENK", (2, 4, 3)),              # GG <-> N, regions of different length
+    ("AAA", "AA", (2, 3, 2)),                  # suffix may not overlap the prefix
+    ("AA", "AAA", (2, 2, 3)),                  # empty region on one side
+    ("LPEIK", "IPELR", (4, 5, 5)),             # I = L: only the K/R differs
+])
+def test_differing_region(a, b, expected):
+    assert differing_region(_t(a), _t(b)) == expected
+
+
+def test_differing_region_raises_when_equal_up_to_il():
+    with pytest.raises(ValueError):
+        differing_region(_t("PEIK"), _t("PELK"))
+
+
+@pytest.mark.parametrize("a, b, expected", [
+    (["P", "E", "M[UNIMOD:35]", "K"], ["P", "E", "M", "K"], "modification"),
+    (["P", "N[UNIMOD:7]", "K"], ["P", "N", "K"], "modification"),
+    (_t("PEAGK"), _t("PEGAK"), "swap"),
+    (_t("PEAK"), _t("PEGK"), "substitution"),
+    (_t("PAEGK"), _t("PSETK"), "substitution"),
+    (_t("PEGGK"), _t("PENK"), "length change"),
+    (["P", "M[UNIMOD:35]", "A", "K"], ["P", "M", "G", "K"], "other"),
+])
+def test_mismatch_type(a, b, expected):
+    assert mismatch_type(a, b, differing_region(a, b)) == expected
+
+
+def _ann(t: str) -> dict:
+    return {"ion_type": t, "ion_index": 1, "charge": 1, "neutral_loss": ""}
+
+
+def test_distinguishing_peaks():
+    pred = [_ann(t) for t in ("y", "noise", "b", "I", "precursor", "internal", "noise")]
+    true = [_ann(t) for t in ("noise", "y", "b", "noise", "noise", "precursor", "noise")]
+    d = distinguishing_peaks(pred, true)
+    # peak 2 is a fragment under both, peak 4 is precursor (not a fragment), peak 6 noise under both
+    assert d["pred_only"] == [0, 3, 5] and d["true_only"] == [1]
+    assert (d["n_pred_only"], d["n_pred_only_by"], d["n_true_only"], d["n_true_only_by"]) == (3, 1, 1, 1)
+    with pytest.raises(ValueError):
+        distinguishing_peaks(pred, true[:-1])
+
+
+def test_evidence_class():
+    assert evidence_class(0, 0) == EVIDENCE_AMBIGUOUS
+    assert evidence_class(3, 0) == EVIDENCE_FOR_PRED
+    assert evidence_class(0, 1) == EVIDENCE_FOR_TRUE
+    assert evidence_class(4, 2) == EVIDENCE_FOR_TRUE
+
+
+def test_mean_residue_log_prob_excludes_eos():
+    # decoder order: 3 residues then EOS; EOS's CE (5.0) must not count
+    assert mean_residue_log_prob([0.1, 0.2, 0.3, 5.0], 3) == pytest.approx(-0.2)
+    with pytest.raises(ValueError):
+        mean_residue_log_prob([0.1, 0.2], 3)
+
+
+def _cand(row, mean, cls, n_res=10):
+    return {"row": row, "mean_residue_log_prob": mean, "evidence_class": cls,
+            "sum_log_prob": mean * n_res}
+
+
+def test_selection_ranks_by_mean_not_sum():
+    long_ = _cand(1, -0.10, EVIDENCE_AMBIGUOUS, n_res=30)     # sum -3.0
+    short = _cand(2, -0.20, EVIDENCE_AMBIGUOUS, n_res=5)      # sum -1.0, higher
+    ranked, _ = select_audit_cases([short, long_], n_top=1, min_evidence=0)
+    assert [c["row"] for c in ranked] == [1, 2] and ranked[0]["selected"] and not ranked[1]["selected"]
+
+
+def test_selection_tops_up_evidence_for_true():
+    cands = ([_cand(r, -0.01 * r, EVIDENCE_AMBIGUOUS) for r in range(1, 5)]
+             + [_cand(5, -0.05, EVIDENCE_FOR_PRED), _cand(6, -0.06, EVIDENCE_FOR_PRED),
+                _cand(7, -0.07, EVIDENCE_FOR_TRUE), _cand(8, -0.08, EVIDENCE_AMBIGUOUS),
+                _cand(9, -0.09, EVIDENCE_FOR_TRUE), _cand(10, -0.10, EVIDENCE_FOR_TRUE)])
+    ranked, summary = select_audit_cases(cands)
+    sel = {c["row"]: c["selection_reason"] for c in ranked if c["selected"]}
+    # the top 5 holds no 'evidence for true'; 'favours prediction' (rows 5, 6) does not count
+    assert sel == {1: "top 5", 2: "top 5", 3: "top 5", 4: "top 5", 5: "top 5",
+                   7: f"added: {EVIDENCE_FOR_TRUE}", 9: f"added: {EVIDENCE_FOR_TRUE}"}
+    assert summary["n_selected_evidence_for_true"] == 2 and summary["shortfall"] == 0
+    assert [c["rank"] for c in ranked] == list(range(1, 11))
+
+
+def test_selection_one_in_top_needs_one_more():
+    cands = [_cand(1, -0.01, EVIDENCE_FOR_TRUE)] + [_cand(r, -0.01 * r, EVIDENCE_AMBIGUOUS)
+                                                     for r in range(2, 8)] + [_cand(8, -0.08, EVIDENCE_FOR_TRUE)]
+    ranked, summary = select_audit_cases(cands)
+    assert [c["row"] for c in ranked if c["selected"]] == [1, 2, 3, 4, 5, 8]
+    assert summary["shortfall"] == 0
+
+
+def test_selection_adds_nothing_when_top_has_enough():
+    cands = [_cand(r, -0.01 * r, EVIDENCE_FOR_TRUE if r in (2, 4) else EVIDENCE_AMBIGUOUS)
+             for r in range(1, 9)] + [_cand(9, -0.09, EVIDENCE_FOR_TRUE)]
+    ranked, summary = select_audit_cases(cands)
+    assert [c["row"] for c in ranked if c["selected"]] == [1, 2, 3, 4, 5]
+    assert summary["n_selected"] == 5 and summary["shortfall"] == 0
+
+
+def test_selection_reports_shortfall():
+    cands = [_cand(r, -0.01 * r, EVIDENCE_AMBIGUOUS) for r in range(1, 7)] + [_cand(7, -0.07, EVIDENCE_FOR_TRUE)]
+    ranked, summary = select_audit_cases(cands)
+    assert [c["row"] for c in ranked if c["selected"]] == [1, 2, 3, 4, 5, 7]
+    assert summary["n_selected_evidence_for_true"] == 1 and summary["shortfall"] == 1
 
 
 # --- Exact ablation (V1-4b), on chunk 0 spectrum 0 ------------------------------------

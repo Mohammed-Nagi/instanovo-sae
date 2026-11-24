@@ -207,6 +207,79 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a, V1-4b.
       `ablation_context(spec, exp, target=modified_sequence)` (V1-4b), so it
       shows whether removing a feature moves the model towards the truth.
       Candidates feed the V1-5 demo set.
+      Part A, case selection (2026-11-24, `python -m inspector.runtime audit-cases
+      --parquet <HF test> --n 200 --seed 0`; outputs `analysis/v1_4c/`:
+      predictions.csv, candidates.csv, selection.json, explanations/, case_views/).
+      Fixed rule (`runtime.AUDIT_SELECTION_RULE`): beam prediction wrong (I=L,
+      modified_sequence) and meeting the precursor (min |ppm| over isotopes 0–1
+      ≤ 20); ranked by mean teacher-forced log p over the predicted residues
+      (EOS excluded); top 5, then the next-ranked "evidence for true" cases until
+      2 selected cases are. Each candidate's ≤ 200 processed peaks (the model's
+      input) are annotated against both peptides (`annotate_spectrum`, strict,
+      20 ppm); a distinguishing peak is labelled a fragment (b, y, immonium,
+      internal; not precursor or noise) under one peptide and not the other, one
+      label per peak. Classes: amb = none; true = ≥ 1 peak a fragment only under
+      the true peptide; pred = distinguishing peaks only under the prediction
+      (reported as possible label errors, not model failures). Region = the span
+      between the longest common prefix and suffix (I=L, no overlap); type in
+      order: length change, modification (same base residues), swap (same
+      multiset), substitution, other (mixed). Reproduction check: the regenerated
+      beam predictions give exact 123/200 and 167 meeting the precursor (V1-4a: 123,
+      167), so 44 candidates; beam search 912 s. Selected: 19475, 51238, 109208, 29350, 60182, 29977
+      (top 5 hold one "evidence for true", 109208; 29977 added at rank 6;
+      shortfall 0). Of 44 candidates: 7 amb, 34 true, 3 pred; 18 substitution, 14
+      length change, 5 swap, 4 other, 3 modification. A
+      region Δm near −0.98 Da is a deamidation difference that passes the precursor
+      filter via isotope offset 1. The console table at the end of the run failed
+      to print (cp1252 cannot encode "Δ"; fixed) after every output file had been
+      written, so the run was not repeated.
+
+      | # | row | mean log p | type | Δm (Da) | class | pred-only (b/y) | true-only (b/y) | sel | prediction [region] / true [region] |
+      |---|---|---|---|---|---|---|---|---|---|
+      | 1 | 19475 | -0.012 | substitution | +0.000 | amb | 0 (0) | 0 (0) | top 5 | VNN[UNIMOD:7]AVVTVPAYFNDSQR [N[UNIMOD:7]] / VNDAVVTVPAYFNDSQR [D] |
+      | 2 | 51238 | -0.019 | swap | +0.000 | pred | 5 (0) | 0 (0) | top 5 | VLSTIDANFADKYDEVK [VL] / IVSTIDANFADKYDEVK [IV] |
+      | 3 | 109208 | -0.021 | modification | -0.984 | true | 25 (11) | 6 (3) | top 5 | TLSSVTQTTVEVDSLFDGEDFESSLTR [Q] / TISSVTQ[UNIMOD:7]TTVEVDSIFDGEDFESSITR [Q[UNIMOD:7]] |
+      | 4 | 29350 | -0.025 | substitution | -0.000 | amb | 0 (0) | 0 (0) | top 5 | TGNLMAGHWVAISGAAGGLGSLAVQYAK [TG] / SANIMAGHWVAISGAAGGIGSIAVQYAK [SA] |
+      | 5 | 60182 | -0.031 | substitution | +0.000 | amb | 0 (0) | 0 (0) | top 5 | DVTFIDDC[UNIMOD:4]VGPEVEAAVK [D] / DVTFIN[UNIMOD:7]DC[UNIMOD:4]VGPEVEAAVK [N[UNIMOD:7]] |
+      | 6 | 29977 | -0.035 | substitution | +0.000 | true | 0 (0) | 1 (0) | added | WETALGPLATNAVTSLSLR [AV] / WETAIGPIATNGITSISIR [GI] |
+      | 7 | 74557 | -0.040 | substitution | -0.984 | true | 9 (9) | 1 (1) |  | PEAAAAGAAAVAAAER [AAER] / PEAAAAGAAAVAN[UNIMOD:7]QGK [N[UNIMOD:7]QGK] |
+      | 8 | 594 | -0.053 | swap | +0.000 | amb | 0 (0) | 0 (0) |  | LVAGGAAQNATR [AT] / IVAGGAAQNTAR [TA] |
+      | 9 | 46143 | -0.055 | swap | +0.000 | true | 3 (3) | 9 (0) |  | VVDLVEHVAAK [AK] / VVDIVEHVAKA [KA] |
+      | 10 | 43804 | -0.068 | substitution | -0.036 | true | 2 (0) | 19 (13) |  | DSQLEETQAHYTNLYVK [Q] / DSQIEETKAHYTNIYVK [K] |
+      | 11 | 56090 | -0.073 | substitution | -0.011 | true | 26 (22) | 31 (25) |  | EPSTSVQFLSNLANK [EPSTSVQFLSNLANK] / NAFIGNTDINISTVR [NAFIGNTDINISTVR] |
+      | 12 | 40875 | -0.075 | substitution | +0.000 | amb | 0 (0) | 0 (0) |  | MEKN[UNIMOD:7]STTGGSSVMLDGVK [N[UNIMOD:7]] / MEKDSTTGGSSVMIDGVK [D] |
+      | 13 | 8647 | -0.075 | other | -0.984 | true | 18 (16) | 6 (5) |  | YKVDYPISLNDAQRK [NDAQRK] / YKVDYPISIN[UNIMOD:7]DAQKR [N[UNIMOD:7]DAQKR] |
+      | 14 | 47026 | -0.077 | length change | +0.018 | true | 15 (12) | 3 (0) |  | [UNIMOD:5]WAVATSGTR [[UNIMOD:5]WAVATSGT] / YHVASVC[UNIMOD:4]R [YHVASVC[UNIMOD:4]] |
+      | 15 | 84997 | -0.084 | substitution | -0.011 | true | 1 (0) | 1 (1) |  | AQLPAGSDGLMIDYSHGNSLEDFR [DGLMIDYSHGNSLE] / AQIPAGSN[UNIMOD:7]GIMIDYSHGNSNKDFR [N[UNIMOD:7]GIMIDYSHGNSNK] |
+      | 16 | 71941 | -0.086 | modification | +0.000 | true | 3 (0) | 1 (0) |  | MLELM[UNIMOD:35]LPVFDAPQNLVEQAK [MLELM[UNIMOD:35]] / M[UNIMOD:35]IEIMIPVFDAPQNIVEQAK [M[UNIMOD:35]IEIM] |
+      | 17 | 31366 | -0.095 | other | -0.984 | true | 7 (2) | 1 (1) |  | PANLPWGSSNVDIADISTGVFKELDTAQK [NLPWGSSNVDIADI] / PAN[UNIMOD:7]IPWGSSNVDIAIDSTGVFKEIDTAQK [N[UNIMOD:7]IPWGSSNVDIAID] |
+      | 18 | 74658 | -0.100 | length change | +0.000 | amb | 0 (0) | 0 (0) |  | AAGGHSGGTIQVST [AGGHSGG] / AGAGHSNTIQVST [GAGHSN] |
+      | 19 | 90372 | -0.105 | substitution | +0.000 | pred | 2 (0) | 0 (0) |  | TTPTLFDQDVLK [DQ] / TTPTIFENDVIK [EN] |
+      | 20 | 109037 | -0.112 | substitution | -0.000 | true | 2 (1) | 3 (1) |  | VYEPILLVGIDKFTVNDLR [TVN] / VYEPIIIVGIDKFSNIDIR [SNI] |
+      | 21 | 97297 | -0.118 | length change | +0.000 | true | 0 (0) | 3 (0) |  | VNQAIALLTLQR [Q] / VNQAIAIITIGAR [GA] |
+      | 22 | 110855 | -0.129 | substitution | +0.000 | amb | 0 (0) | 0 (0) |  | GVPGVLPPSGELVFDVELVDVK [GE] / GVPGVIPPSADIVFDVEIVDVK [AD] |
+      | 23 | 58900 | -0.160 | substitution | -0.000 | true | 0 (0) | 4 (1) |  | VGDNHEDENLSPAQAAELVGEDLSR [VGDNHE] / AEQGEHDENISPAQAAEIVGEDISR [AEQGEH] |
+      | 24 | 33227 | -0.165 | swap | +0.000 | true | 2 (0) | 1 (0) |  | GMALNLEPGQVGIVLFSGDIVRK [SGDIVR] / GMAINIEPGQVGIVIFGSDRIVK [GSDRIV] |
+      | 25 | 98900 | -0.168 | other | -0.025 | true | 5 (2) | 11 (5) |  | DLYANNVM[UNIMOD:35]SGGTTMFPGLAER [DLYANN] / EIYGN[UNIMOD:7]IVM[UNIMOD:35]SGGTTMFPGIAER [EIYGN[UNIMOD:7]I] |
+      | 26 | 45595 | -0.169 | substitution | -0.995 | true | 20 (13) | 9 (2) |  | MSASDPESILDILEEPKQVK [ESI] / MSASDPN[UNIMOD:7]SKIDIIEEPKQVK [N[UNIMOD:7]SK] |
+      | 27 | 63550 | -0.199 | length change | -0.000 | true | 1 (0) | 6 (2) |  | LIGAPNSSESVFEVTYFK [NSSE] / IIGAPSEGGSSVFEVTYFK [SEGGS] |
+      | 28 | 81095 | -0.203 | substitution | -0.000 | true | 4 (2) | 4 (1) |  | SVENPFLPTNLER [TNL] / SVENPFIPAKEER [AKE] |
+      | 29 | 39783 | -0.217 | other | -0.995 | true | 9 (8) | 8 (7) |  | SWSGDNEAHWEK [NEAHWEK] / SWSGDN[UNIMOD:7]EAHRWT [N[UNIMOD:7]EAHRWT] |
+      | 30 | 72165 | -0.250 | substitution | -0.006 | true | 9 (1) | 12 (4) |  | AASTVPFVTWSVDSLFDGEDFESSLTR [AASTVPFVTWS] / TISSVTQTTVEVDSIFDGEDFESSITR [TISSVTQTTVE] |
+      | 31 | 41739 | -0.258 | substitution | -0.992 | true | 17 (12) | 7 (6) |  | LMSDQTYLK [LMSDQTYLK] / TIYGDIDFR [TIYGDIDFR] |
+      | 32 | 55965 | -0.289 | swap | +0.000 | pred | 1 (1) | 0 (0) |  | KSSETADLSELLPEEIEER [KSSETA] / SKASETDISEIIPEEIEER [SKASET] |
+      | 33 | 106541 | -0.311 | substitution | -0.958 | true | 30 (18) | 41 (31) |  | QNVANPSLLIYAIC[UNIMOD:4]NSFGFGGVNTSLLFK [QNVANPSLLIYAIC[UNIMOD:4]NSFGFGGVNTSLLFK] / GQNVANPTAM[UNIMOD:35]IISSTIMINHIGINEYATR [GQNVANPTAM[UNIMOD:35]IISSTIMINHIGINEYATR] |
+      | 34 | 42191 | -0.320 | modification | -0.984 | true | 7 (6) | 4 (4) |  | SLMDKVTNVR [N] / SIMDKVTN[UNIMOD:7]VR [N[UNIMOD:7]] |
+      | 35 | 93419 | -0.331 | length change | -1.009 | true | 18 (9) | 45 (27) |  | ESDPYSHALVAQGVSQVVEVGTLR [ESDPYSHALVAQGVSQVVEVGTLR] / YFSESDSVIVAQGVSGAVVDKGSIK [YFSESDSVIVAQGVSGAVVDKGSIK] |
+      | 36 | 99547 | -0.345 | length change | +0.000 | true | 5 (1) | 22 (18) |  | [UNIMOD:5]ELPGAVIIDQM[UNIMOD:35]QGM[UNIMOD:35]FNPEAHYFGTGR [[UNIMOD:5]ELPGAVIIDQM[UNIMOD:35]QGM[UNIMOD:35]F] / EIPGAVIIDQYNNM[UNIMOD:35]MNPEAHYFGTGR [EIPGAVIIDQYNNM[UNIMOD:35]M] |
+      | 37 | 40105 | -0.470 | length change | -0.956 | true | 10 (4) | 24 (16) |  | EVVPNNASPGEVTLVDLKADVTGVEDANVK [GEVTLVDLKADVTGVEDANV] / EVVPNNASPASATGARPVSVSNGAANTEREK [ASATGARPVSVSNGAANTERE] |
+      | 38 | 56794 | -0.496 | length change | +0.032 | true | 25 (10) | 31 (19) |  | AEAFGTHETTILREFKEDLEQFLK [EAFGTHETTILREFKEDLEQFL] / AAFGN[UNIMOD:7]C[UNIMOD:4]HGIYAGDIAIRPEIIAEHQK [AFGN[UNIMOD:7]C[UNIMOD:4]HGIYAGDIAIRPEIIAEHQ] |
+      | 39 | 105288 | -0.650 | length change | +0.049 | true | 18 (5) | 18 (7) |  | [UNIMOD:385]QATGGQAPSSSPTSLTFSLSTLGSDPIDPTSK [[UNIMOD:385]QATGGQAPSSSPTSLTFSL] / QATGGQAFPQMVFDHWSTIGSDPIDPTSK [QATGGQAFPQMVFDHW] |
+      | 40 | 2456 | -0.776 | length change | -1.029 | true | 0 (0) | 2 (2) |  | GGGEEDEDDPGSR [GGGEEDEDDPGS] / ADWGC[UNIMOD:4]AEDPSGR [ADWGC[UNIMOD:4]AEDPSG] |
+      | 41 | 37383 | -0.780 | length change | -0.044 | true | 0 (0) | 3 (1) |  | [UNIMOD:385]GDGYDNYGGYGSEEDSYGSGGSR [[UNIMOD:385]GDGYDNYGGYGSEEDSYGSGGS] / NSYGSSNYGSSNNDDSYGSSNR [NSYGSSNYGSSNNDDSYGSSN] |
+      | 42 | 42651 | -0.972 | length change | -0.044 | true | 0 (0) | 35 (22) |  | [UNIMOD:385]CVTITDGVQHHATDDVEDAAPETK [[UNIMOD:385]CVTITDGVQ] / ISITGGFSHHHATDDVEDAAPETK [ISITGGFSH] |
+      | 43 | 95938 | -1.071 | length change | -0.019 | true | 10 (1) | 53 (28) |  | [UNIMOD:385]AGGNISGIC[UNIMOD:4]QDSDSNISGVHC[UNIMOD:4]M[UNIMOD:35]TTQELDELANSK [[UNIMOD:385]AGGNISGIC[UNIMOD:4]QDSDSNI] / FINNTYENPFM[UNIMOD:35]NASGVHC[UNIMOD:4]M[UNIMOD:35]TTQEIDEIANSK [FINNTYENPFM[UNIMOD:35]NA] |
+      | 44 | 1636 | -1.274 | length change | -1.027 | true | 13 (3) | 15 (8) |  | [UNIMOD:385]AIVHIAQAGQC[UNIMOD:4]GNQIGAK [[UNIMOD:385]AIVHIAQAGQC[UNIMOD:4]GNQIGA] / KGFGEKASEAIKPDSQK [KGFGEKASEAIKPDSQ] |
 - [ ] **V1-5 Data for the tool** — feature examples; demo set from the HF test
       split. Verified by Finding 7 from code and logs: chunk 520's spectrum
       IDs start at row 532,480, and the SAE validation chunks are 17, 116, 135,
@@ -623,3 +696,4 @@ any result on the test split must state it.
 - 2026-11-24 — V1-4b done (`80e2653`): Explanation schema 2 (summaries plus dictionary hash), exact error-preserving ablation (local/global scopes, `ablate_token` over every active feature at a token plus a joint ablation, optional target peptide), `explain(latent_ablation=)`. Results and timings under V1-4b; behaviour changes recorded; two backlog items (re-decode under ablation, faster per-peak clicks). 144 tests pass.
 - 2026-11-24 — CLAUDE.md and STATUS.md brought up to date after V1-4b: CLAUDE.md goal, layout, dependency and causal-effect rules; V1-4a notes the renamed flag; V1-4c gets its metric and contexts; V1-6 spec built on the V1-4b API. No code changed.
 - 2026-11-24 — V1-4b commits pushed (`992b3b4`..`f8eb7df`); the joint-ablation caveat added to V1-4b's results (the joint figure is a reference scale, not a clean total). No code changed.
+- 2026-11-24 — V1-4c part A, case selection: `runtime.py` gets the `audit-cases` subcommand and pure helpers (`differing_region`, `mismatch_type`, `distinguishing_peaks`, `evidence_class`, `mean_residue_log_prob`, `select_audit_cases`, `case_view`), additive; the CLI's `main` now returns a subcommand's exit code (the existing ones return 0 as before). The regenerated predictions reproduce V1-4a (123 exact, 167 meeting the precursor); 44 candidates, 6 selected; table under V1-4c. No ablation calls. 167 tests pass (23 new).

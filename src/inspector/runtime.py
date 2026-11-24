@@ -48,6 +48,8 @@ CLI (from the repo root)::
         --parquet <raw spectra parquet> --rows 4506 ...
     PYTHONPATH=src uv run python -m inspector.runtime accuracy \\
         --parquet <HF test parquet> --n 200 --seed 0
+    PYTHONPATH=src uv run python -m inspector.runtime audit-cases \\
+        --parquet <HF test parquet> --n 200 --seed 0    # V1-4c part A, no ablation
 
 --checkpoint defaults to checkpoints/instanovo_v1.1.0.ckpt and --outputs-root
 to sae_pipeline_outputs/, both under the repo root.
@@ -1253,9 +1255,373 @@ def _cmd_accuracy(args, inspector: Inspector) -> None:
             print(f"    truth {truth}  pred {pred}")
 
 
+# --- Audit case selection (V1-4c part A) -----------------------------------------
+#
+# A fixed rule picks InstaNovo errors for the audit case study, before any
+# ablation: wrong predictions (I=L) that meet the precursor, ranked by mean
+# per-residue log p, each annotated against both the predicted and the true
+# peptide to count distinguishing peaks. The pure helpers are unit-tested.
+
+FRAGMENT_ION_TYPES = ("b", "y", "I", "internal")   # annotator ion types that are fragments
+BACKBONE_ION_TYPES = ("b", "y")
+EVIDENCE_AMBIGUOUS = "ambiguous"
+EVIDENCE_FOR_TRUE = "evidence for true"
+EVIDENCE_FOR_PRED = "evidence favours prediction"
+V1_4A_BEAM_EXACT, V1_4A_BEAM_MEETS = 123, 167        # the V1-4a record (n 200, seed 0)
+AUDIT_SELECTION_RULE = (
+    "candidates: beam prediction wrong (I=L, modified_sequence) and meeting the precursor "
+    "(min |ppm| over isotopes 0-1 <= 20); ranked by mean teacher-forced log p over the "
+    "predicted residues (EOS excluded), highest first, ties by row; the top n_top are "
+    "selected, then the next-ranked 'evidence for true' candidates until min_evidence "
+    "selected cases are 'evidence for true'. Distinguishing peak: a processed peak labelled "
+    "a fragment (b, y, immonium, internal) under one peptide and not under the other "
+    "(annotate_spectrum, strict, 20 ppm)."
+)
+
+
+def differing_region(a: list[str], b: list[str]) -> tuple[int, int, int]:
+    """(start, end_a, end_b): the regions a[start:end_a] and b[start:end_b] lie
+    between the longest common prefix and the longest common suffix (I = L),
+    the suffix not overlapping the prefix. The regions may differ in length and
+    one may be empty. Raises for sequences equal up to I/L."""
+    na, nb = normalise_peptide(a), normalise_peptide(b)
+    if na == nb:
+        raise ValueError(f"no differing region: {a} and {b} are equal up to I/L")
+    n = min(len(na), len(nb))
+    start = 0
+    while start < n and na[start] == nb[start]:
+        start += 1
+    suffix = 0
+    while suffix < n - start and na[-1 - suffix] == nb[-1 - suffix]:
+        suffix += 1
+    return start, len(a) - suffix, len(b) - suffix
+
+
+def _base_residue(token: str) -> str:
+    return token[0] if token[0].isalpha() else ""
+
+
+def mismatch_type(a: list[str], b: list[str], region: tuple[int, int, int]) -> str:
+    """Class of the difference in the region, checked in order: 'length change'
+    (region lengths differ); 'modification' (every differing position has the
+    same base residue); 'swap' (two or more tokens, same multiset);
+    'substitution' (every differing position has a different base residue);
+    'other' (a mix of modification-only and residue changes). I = L."""
+    start, end_a, end_b = region
+    ra, rb = normalise_peptide(a)[start:end_a], normalise_peptide(b)[start:end_b]
+    if len(ra) != len(rb):
+        return "length change"
+    diff = [i for i in range(len(ra)) if ra[i] != rb[i]]
+    if not diff:
+        raise ValueError(f"region {region} of {a} / {b} holds no difference")
+    same_base = [_base_residue(ra[i]) == _base_residue(rb[i]) for i in diff]
+    if all(same_base):
+        return "modification"
+    if len(ra) >= 2 and sorted(ra) == sorted(rb):
+        return "swap"
+    if not any(same_base):
+        return "substitution"
+    return "other"
+
+
+def distinguishing_peaks(ann_pred: list[dict], ann_true: list[dict]) -> dict:
+    """Peaks labelled a fragment (FRAGMENT_ION_TYPES) under one peptide and not
+    under the other (noise or precursor). One label per peak, as the annotator
+    keeps it. Indices are peak indices (encoder token = index + 1)."""
+    if len(ann_pred) != len(ann_true):
+        raise ValueError(f"{len(ann_pred)} vs {len(ann_true)} peak annotations")
+
+    def frag(ann):
+        return ann["ion_type"] in FRAGMENT_ION_TYPES
+
+    pred_only = [j for j, (p, t) in enumerate(zip(ann_pred, ann_true)) if frag(p) and not frag(t)]
+    true_only = [j for j, (p, t) in enumerate(zip(ann_pred, ann_true)) if frag(t) and not frag(p)]
+    return {"pred_only": pred_only, "true_only": true_only,
+            "n_pred_only": len(pred_only), "n_true_only": len(true_only),
+            "n_pred_only_by": sum(ann_pred[j]["ion_type"] in BACKBONE_ION_TYPES for j in pred_only),
+            "n_true_only_by": sum(ann_true[j]["ion_type"] in BACKBONE_ION_TYPES for j in true_only)}
+
+
+def evidence_class(n_pred_only: int, n_true_only: int) -> str:
+    """'ambiguous' (no distinguishing peak), 'evidence for true' (at least one
+    peak is a fragment only under the true peptide), else 'evidence favours
+    prediction' (distinguishing peaks only under the prediction)."""
+    if n_true_only > 0:
+        return EVIDENCE_FOR_TRUE
+    if n_pred_only > 0:
+        return EVIDENCE_FOR_PRED
+    return EVIDENCE_AMBIGUOUS
+
+
+def mean_residue_log_prob(ce: list[float], n_residues: int) -> float:
+    """Mean log p over the residues from decoder-order CE (residues then EOS); EOS excluded."""
+    per_residue, _eos = decoder_to_residue_order([-float(v) for v in ce], n_residues)
+    return float(np.mean(per_residue))
+
+
+def select_audit_cases(candidates: list[dict], n_top: int = 5,
+                       min_evidence: int = 2) -> tuple[list[dict], dict]:
+    """Rank candidates (dicts with row, mean_residue_log_prob, evidence_class)
+    by mean residue log p, highest first (ties by row); select the top n_top,
+    then the next-ranked 'evidence for true' candidates until min_evidence
+    selected cases are 'evidence for true'. Returns (ranked copies with rank,
+    selected, selection_reason; a summary with any shortfall)."""
+    ranked = sorted((dict(c) for c in candidates),
+                    key=lambda c: (-c["mean_residue_log_prob"], c["row"]))
+    n_for_true = 0
+    for i, c in enumerate(ranked):
+        c["rank"] = i + 1
+        c["selected"] = i < n_top
+        c["selection_reason"] = f"top {n_top}" if i < n_top else ""
+        n_for_true += c["selected"] and c["evidence_class"] == EVIDENCE_FOR_TRUE
+    for c in ranked[n_top:]:
+        if n_for_true >= min_evidence:
+            break
+        if c["evidence_class"] == EVIDENCE_FOR_TRUE:
+            c["selected"], c["selection_reason"] = True, f"added: {EVIDENCE_FOR_TRUE}"
+            n_for_true += 1
+    summary = {"n_candidates": len(ranked), "n_top": n_top, "min_evidence": min_evidence,
+               "n_selected": sum(c["selected"] for c in ranked),
+               "n_selected_evidence_for_true": n_for_true,
+               "shortfall": max(0, min_evidence - n_for_true)}
+    return ranked, summary
+
+
+def audit_candidates(inspector: Inspector, parquet_path: Path, rows: list[int],
+                     precursor_ppm: float = 20.0) -> tuple[list[dict], list[dict]]:
+    """(predictions, candidates). Beam prediction for every row (Inspector
+    settings), exact and meets-precursor as in accuracy_check. Each wrong
+    prediction meeting the precursor becomes a candidate: teacher-forced mean
+    residue log p, the differing region, mismatch type, region mass difference,
+    and distinguishing peaks from annotating the processed peaks against both
+    peptides. Candidates carry the annotations under '_ann_pred' / '_ann_true'."""
+    rs = inspector.residue_set
+    metrics = instanovo_io.instanovo_metrics(rs)
+    records = read_raw_records(parquet_path, rows, _SPECTRUM_COLUMNS + ["modified_sequence"])
+    predictions, candidates = [], []
+    for row, rec in zip(rows, records, strict=True):
+        truth = [rs.residue_remapping.get(t, t) for t in rs.tokenize(rec["modified_sequence"])]
+        spec = Spectrum(rec["mz_array"], rec["intensity_array"], rec["precursor_mz"],
+                        rec["precursor_charge"], spectrum_id=f"{Path(parquet_path).stem}:{row}")
+        pred = inspector.predict(spec)
+        tokens = pred["tokens"]
+        exact = bool(tokens) and normalise_peptide(tokens) == normalise_peptide(truth)
+        min_ppm = None
+        if tokens:
+            _ok, ppm = metrics.matches_precursor(tokens, rec["precursor_mz"], rec["precursor_charge"])
+            min_ppm = float(min(abs(p) for p in ppm))
+        meets = min_ppm is not None and min_ppm <= precursor_ppm
+        p = {"row": row, "truth": "".join(truth), "prediction": "".join(tokens), "exact": exact,
+             "meets_precursor": meets, "min_abs_ppm": min_ppm, "beam_log_prob": pred["log_prob"],
+             "n_residues": len(tokens), "modified_truth": any("[" in t for t in truth)}
+        predictions.append(p)
+        if exact or not meets:
+            continue
+        fwd = inspector.forward(spec, "".join(tokens))
+        ann_pred, _ = inspector._annotate(tokens, spec, fwd)
+        ann_true, _ = inspector._annotate(truth, spec, fwd)
+        region = differing_region(tokens, truth)
+        start, end_p, end_t = region
+        dist = distinguishing_peaks(ann_pred, ann_true)
+        candidates.append({
+            **p, "pred_tokens": tokens, "truth_tokens": truth,
+            "mean_residue_log_prob": mean_residue_log_prob(fwd.ce.tolist(), len(tokens)),
+            "region_start": start, "region_end_pred": end_p, "region_end_true": end_t,
+            "pred_region": "".join(tokens[start:end_p]), "true_region": "".join(truth[start:end_t]),
+            "mismatch_type": mismatch_type(tokens, truth, region),
+            "region_mass_delta_da": (sum(float(rs.get_mass(t)) for t in tokens[start:end_p])
+                                     - sum(float(rs.get_mass(t)) for t in truth[start:end_t])),
+            **{k: dist[k] for k in ("n_pred_only", "n_true_only", "n_pred_only_by", "n_true_only_by")},
+            "pred_only_peaks": dist["pred_only"], "true_only_peaks": dist["true_only"],
+            "evidence_class": evidence_class(dist["n_pred_only"], dist["n_true_only"]),
+            "n_processed_peaks": len(ann_pred), "_ann_pred": ann_pred, "_ann_true": ann_true,
+        })
+    return predictions, candidates
+
+
+def _cleavage_site(ann: dict, n_residues: int) -> int | None:
+    """Backbone cleavage site k (between residues k-1 and k, 0-indexed) of a b/y annotation."""
+    if ann["ion_type"] == "b":
+        return int(ann["ion_index"])
+    if ann["ion_type"] == "y":
+        return n_residues - int(ann["ion_index"])
+    return None
+
+
+def _fmt(v, digits: int = 3) -> str:
+    if v is None:
+        return "–"
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    if isinstance(v, float):
+        return f"{v:.{digits}f}"
+    return str(v)
+
+
+def case_view(inspector: Inspector, exp: Explanation, cand: dict) -> str:
+    """Markdown report of one audit case from explain() output and the two
+    annotations: what the hypothesis is written from. No ablation."""
+    pred, truth = cand["pred_tokens"], cand["truth_tokens"]
+    start, end_p, end_t = cand["region_start"], cand["region_end_pred"], cand["region_end_true"]
+    ann_p, ann_t = cand["_ann_pred"], cand["_ann_true"]
+
+    def marked(tokens, end):
+        return "".join(tokens[:start]) + " [" + "".join(tokens[start:end]) + "] " + "".join(tokens[end:])
+
+    out = [f"# Row {cand['row']} — {cand['evidence_class']}", "",
+           f"- prediction: `{marked(pred, end_p)}`",
+           f"- true:       `{marked(truth, end_t)}`",
+           f"- mismatch: {cand['mismatch_type']}; region mass Δ (pred − true) "
+           f"{cand['region_mass_delta_da']:+.4f} Da; min |ppm| {cand['min_abs_ppm']:.2f}; "
+           f"mean residue log p {cand['mean_residue_log_prob']:.4f}; rank {cand.get('rank')}",
+           f"- distinguishing peaks: pred-only {cand['n_pred_only']} (b/y {cand['n_pred_only_by']}) "
+           f"{cand['pred_only_peaks']}; true-only {cand['n_true_only']} (b/y {cand['n_true_only_by']}) "
+           f"{cand['true_only_peaks']}",
+           f"- precursor charge {exp.input['precursor_charge']}, {exp.input['n_processed_peaks']} "
+           f"processed peaks (peak j = encoder token j + 1)", "",
+           "## Predicted residues (teacher-forced log p)", "",
+           "| i | token | log p | in region |", "|---|---|---|---|"]
+    for i, r in enumerate(exp.prediction["residues"]):
+        out.append(f"| {i} | {r['token']} | {r['log_prob_tf']:.4f} | {'*' if start <= i < end_p else ''} |")
+    out.append(f"| EOS | | {exp.prediction['eos_log_prob_tf']:.4f} | |")
+
+    near = set(cand["pred_only_peaks"]) | set(cand["true_only_peaks"])
+    for j, (a, b) in enumerate(zip(ann_p, ann_t)):
+        kp, kt = _cleavage_site(a, len(pred)), _cleavage_site(b, len(truth))
+        if (kp is not None and start <= kp <= end_p) or (kt is not None and start <= kt <= end_t):
+            near.add(j)
+    intensity_rank = {j: r + 1 for r, j in enumerate(
+        sorted(range(len(exp.peaks)), key=lambda j: -exp.peaks[j]["intensity"]))}
+    out += ["", "## Peaks near the region", "",
+            "Distinguishing peaks plus peaks whose b/y cleavage site lies in or at the edges of "
+            "the region under either peptide.", "",
+            "| peak | m/z | intensity (rank) | under pred | under true | distinguishing |",
+            "|---|---|---|---|---|---|"]
+    for j in sorted(near):
+        pk = exp.peaks[j]
+        tag = ("pred-only" if j in cand["pred_only_peaks"] else
+               "true-only" if j in cand["true_only_peaks"] else "")
+        out.append(f"| {j} | {pk['mz']:.4f} | {pk['intensity']:.4g} ({intensity_rank[j]}) | "
+                   f"{peak_label(ann_p[j])} | {peak_label(ann_t[j])} | {tag} |")
+
+    used: dict[int, set[int]] = {L: set() for L in inspector.layers}
+
+    def feature_table(position: int) -> list[str]:
+        rows = ["| layer | feature | act | top concept | F1dom | sig | ΔCE (Phase 8) | lat. frac | desc |",
+                "|---|---|---|---|---|---|---|---|---|"]
+        for L in inspector.layers:
+            for item in exp.layers[str(L)]["tokens"][position]["top"]:
+                f = item["feature"]
+                s = exp.features[str(L)][str(f)]
+                used[L].add(f)
+                desc = ("–" if not s["has_description"] else
+                        ("blind, beats" if s["description_beats_baseline"] else "blind, not beats")
+                        if s["description_blinded"] else "unblinded")
+                rows.append(f"| L{L} | F{f} | {item['activation']:.3f} | {_fmt(s['top_concept'])} | "
+                            f"{_fmt(s['top_concept_f1_dom'])} | {_fmt(s['has_significant_association'])} | "
+                            f"{_fmt(s['causal_delta_ce'], 4) if s['causal_delta_ce'] is not None else 'untested'} | "
+                            f"{_fmt(s['latent_token_fraction'])} | {desc} |")
+        return rows
+
+    out += ["", "## Latent token (token 0), top features per layer", ""] + feature_table(0)
+    for j in sorted(near):
+        out += ["", f"## Peak {j} (token {j + 1}): m/z {exp.peaks[j]['mz']:.4f}, "
+                    f"pred {peak_label(ann_p[j])}, true {peak_label(ann_t[j])}", ""] + feature_table(j + 1)
+
+    out += ["", "## Descriptions of the features above", "",
+            "Layer 8 has no descriptions yet (V1-2c). Only blinded descriptions are in the dictionary.", ""]
+    for L in inspector.layers:
+        for f in sorted(used[L]):
+            row = feature_row(exp, inspector.dictionaries, L, f)
+            if row and row.get("description"):
+                out.append(f"- **L{L} F{f}** (r {_fmt(row.get('description_r'))}, beats baseline "
+                           f"{_fmt(row.get('description_beats_baseline'))}): {row['description']}")
+    return "\n".join(out) + "\n"
+
+
+_PREDICTION_COLUMNS = ("row", "truth", "prediction", "exact", "meets_precursor", "min_abs_ppm",
+                       "beam_log_prob", "n_residues", "modified_truth")
+_CANDIDATE_COLUMNS = ("rank", "row", "mean_residue_log_prob", "prediction", "truth", "mismatch_type",
+                      "region_start", "pred_region", "true_region", "region_mass_delta_da",
+                      "min_abs_ppm", "evidence_class", "n_pred_only", "n_pred_only_by",
+                      "n_true_only", "n_true_only_by", "pred_only_peaks", "true_only_peaks",
+                      "n_processed_peaks", "selected", "selection_reason")
+
+
+def _write_csv(path: Path, rows: list[dict], columns: tuple[str, ...]) -> None:
+    import csv
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(columns)
+        for r in rows:
+            w.writerow([" ".join(map(str, r[c])) if isinstance(r[c], list) else r[c] for c in columns])
+
+
+def _cmd_audit_cases(args, inspector: Inspector) -> int:
+    """V1-4c part A: regenerate the V1-4a beam predictions, select audit cases
+    by the fixed rule, explain() the selected ones (no ablation) and write case
+    views. Never writes hypotheses.json."""
+    default_sample = not args.rows and args.n == 200 and args.seed == 0
+    rows = sorted(args.rows) if args.rows else sorted(np.random.default_rng(args.seed).choice(
+        parquet_num_rows(args.parquet), size=args.n, replace=False).tolist())
+    out = Path(args.out_dir)
+    (out / "explanations").mkdir(parents=True, exist_ok=True)
+    (out / "case_views").mkdir(parents=True, exist_ok=True)
+    t0 = time.perf_counter()
+    predictions, candidates = audit_candidates(inspector, args.parquet, rows)
+    t_pred = time.perf_counter() - t0
+    _write_csv(out / "predictions.csv", predictions, _PREDICTION_COLUMNS)
+    n_exact = sum(p["exact"] for p in predictions)
+    n_meets = sum(p["meets_precursor"] for p in predictions)
+    print(f"{len(rows)} rows; exact {n_exact}, meets precursor {n_meets}, exact among meeting "
+          f"{sum(p['exact'] and p['meets_precursor'] for p in predictions)}; "
+          f"{len(candidates)} candidates; {t_pred:.0f} s")
+    if default_sample and (n_exact, n_meets) != (V1_4A_BEAM_EXACT, V1_4A_BEAM_MEETS):
+        print(f"REPRODUCTION FAILED: V1-4a recorded exact {V1_4A_BEAM_EXACT}, meets {V1_4A_BEAM_MEETS}; "
+              f"got {n_exact}, {n_meets}. V1-4a saved no per-row predictions, so the differing rows "
+              f"cannot be named; every wrong or non-meeting row follows.")
+        for p in predictions:
+            if not p["exact"] or not p["meets_precursor"]:
+                print(f"  row {p['row']}: exact {p['exact']}, meets {p['meets_precursor']}, "
+                      f"min |ppm| {p['min_abs_ppm']}, pred {p['prediction']}, truth {p['truth']}")
+        return 1
+
+    ranked, summary = select_audit_cases(candidates, n_top=args.n_top, min_evidence=args.min_evidence)
+    _write_csv(out / "candidates.csv", ranked, _CANDIDATE_COLUMNS)
+    selected = [c for c in ranked if c["selected"]]
+    for c in selected:
+        spec = read_raw_spectra(args.parquet, [c["row"]])[0]
+        exp = inspector.explain(spec)
+        if exp.prediction is None or exp.prediction["tokens"] != c["pred_tokens"]:
+            raise RuntimeError(f"row {c['row']}: explain() predicted {exp.prediction and exp.prediction['peptide']}, "
+                               f"the audit run {c['prediction']}")
+        (out / "explanations" / f"row_{c['row']}.json").write_text(exp.to_json(), encoding="utf-8")
+        (out / "case_views" / f"row_{c['row']}.md").write_text(case_view(inspector, exp, c), encoding="utf-8")
+    selection = {
+        "rule": AUDIT_SELECTION_RULE, "parquet": Path(args.parquet).name, "seed": args.seed,
+        "n": len(rows), "rows": rows, "reproduces_v1_4a": default_sample,
+        "counts": {"exact": n_exact, "meets_precursor": n_meets, "candidates": len(candidates)},
+        "summary": summary, "selected_rows": [c["row"] for c in selected],
+        "sha256": {name: _sha256_prefix(out / name, 64) for name in ("predictions.csv", "candidates.csv")},
+        "provenance": inspector.provenance,
+    }
+    (out / "selection.json").write_text(json.dumps(selection, indent=1), encoding="utf-8")
+
+    print(f"selected {summary['n_selected']} ({summary['n_selected_evidence_for_true']} "
+          f"'{EVIDENCE_FOR_TRUE}', shortfall {summary['shortfall']}); outputs in {out}")
+    print("rank | row | mean logp | type | dmass (Da) | class | pred-only (b/y) | true-only (b/y) | sel | pred | true")
+    for c in ranked:
+        print(f"{c['rank']} | {c['row']} | {c['mean_residue_log_prob']:.3f} | {c['mismatch_type']} | "
+              f"{c['region_mass_delta_da']:+.3f} | {c['evidence_class']} | {c['n_pred_only']} "
+              f"({c['n_pred_only_by']}) | {c['n_true_only']} ({c['n_true_only_by']}) | "
+              f"{'Y' if c['selected'] else ''} | {c['prediction']} [{c['pred_region']}] | "
+              f"{c['truth']} [{c['true_region']}]")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("command", choices=["time", "compare-preprocessing", "accuracy"])
+    p.add_argument("command", choices=["time", "compare-preprocessing", "accuracy", "audit-cases"])
     p.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     p.add_argument("--outputs-root", type=Path, default=DEFAULT_OUTPUTS_ROOT)
     p.add_argument("--parquet", type=Path, required=True, help="raw spectra parquet (InstaNovo columns)")
@@ -1266,13 +1632,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     p.add_argument("--ablation", action="store_true",
                    help="time: also time exact ablation (both scopes, per-peak and latent panels)")
+    p.add_argument("--out-dir", type=Path, default=DEFAULT_OUTPUTS_ROOT / "analysis" / "v1_4c",
+                   help="audit-cases: output directory")
+    p.add_argument("--n-top", type=int, default=5, help="audit-cases: cases taken by rank")
+    p.add_argument("--min-evidence", type=int, default=2,
+                   help=f"audit-cases: selected cases that must be '{EVIDENCE_FOR_TRUE}'")
     args = p.parse_args(argv)
-    if args.command != "accuracy" and not args.rows:
+    if args.command not in ("accuracy", "audit-cases") and not args.rows:
         p.error(f"{args.command} needs --rows")
     inspector = Inspector(args.checkpoint, args.outputs_root, top_k=args.top_k)
-    {"time": _cmd_time, "compare-preprocessing": _cmd_compare,
-     "accuracy": _cmd_accuracy}[args.command](args, inspector)
-    return 0
+    rc = {"time": _cmd_time, "compare-preprocessing": _cmd_compare, "accuracy": _cmd_accuracy,
+          "audit-cases": _cmd_audit_cases}[args.command](args, inspector)
+    return rc or 0
 
 
 if __name__ == "__main__":

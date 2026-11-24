@@ -280,6 +280,228 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a, V1-4b.
       | 42 | 42651 | -0.972 | length change | -0.044 | true | 0 (0) | 35 (22) |  | [UNIMOD:385]CVTITDGVQHHATDDVEDAAPETK [[UNIMOD:385]CVTITDGVQ] / ISITGGFSHHHATDDVEDAAPETK [ISITGGFSH] |
       | 43 | 95938 | -1.071 | length change | -0.019 | true | 10 (1) | 53 (28) |  | [UNIMOD:385]AGGNISGIC[UNIMOD:4]QDSDSNISGVHC[UNIMOD:4]M[UNIMOD:35]TTQELDELANSK [[UNIMOD:385]AGGNISGIC[UNIMOD:4]QDSDSNI] / FINNTYENPFM[UNIMOD:35]NASGVHC[UNIMOD:4]M[UNIMOD:35]TTQEIDEIANSK [FINNTYENPFM[UNIMOD:35]NA] |
       | 44 | 1636 | -1.274 | length change | -1.027 | true | 13 (3) | 15 (8) |  | [UNIMOD:385]AIVHIAQAGQC[UNIMOD:4]GNQIGAK [[UNIMOD:385]AIVHIAQAGQC[UNIMOD:4]GNQIGA] / KGFGEKASEAIKPDSQK [KGFGEKASEAIKPDSQ] |
+
+      Part A, pre-registered hypotheses (2026-11-24; written from explain()
+      output only, top_k 8, no ablation, via `analysis/v1_4c/case_views/`;
+      machine-readable copy `analysis/v1_4c/hypotheses.json`, sha256
+      2177039b13515fdf46d8f07de6d1c3542d92f7829c8b4ee73cca9120963e84a9). Nothing
+      after this commit may change them. Each names features at one layer as
+      (feature, token); token 0 = latent, token j + 1 = peak j. Sign: + = the set
+      pushed the model towards its wrong answer (E > 0, defined below). The
+      first draft (H1–H6) was amended at review before this commit: H1's
+      confound and low motivation, H3's narrowed claim, the H2/H6
+      internal-fragment caveat and H7 (a deviation, below) were added.
+      Layer choice (recorded because "most specific" was not defined): no
+      criterion was fixed in advance. For H1, H2, H5, H6 the layer is where, on
+      the peaks named, the features whose top concept matched the claim
+      (covers_N, is_internal_fragment, covers_D, is_I_ion) had their largest
+      activation in the case view, which was L8 each time; H3, H4 and H7 were
+      then put at L8 too, the last encoder layer (`n_layers` 9, layers 0–8),
+      whose output the decoder reads. A post-hoc choice, stated as such.
+      - H1, row 19475 (ambiguous; N[UNIMOD:7] vs D at residue 2, isobaric). L8
+        {F511, F9744, F3490} at token 9 (b2 peak, m/z 214.118); predicted +.
+        Low motivation. Claim: the default N[UNIMOD:7] comes from covers_N
+        features on the b2 fragment VN next to the region. Evidence: b2 and b3
+        have the same mass under both peptides, no distinguishing peak; region
+        log p −0.129; F511 act 12.38 (covers_N, F1dom 0.024), F9744 6.61
+        (0.010), F3490 6.04 (0.152, Phase 8 ΔCE +0.0022); no L8 descriptions.
+        Confound: b2 = VN covers residue 1's N, which is correct under both
+        peptides, so covers_N on this peak need not be evidence about the
+        region residue.
+      - H2, row 51238 (evidence favours prediction; VL vs IV = LV, a swap). L8
+        {F5902, F3969} at tokens 75 and 81, F12279 at token 75 (peaks 74 / 80,
+        m2:6+-H2O / m2:6+); predicted +. Claim: the VL order rests on
+        internal-fragment peaks only the prediction explains, and the L8
+        internal-fragment features on them push towards VL (possible label
+        error). Evidence: all 5 distinguishing peaks are internal fragments
+        under the prediction (m2:4, m2:6, m2:14), none under the true peptide;
+        b2 identical; F5902 13.71 / 11.01 (is_internal_fragment, F1dom 0.070),
+        F3969 5.88 / 7.05 (0.217, Phase 8 ΔCE −0.0032), F12279 6.45 (0.138).
+        Caveat: the evidence rests only on internal-fragment matches, whose
+        chance rate was not measured when this was written (check (c) below:
+        decoys match 3–13 internal fragments in this spectrum).
+      - H3, row 109208 (evidence for true; Q vs Q[UNIMOD:7], region Δm −0.984 Da,
+        the prediction meets the precursor via isotope offset 1). L8 F2369 at
+        token 155, F3879 at 171, F5569 at 108, F7859 at 195; predicted +.
+        Claim (narrowed at review): the representations of these pred-only
+        b-ion peaks push towards the prediction (unmodified Q). Features chosen
+        by rule: the top L8 activation on each of the four most intense
+        pred-only b/y peaks (154 b10+-H2O, intensity rank 11; 170 b11+, 20; 107
+        b7+, 22; 194 b14+-H2O, 27; true-only peaks rank 58–197): F2369 17.21
+        (mz_mid, 0.072), F3879 16.17 (mz_high, 0.627, ΔCE −0.0081), F5569 15.33
+        (is_internal_fragment, 0.055), F7859 18.50 (mz_high, 0.452, ΔCE
+        −0.0054). The data lean to the prediction (25 pred-only, 11 b/y; 6
+        true-only, 3 b/y; and 5 of the 6 true-only peaks are 13C peaks of
+        predicted fragments, check (a)), so this is also a possible label
+        error. Side note: the true-only b9+ peak (m/z 920.458, 0.982 above the
+        pred b9+ at 919.476) is encoded at L8 mainly by F7398 (18.32,
+        is_NH3_loss).
+      - H4, row 29350 (ambiguous; TG vs SA at residues 0–1, isobaric, no
+        b/y peak in or at the region's edges). L8 {F1276, F2212, F7444} at
+        token 0; predicted +. Claim: with no fragment evidence, the last-decoded
+        N-terminal pair follows the spectrum-specific latent code, which
+        supports TG. Named: the L8 latent top-k features other than F46, F4646,
+        F4770, F5019 (in the L8 latent top-k of all six original cases): F1276
+        4.59 (F1dom 0.284), F2212 1.73 (0.204), F7444 1.40 (0.179). Residue log p
+        T −0.001, G −0.218. The least motivated hypothesis.
+      - H5, row 60182 (ambiguous; D vs N[UNIMOD:7] at residue 5, isobaric). L8
+        {F11636, F12167} at token 151 (y13, the most intense peak) and F11636
+        at token 149 (y13+-H2O); predicted +. Claim: the default D comes from
+        covers_D features on the y13 fragments, which contain the region
+        residue. Evidence: b5, y12, y13 have the same masses under both
+        peptides; region log p −0.458; F11636 9.66 / 5.19 (covers_D, 0.175,
+        ΔCE +0.0003), F12167 5.45 (0.150). y13 also covers the D at residue 6
+        under both peptides.
+      - H6, row 29977 (evidence for true; AV vs GI = GL at residues 11–12,
+        isobaric). L8 F6206 at token 19; predicted −. Claim: the one true-only
+        peak is represented and pushes towards the true peptide, too weakly to
+        overturn the default. Evidence: peak 18 (m/z 215.139, intensity rank
+        104 of 117) is internal m13:15 under the true peptide, noise under the
+        prediction; y6, y8 identical; region log p A −0.0001, V −0.550; F6206
+        12.10 (is_I_ion, 0.137) is the only L8 top-k entry on that peak whose top
+        concept is not an m/z bin. Caveat: the evidence rests only on one
+        internal-fragment match; decoys match 5–15 internal fragments in this
+        spectrum (check (c)), so one match is within chance.
+      - H7, row 43804 (evidence for true; Q vs K at residue 7, region Δm
+        −0.036 Da, precursor 17.4 ppm). L8 F9707 at tokens 124 and 119, F3971
+        at 123, F12249 at 112; predicted −. Deviation: added at review, after
+        seeing the candidate table (rank 10, the only top-ranked candidate with
+        clear b/y evidence for the true peptide) and before any ablation;
+        written from its case view (explain() only). Claim: the
+        representations of the true-only y-ion peaks push towards the true
+        peptide (K). Evidence: 19 true-only peaks (13 b/y) vs 2 pred-only (0
+        b/y); the y10–y15 and b9–b14 ions containing residue 7 match only K,
+        since 0.036 Da is ~20–30 ppm at m/z 1,000–1,800, just outside the
+        tolerance for the prediction. Region log p (Q) −0.333; EOS log p −5.70.
+        Features by H3's rule (top L8 activation on each of the four most
+        intense true-only b/y peaks): peak 123 y13+ (intensity rank 2): F9707
+        13.79 (covers_E, F1dom 0.206, ΔCE +0.0003); 122 y13+-H2O (8): F3971
+        14.83 (mz_high, 0.287, ΔCE −0.0013); 118 y12+ (11): F9707 14.37; 111
+        y11+ (13): F12249 16.65 (mz_mid, 0.081).
+
+      Descriptive checks before part B (no ablation; `python -m
+      inspector.runtime audit-checks --parquet <HF test> --isotope-rows 109208
+      74557 8647 31366 45595 39783 42191 --decoy-rows 51238 29977`, output
+      `analysis/v1_4c/descriptive_checks.json`, sha256
+      8f444cfe54d4b0f905e1002d1eccf355d0c828ed5be8d42759dc34e5bbdec94f; code:
+      `runtime.audit_descriptive_checks` and the `max_isotope` flag of
+      `annotate.run_spectrum_utils`, not yet committed, see the log):
+      (a) The 7 candidates whose label carries a deamidation and whose
+          prediction meets the precursor only via isotope offset 1, re-annotated
+          under the prediction with max_isotope=1. True-only peaks that become
+          13C isotope peaks of predicted fragments, and b/y counts:
+
+          | # | row | ppm iso 0 / 1 | pred-only (b/y) | true-only (b/y) | true-only → pred 13C (b/y) |
+          |---|---|---|---|---|---|
+          | 3 | 109208 | −339.6 / −1.3 | 25 (11) | 6 (3) | 5 (3) |
+          | 7 | 74557 | −719.1 / −1.7 | 9 (9) | 1 (1) | 0 (0) |
+          | 13 | 8647 | −551.3 / +2.1 | 18 (16) | 6 (5) | 4 (4) |
+          | 17 | 31366 | −330.7 / −4.6 | 7 (2) | 1 (1) | 1 (1) |
+          | 26 | 45595 | −453.2 / −3.7 | 20 (13) | 9 (2) | 6 (2) |
+          | 29 | 39783 | −700.8 / −7.7 | 9 (8) | 8 (7) | 3 (3) |
+          | 34 | 42191 | −861.2 / +0.3 | 7 (6) | 4 (4) | 4 (4) |
+
+          In all: 23 of 35 true-only peaks (17 of 23 true-only b/y) are 13C
+          peaks of predicted fragments; b/y favour the prediction in 5 rows,
+          rows ranked 17 (2 vs 1) and 29 (8 vs 7) are near-ties. Above ~967 Da a
+          13C peak (+1.00336) lies within 20 ppm of the +0.98402 deamidation
+          shift; misassigning 13C peaks of amidated peptides as deamidation is
+          a known artifact, so these labels may be wrong.
+      (b) Row 72165 (rank 30)'s true peptide is row 109208 (rank 3)'s true
+          peptide unmodified.
+      (c) Internal-fragment chance matches: 20 same-composition decoys of the
+          prediction (C-terminal residue fixed, the rest shuffled with their
+          modifications, `default_rng([0, row])`), one label per peak. Row
+          51238 (H2, 179 peaks): peaks labelled internal, prediction 21, true
+          peptide 16, decoys mean 9.3 [3, 13]; any fragment 54 / 49 / decoys 19.6
+          [14, 25]. Row 29977 (H6, 117 peaks): internal 16 / 17 / decoys 8.9
+          [5, 15]; any fragment 48 / 49 / decoys 14.4 [10, 20]. So 5–8% of
+          peaks match an internal fragment of a random same-composition
+          sequence at 20 ppm.
+      (d) Control pools (rule below, from the SAE features at each named
+          token): L0 at token / named feature's activation rank / pool size.
+          H1: F511 26/2/2 (underpowered), F9744 26/4/8, F3490 26/5/9; 49
+          distinct sets. H2: F5902@75 34/1/1 (underpowered), F5902@81 37/1/4,
+          F3969@75 34/5/10, F3969@81 37/4/10, F12279 34/3/10; 1,080 sets. H3:
+          F2369 43/1/3, F3879 50/1/1 (underpowered), F5569 50/1/3, F7859 49/1/0
+          (underpowered); 0 sets. H4: L0 7 at the latent token (confirmed), so
+          the pool of each named feature is exactly F46, F4646, F4770, F5019
+          (all ≥ 0.5×); 4 sets. H5: F11636@151 41/2/9, F12167 41/8/10,
+          F11636@149 36/8/10; 540 sets. H6: L0 1 at token 19 (F6206 is the only
+          active L8 feature there), pool 0; 0 sets. H7: F9707@124 36/1/3,
+          F3971 30/1/2 (underpowered), F9707@119 38/1/4, F12249 37/1/2
+          (underpowered); 48 sets. Under the outcome rule below, H3, H4 and H6
+          are therefore undetermined by construction; H1, H2, H5 and H7 can be
+          decided. H3's and H7's named features are rank 1 at their tokens by
+          construction (top activation), so all their pool members are weaker.
+
+      Part B protocol (fixed with the hypotheses):
+      - Contexts: ctx_p = `ablation_context(spec, exp)` and
+        ctx_t = `ablation_context(spec, exp, target=T)`, with `exp` = a fresh
+        `explain()` that must reproduce the saved explanation's prediction.
+        T = the prediction's tokens outside the region plus the true region
+        with I mapped to L: pred[:start] + L(true[start:end_true]) +
+        pred[end_pred:]. In all seven cases the prediction's region contains
+        no I, so this equals setting I/L to match the prediction. T replaces
+        the raw `modified_sequence` because `ablation_context` does not
+        canonicalise I/L (`runtime.py:871` maps only modification notation
+        through InstaNovo's `residue_remapping`, which has no I/L entry) and I
+        and L are distinct InstaNovo tokens, while the accuracy metric and the
+        region use I = L; the true peptides of H3, H4, H6 and H7 differ from
+        the prediction by I/L outside the region (so "same C-terminal suffix"
+        holds only after mapping), and the true regions of H2 (IV) and H6 (GI)
+        contain I.
+      - Metric: M = Σ log p(pred region | ctx_p) − Σ log p(L(true region) | ctx_t),
+        per-residue log p in residue order over the regions in the candidate
+        table (an empty region adds 0; EOS is not in the region). InstaNovo
+        decodes C→N and T shares the prediction's tokens outside the region,
+        so both regions are conditioned on the same C-terminal suffix. Effect
+        of a set S: E(S) = M(intact) − M(S removed), the negative of the raw
+        ablation delta of M. E > 0: S pushed the model towards its wrong
+        answer.
+      - Ablation: exact, error-preserving (SAE error kept), joint removal of the
+        named set, local at the named tokens, one layer, in both contexts.
+        Needs a small extension (`ablate` runs single features, `ablate_token`
+        all features at one token): a joint ablation of an arbitrary set of
+        (feature, token) pairs at one layer, built in part B with a test that it
+        equals `ablate` for a single pair and `ablate_token`'s joint for a full
+        token.
+      - Reported per hypothesis: E and E / M(intact); per-residue deltas in both
+        contexts; whole-sequence Δ (residues + EOS) in both; each named
+        feature's single-feature E; the joint ablation of all active features at
+        each named token as a reference scale (with the V1-4b caveat: a large
+        edit, not a clean total); provenance (exact, error-preserving, local,
+        targets as above, n = 1 spectrum, no CI).
+      - Control: 20 draws with `np.random.default_rng([0, row])`. Pool of a named
+        (feature, token) (`runtime.control_pool`): the non-named active features
+        at that token and layer with activation ≥ 0.5 × the named feature's (a
+        judgement call), of which the 10 nearest in activation rank (ties to
+        the higher activation); fewer than 3 qualifying → that item's control
+        is marked "underpowered". A draw takes one feature per named item
+        uniformly from its pool, with no (feature, token) pair twice in a draw,
+        and is ablated exactly as the hypothesis set. For every draw, report
+        Σ activation(control) / Σ activation(named); decoder rows have unit
+        norm, so this is the ratio of the removed norms. Report every control E
+        and E / M(intact), and the number of distinct draws. Percentile =
+        (#controls with E below the hypothesis's + ½ #ties) / 20, taken in the
+        predicted direction (signs flipped for a predicted −).
+      - Outcome (pre-registered): undetermined = fewer than 10 distinct
+        control draws (including any item with an empty pool); otherwise
+        supported = predicted sign and beyond all 20 controls in that
+        direction; weak = predicted sign but not beyond all controls; not
+        supported = wrong sign. "Weak" needs only the predicted sign (~50% by
+        chance). If the controls are exchangeable with the hypothesis set,
+        each test has a 1/21 chance of "supported" by chance, so across the
+        four decidable tests (H1, H2, H5, H7) about 0.2 false "supported"
+        results are expected (0.3 had all six original tests been decidable).
+        Always reported with the numbers (n = 1 spectrum each; 20 draws give
+        5% resolution) and the underpowered items. E / M(intact) is reported
+        alongside, for scale only; it does not change the outcome.
+      - Caveats stated with the results: every test spectrum was SAE training
+        data (Finding 7); L8 has no descriptions (V1-2c), so the dictionary
+        evidence above is concept associations only, all weak (F1dom ≤ 0.63);
+        the encoder does not see the peptide; H2, H3 (and the deamidation
+        labels in check (a)) may be label errors; the layer choice was post hoc.
 - [ ] **V1-5 Data for the tool** — feature examples; demo set from the HF test
       split. Verified by Finding 7 from code and logs: chunk 520's spectrum
       IDs start at row 532,480, and the SAE validation chunks are 17, 116, 135,
@@ -697,3 +919,4 @@ any result on the test split must state it.
 - 2026-11-24 — CLAUDE.md and STATUS.md brought up to date after V1-4b: CLAUDE.md goal, layout, dependency and causal-effect rules; V1-4a notes the renamed flag; V1-4c gets its metric and contexts; V1-6 spec built on the V1-4b API. No code changed.
 - 2026-11-24 — V1-4b commits pushed (`992b3b4`..`f8eb7df`); the joint-ablation caveat added to V1-4b's results (the joint figure is a reference scale, not a clean total). No code changed.
 - 2026-11-24 — V1-4c part A, case selection: `runtime.py` gets the `audit-cases` subcommand and pure helpers (`differing_region`, `mismatch_type`, `distinguishing_peaks`, `evidence_class`, `mean_residue_log_prob`, `select_audit_cases`, `case_view`), additive; the CLI's `main` now returns a subcommand's exit code (the existing ones return 0 as before). The regenerated predictions reproduce V1-4a (123 exact, 167 meeting the precursor); 44 candidates, 6 selected; table under V1-4c. No ablation calls. 167 tests pass (23 new).
+- 2026-11-24 — V1-4c part A, pre-registration, amended at review before commit: hypotheses H1–H7 (H7 a logged deviation; all at layer 8, a post-hoc choice now recorded) and the part-B protocol under V1-4c (ctx_t target = the prediction outside the region plus the I→L-mapped true region, since ablation_context does not canonicalise I/L; control pools with a 0.5× activation floor and an underpowered mark; removed-norm ratios; "undetermined" below 10 distinct control draws, which H3, H4 and H6 hit by construction). Descriptive checks (no ablation) under V1-4c: 23 of 35 true-only peaks of the 7 isotope-offset deamidation candidates are 13C peaks of predicted fragments; decoys match 5–8% of peaks as internal fragments. hypotheses.json sha256 2177039b…e84a9. Not in this commit (STATUS.md only, as asked): the check code (`runtime.audit_descriptive_checks`, `control_pool`, `n_distinct_control_sets`, `peptide_decoys`, the `audit-checks` subcommand), the additive `max_isotope` flag of `annotate.run_spectrum_utils` (default 0, unchanged behaviour) and 4 tests; they stay in the working tree for review and go into the repo with part B. No ablation calls.

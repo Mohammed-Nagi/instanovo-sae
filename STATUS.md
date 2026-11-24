@@ -131,19 +131,45 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a.
       6 of 20 test predictions (rows 4506–4525) differ between
       `use_spectrum_utils` True and False, 5 only by I↔L, 1 a different
       peptide.
-- [ ] **V1-4b Attribution patching and verify** — first step: slim the
-      Explanation JSON as `EXPLAIN_SCHEMA_VERSION` 2. Each listed feature
-      carries a per-feature summary instead of its full dictionary row (V1-4a
-      measured 0.8–1.9 MB per spectrum, 85% full rows); the dashboard reads
-      full rows from the dictionary it already loads. Then per-spectrum
-      attribution patching: zero-ablation estimate −a·(d·∂m/∂x) from a normal backward pass,
-      so the SAE error term is untouched; metric m = log p of each predicted
-      residue under teacher forcing. Exact error-preserving ablation (subtract
-      a·d, rerun) verifies on demand and returns Δ log p per residue. Effects
-      are split by token type (latent vs peak), reported per token and in total.
-      The per-peak view uses peak tokens only; latent-token features get a
-      separate spectrum-summary panel. First measure the timings (AtP pass,
-      exact ablation) on a few spectra. Tests on one spectrum.
+- [ ] **V1-4b Slim JSON and exact ablation** (revised 2026-11-24: no
+      attribution patching in the tool; the AtP study moved to V1.1-1, where
+      the planning preview is recorded). First step: slim the Explanation JSON
+      as `EXPLAIN_SCHEMA_VERSION` 2. Each listed feature carries a per-feature
+      summary instead of its full dictionary row (V1-4a measured 0.8–1.9 MB per
+      spectrum, 85% full rows); the dashboard reads full rows from the
+      dictionary it already loads, checked by the dictionary file's hash.
+      Then exact error-preserving ablation (subtract a·W_dec[f] from the layer
+      output, rerun teacher-forced; the SAE error term is kept) in two scopes:
+      local = the feature at one token only; global = the feature at every
+      token where it fires. Both report Δ log p per residue and in total
+      (residues + EOS), labelled with their scope. Per-peak view: local
+      ablation of every active feature at the selected token, for the selected
+      layer (not just the top-k listed), sorted by |delta_total|, activation
+      shown. Latent panel: the same at token 0, labelled "latent token only";
+      no ranking proxy and no top-N cut. Global stays available through
+      `ablate` (e.g. a feature card's "remove everywhere"). `ablate_token`
+      also runs one joint ablation (all active features at the token removed
+      together) and returns `joint_delta_total`, per-residue joint deltas and
+      `sum_of_singles`, labelled "joint = what the SAE-explained content at
+      this token contributes; a joint effect far from the sum of singles
+      indicates redundancy or interaction". `ablation_context` takes an
+      optional target peptide (default: the prediction) to teacher-force
+      instead; results record the target used, and the provenance string
+      follows it (for V1-4c's Δ[log p(pred) − log p(true)]). UI caveat: a
+      single-feature effect understates the importance of redundant features;
+      small means "removing this alone changes little". Timings for both
+      scopes and per-click times for both panels on 3 spectra. Tests on one
+      spectrum. For the record: the SAEs' decoder rows have unit norm
+      (`train.py:17`; the checkpoints record 0.99999976–1.0000002 at all four
+      layers), so a ranking by activation × decoder norm would equal ranking
+      by activation.
+      What exact ablation measures, and its limits: it removes only the
+      SAE-captured component a·W_dec[f]. SAE shrinkage can leave part of a
+      concept's direction in the error term, which is kept, so effects are
+      lower bounds for the concept. Single-feature edits can produce activation
+      combinations the model rarely sees. A feature may be one part of a split
+      concept, or a concept may be absorbed into another feature, so a small
+      single-feature effect does not mean the concept is unimportant.
 - [ ] **V1-4c Audit case study** — pick 3–5 confidently wrong predictions
       from the V1-4a accuracy run (seed 0); use the inspector to form a
       hypothesis for each failure; test it by exact ablation; record what
@@ -151,7 +177,15 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a.
 - [ ] **V1-5 Data for the tool** — feature examples; demo set from the HF test
       split. Verified by Finding 7 from code and logs: chunk 520's spectrum
       IDs start at row 532,480, and the SAE validation chunks are 17, 116, 135,
-      141, 230, 292, 316, 397, 448, 462, 489, 495. Calibrate the per-spectrum SAE-fit indicator: the
+      141, 230, 292, 316, 397, 448, 462, 489, 495. Offline exhaustive exact
+      ablation for the demo set, both scopes (local over every active
+      (token, feature) pair, global over every active feature, all four
+      layers); report the runtime. Planning estimate from V1-4b's preview:
+      1,073–5,316 active pairs and 500–1,250 active features per layer, so
+      ~3–40 min (local) and ~1.5–9 min (global) per spectrum; the output
+      location is to be agreed (no new output roots without asking). It also
+      shows how often a weakly active feature has a large effect (V1.1-1's
+      F647). Calibrate the per-spectrum SAE-fit indicator: the
       per-spectrum centred FVE is not comparable to the corpus FVE in the
       eval reports, so compute its distribution per layer over local
       spectra and show a spectrum's value as a percentile of that reference
@@ -198,6 +232,37 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a.
       separately for latent and peak features. Cross-check against Phase 8.
       Write the results to the dictionary. If agreement is poor, switch the
       global run to integrated gradients.
+      AtP-vs-exact agreement study (moved here from V1-4b, 2026-11-24):
+      candidate estimators plain AtP, integrated gradients and AtP* (Kramár et
+      al. 2024); exact error-preserving ablation is the reference; report rank
+      correlation, sign agreement and top-k overlap separately for latent and
+      peak tokens, with bootstrap CIs over spectra.
+      First evidence (2026-11-24, read-only planning script, not in the repo):
+      HF test rows 4506–4508 (= chunk 520 rows 0–2; predictions
+      GQPLTQADLSNPTR, SEYDRGVSTFSPEGR, LIGDAAKDQAAINPR). Per layer, AtP's top
+      10 features by |Δ̂ sequence log p| plus 10 random other active features
+      (`default_rng(0)`), each ablated exactly at every token where it fires
+      (error-preserving, teacher-forced on the prediction). Spearman ρ, AtP vs
+      exact, L2/L4/L6/L8: row 4506 0.76/0.84/0.68/0.55; 4507
+      0.46/0.98/0.76/0.91; 4508 0.23/0.51/0.98/0.80. Sign agreement within
+      AtP's top 10: 0.6–1.0. Underestimates (AtP vs exact): −0.223 vs −4.609
+      (4506 L2, 21×); −0.113 vs −1.580 (4507 L8, 14×); −0.140 vs −1.356 (4507
+      L4, 10×); −0.132 vs −1.111 (4507 L6, 8×); −0.226 vs −1.372 (4506 L2,
+      6×). Sign errors among AtP's top 3: +0.930 vs −2.886 (4508 L4), +0.423 vs
+      −0.893 (4508 L2), +1.512 vs −0.660 (4508 L8); near zero: −0.202 vs
+      +0.031 (4506 L6), +0.550 vs −0.026 (4506 L8). Random features: the
+      largest exact effect was L2 F647 on row 4506 (AtP rank 30 of 497: −0.041
+      vs exact −0.202), twice the median exact |Δ| of AtP's top 10 at that
+      layer (0.097). In 5 of 12 (spectrum, layer) cells the largest random
+      feature exceeded the smallest exact |Δ| in AtP's top 10 (all ≤ 0.074
+      except F647). Two random features had a sign error (4506 L6 F8887, rank
+      13: −0.083 vs +0.069; 4508 L4 F5326, rank 116: +0.056 vs −0.020). Below
+      rank ~100, AtP ≈ exact (|Δ| ≤ 0.03). A biased sample (top 10 + 10 random
+      of 500–1,250 active features per layer): a sanity check, not a
+      calibration. Notes for the study: per-residue gradients via n+1 backward
+      passes on one forward took 1.0–2.0 s, faster than one backward over n+1
+      batch copies (1.4–5.6 s); grad-path vs inference-path log p differ by
+      ≤ 1.9e-6. Rows 4506–4508 were SAE training data (Finding 7).
 - [ ] **V1.1-2 Descriptions at scale** — pilot a cheaper model on the V1-2
       features against gpt-4o, then describe features in priority order (hubs,
       then by firing rate) with the Batch API; rebuild the dictionary.
@@ -498,3 +563,4 @@ any result on the test split must state it.
 - 2026-11-22 — STATUS moved from `docs/STATUS.md` to the repo root; `STATUS.md` and `CLAUDE.md` are now committed (repo is public; checked for secrets), `docs/` stays gitignored. E1 moved ahead of V1-4b and specified (strong baseline, raw-activation control, peptide-grouped CV, paired AUROC differences). SAE-fit calibration added to V1-5; the backlog's corpus-FVE item folded into it.
 - 2026-11-22 — E1 planned, then moved to v1.1 as V1.1-3 (pre-specified, for the paper; the tool's v1 does not depend on it) with a revised design: Winnow baseline, top-32 class-mean-difference selection, random-encoder control S_rand in place of the raw-activation block, gradient boosting. Beam margin is available from the decoder (`return_beam`, already passed). Finding 7 added (every test-split chunk was SAE training data, with file and log evidence); V1-4c (audit case study) added after V1-4b; two cluster backlog items (exclude the test split at retraining; v1.2.0 is now InstaNovo's default model). Housekeeping: CLAUDE.md and STATUS.md tracked, `docs/` stays ignored (`4cea931`). No code changed.
 - 2026-11-22 — Public-facing fixes (`c1b7c35`), then a staleness audit: stale docs and comments fixed and the V1-7 README note extended (`b1ef982`); `build_dictionary` raises on a description run without a `blind` column and `interpret.py` defaults `--env-file` to the repo-root `.env` (see Behaviour changes). Rebuilding layers 2/4/6 in memory with `blind_v1` reproduces the stored dictionaries exactly. `extract.load_layer_activations` (unused) kept; `run_pipeline.sh` Step 6 stays in the backlog. 130 tests pass. No API calls.
+- 2026-11-24 — S_rand in V1.1-3 fixed before it runs (`992b3b4`): frozen-decoder SAE preferred, the untrained initialisation as fallback, with train.py lines cited. V1-4b planned, then revised after a read-only preview showed attribution patching unreliable at the top of the ranking (large effects underestimated up to 21×, sign errors): the tool uses exact error-preserving ablation only (local and global scopes, per-peak and latent panels over every active feature, a joint ablation per token, an optional target peptide). The AtP study and the preview's numbers moved to V1.1-1; offline exhaustive ablation for the demo set added to V1-5. No code changed.

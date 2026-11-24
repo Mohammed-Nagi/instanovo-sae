@@ -8,8 +8,9 @@ fragment-ion annotator, an evaluation suite, and LLM feature descriptions.
 An **interpretability tool used alongside InstaNovo**: a Python API plus a
 dashboard that lets scientists using InstaNovo inspect a spectrum as the model
 processes it — which SAE features fire on each peak at each layer, what they
-mean, how well that meaning is validated, and what happens to the prediction
-when a feature is ablated. Scope is the encoder; the tool explains what the
+mean, how well that meaning is validated, and how the log-probability of each
+predicted residue (or of a given target peptide) changes when a feature is
+removed by exact, error-preserving ablation. Scope is the encoder; the tool explains what the
 encoder extracted, not how the decoder chose each residue, and the UI says so.
 
 The paper is on hold. Work proceeds in versions: **v1 is a small, solid,
@@ -27,8 +28,8 @@ src/                       one source root (run with PYTHONPATH=src)
 ├── analysis.py            post-hoc analysis over eval outputs           (v1, new)
 ├── build_dictionary.py    builds the feature dictionary                  (v1, new)
 └── inspector/             the tool                                       (v1, new)
-    ├── runtime.py         explain(spectrum), exact ablation (V1-4b)
-    ├── dictionary.py      loads the feature dictionary
+    ├── runtime.py         explain(spectrum) (V1-4a), exact ablation (V1-4b)
+    ├── dictionary.py      loads the feature dictionary; per-feature summaries
     └── app.py             dashboard                                      (V1-6, not yet)
 tests/                     pytest
 paper_artifacts/           released report.json per layer, description CSVs (unblinded,
@@ -71,8 +72,9 @@ Anything needing the full corpus (Phase 4, full Phase 8) waits for the cluster.
   modules without asking. Edit modules in place; new behaviour goes behind a flag.
 - Every generated file goes under `sae_pipeline_outputs/<stage>/`.
 - Every number that reaches a report or the UI is computed by code in this repo.
-- The tool depends on the pipeline only through checkpoints, `instanovo_io`,
-  `annotate`, and the dictionary — not through eval internals.
+- The tool depends on the pipeline only through checkpoints (SAEs read with
+  `train.load_sae_from_checkpoint`), `instanovo_io`, `annotate`, `schema` and the
+  dictionary — not through eval internals.
 - Stay inside the current v1 task. Ideas for later go into the backlog in
   `STATUS.md`, not into code.
 - Machine: 15.4 GB RAM (often a few GB free), 6 cores, no usable GPU. Load one
@@ -80,11 +82,13 @@ Anything needing the full corpus (Phase 4, full Phase 8) waits for the cluster.
 - Work on `main`, one commit per finished task. `docs/` is gitignored and stays
   local. `CLAUDE.md` and `STATUS.md` are committed and the repo is public: never
   write keys, tokens, personal paths or private notes into them.
-- Causal effects are reported as effect sizes with their provenance (estimated
-  by attribution patching vs verified by exact ablation; SAE-patched vs
-  error-preserving; n spectra; CI if any) — no binary labels or thresholds
-  without uncertainty. Features never measured are "untested", never "not
-  important".
+- Causal effects are reported as effect sizes with their provenance (exact
+  ablation vs an estimate such as attribution patching; scope local / global /
+  joint; the teacher-forced target; SAE-patched vs error-preserving; n spectra;
+  CI if any) — no binary labels or thresholds without uncertainty. Features
+  never measured are "untested", never "not important". The tool itself uses
+  exact ablation only (V1-4b; AtP was unreliable, see V1.1-1), and a small
+  single-feature effect means "removing this alone changes little".
 - Keep the existing style: idempotent stages, schema versions, seeded RNGs,
   loud errors over silent fallbacks. Python 3.10–3.13, `uv`.
 - Run tests with `PYTHONPATH=src uv run python -m pytest tests`

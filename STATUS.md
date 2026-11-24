@@ -102,7 +102,7 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a, V1-4b.
       extraction and InstaNovo 1.1.0's own training and prediction (in 1.1.0
       `SpectrumDataset._process_peaks` always used spectrum_utils); only
       InstaNovo 1.2.x's `predict.py` uses False. `explain(spectrum,
-      attribution=False)`: beam-search prediction (max_length from the model
+      attribution=False)` (since V1-4b `latent_ablation=False`): beam-search prediction (max_length from the model
       config) plus per-residue log-probs from a teacher-forced pass on the
       predicted peptide; layers 2/4/6/8 encoded through the SAEs; top-k active
       features per peak per layer with dictionary lookup; peaks annotated
@@ -199,7 +199,11 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a, V1-4b.
 - [ ] **V1-4c Audit case study** — pick 3–5 confidently wrong predictions
       from the V1-4a accuracy run (seed 0); use the inspector to form a
       hypothesis for each failure; test it by exact ablation; record what
-      held and what didn't. Candidates feed the V1-5 demo set.
+      held and what didn't. Metric: Δ[log p(pred) − log p(true)], from two
+      contexts, `ablation_context(spec, exp)` and
+      `ablation_context(spec, exp, target=modified_sequence)` (V1-4b), so it
+      shows whether removing a feature moves the model towards the truth.
+      Candidates feed the V1-5 demo set.
 - [ ] **V1-5 Data for the tool** — feature examples; demo set from the HF test
       split. Verified by Finding 7 from code and logs: chunk 520's spectrum
       IDs start at row 532,480, and the SAE validation chunks are 17, 116, 135,
@@ -219,8 +223,17 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a, V1-4b.
       metadata).
 - [ ] **V1-6 Dashboard** — `src/inspector/app.py`, Streamlit.
       Spectrum plot with peaks coloured by annotation, layer selector, per-peak
-      feature panel, feature card (labels, evidence indicators, top examples), ablate button
-      showing per-residue change, an "encoder-only" scope note.
+      feature panel, feature card (labels, evidence indicators, top examples),
+      an "encoder-only" scope note, and the InstaNovo version the SAEs explain
+      (v1.1.0). Ablation, built on V1-4b: per-peak panel = `ablate_token` on
+      the clicked peak for the selected layer (every active feature, sorted by
+      |delta_total|, activation shown, joint vs sum of singles; 1–6.5 s per
+      click, so show progress); latent panel = `ablate_token(ctx, L, 0)`,
+      labelled "latent token only"; feature card "remove everywhere" =
+      `ablate(..., "global")`. Every effect shows its scope, provenance and the
+      single-feature caveat. Cache the Inspector and the AblationContext per
+      spectrum; read full rows with `feature_row` (fails on a dictionary hash
+      mismatch).
 - [ ] **V1-7 README** — Update README claims once all work is finished.
       Still stale (README line numbers as of 2026-11-22):
       - 10: "Code for the paper of the same name". The paper is on hold, and
@@ -603,5 +616,6 @@ any result on the test split must state it.
 - 2026-11-22 — STATUS moved from `docs/STATUS.md` to the repo root; `STATUS.md` and `CLAUDE.md` are now committed (repo is public; checked for secrets), `docs/` stays gitignored. E1 moved ahead of V1-4b and specified (strong baseline, raw-activation control, peptide-grouped CV, paired AUROC differences). SAE-fit calibration added to V1-5; the backlog's corpus-FVE item folded into it.
 - 2026-11-22 — E1 planned, then moved to v1.1 as V1.1-3 (pre-specified, for the paper; the tool's v1 does not depend on it) with a revised design: Winnow baseline, top-32 class-mean-difference selection, random-encoder control S_rand in place of the raw-activation block, gradient boosting. Beam margin is available from the decoder (`return_beam`, already passed). Finding 7 added (every test-split chunk was SAE training data, with file and log evidence); V1-4c (audit case study) added after V1-4b; two cluster backlog items (exclude the test split at retraining; v1.2.0 is now InstaNovo's default model). Housekeeping: CLAUDE.md and STATUS.md tracked, `docs/` stays ignored (`4cea931`). No code changed.
 - 2026-11-22 — Public-facing fixes (`c1b7c35`), then a staleness audit: stale docs and comments fixed and the V1-7 README note extended (`b1ef982`); `build_dictionary` raises on a description run without a `blind` column and `interpret.py` defaults `--env-file` to the repo-root `.env` (see Behaviour changes). Rebuilding layers 2/4/6 in memory with `blind_v1` reproduces the stored dictionaries exactly. `extract.load_layer_activations` (unused) kept; `run_pipeline.sh` Step 6 stays in the backlog. 130 tests pass. No API calls.
-- 2026-11-24 — S_rand in V1.1-3 fixed before it runs (`992b3b4`): frozen-decoder SAE preferred, the untrained initialisation as fallback, with train.py lines cited. V1-4b planned, then revised after a read-only preview showed attribution patching unreliable at the top of the ranking (large effects underestimated up to 21×, sign errors): the tool uses exact error-preserving ablation only (local and global scopes, per-peak and latent panels over every active feature, a joint ablation per token, an optional target peptide). The AtP study and the preview's numbers moved to V1.1-1; offline exhaustive ablation for the demo set added to V1-5. No code changed.
-- 2026-11-24 — V1-4b done: Explanation schema 2 (summaries plus dictionary hash), exact error-preserving ablation (local/global scopes, `ablate_token` over every active feature at a token plus a joint ablation, optional target peptide), `explain(latent_ablation=)`. Results and timings under V1-4b; behaviour changes recorded; two backlog items (re-decode under ablation, faster per-peak clicks). 144 tests pass.
+- 2026-11-24 — S_rand in V1.1-3 fixed before it runs (`992b3b4`): frozen-decoder SAE preferred, the untrained initialisation as fallback, with train.py lines cited. V1-4b planned, then revised (`8d6793b`) after a read-only preview showed attribution patching unreliable at the top of the ranking (large effects underestimated up to 21×, sign errors): the tool uses exact error-preserving ablation only (local and global scopes, per-peak and latent panels over every active feature, a joint ablation per token, an optional target peptide). The AtP study and the preview's numbers moved to V1.1-1; offline exhaustive ablation for the demo set added to V1-5. No code changed.
+- 2026-11-24 — V1-4b done (`80e2653`): Explanation schema 2 (summaries plus dictionary hash), exact error-preserving ablation (local/global scopes, `ablate_token` over every active feature at a token plus a joint ablation, optional target peptide), `explain(latent_ablation=)`. Results and timings under V1-4b; behaviour changes recorded; two backlog items (re-decode under ablation, faster per-peak clicks). 144 tests pass.
+- 2026-11-24 — CLAUDE.md and STATUS.md brought up to date after V1-4b: CLAUDE.md goal, layout, dependency and causal-effect rules; V1-4a notes the renamed flag; V1-4c gets its metric and contexts; V1-6 spec built on the V1-4b API. No code changed.

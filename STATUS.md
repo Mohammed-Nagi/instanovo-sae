@@ -195,7 +195,10 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a, V1-4b.
       4–6.5 s (borderline). Exhaustive ablation stays offline (V1-5). Joint vs
       sum of singles differ widely, e.g. row 4506 L2 max-L0 peak: joint −3.39 vs
       singles −0.69; L8 latent: −1.36 vs −0.10; row 4508 L8 latent: +0.79 vs
-      +1.93, consistent with redundancy and interaction. 144 tests pass (14 new).
+      +1.93, consistent with redundancy and interaction. Caveat: removing
+      every feature at a token is a large edit that can produce states the
+      model rarely sees; the joint figure is a reference scale, not a clean
+      total. 144 tests pass (14 new).
 - [ ] **V1-4c Audit case study** — pick 3–5 confidently wrong predictions
       from the V1-4a accuracy run (seed 0); use the inspector to form a
       hypothesis for each failure; test it by exact ablation; record what
@@ -619,3 +622,4 @@ any result on the test split must state it.
 - 2026-11-24 — S_rand in V1.1-3 fixed before it runs (`992b3b4`): frozen-decoder SAE preferred, the untrained initialisation as fallback, with train.py lines cited. V1-4b planned, then revised (`8d6793b`) after a read-only preview showed attribution patching unreliable at the top of the ranking (large effects underestimated up to 21×, sign errors): the tool uses exact error-preserving ablation only (local and global scopes, per-peak and latent panels over every active feature, a joint ablation per token, an optional target peptide). The AtP study and the preview's numbers moved to V1.1-1; offline exhaustive ablation for the demo set added to V1-5. No code changed.
 - 2026-11-24 — V1-4b done (`80e2653`): Explanation schema 2 (summaries plus dictionary hash), exact error-preserving ablation (local/global scopes, `ablate_token` over every active feature at a token plus a joint ablation, optional target peptide), `explain(latent_ablation=)`. Results and timings under V1-4b; behaviour changes recorded; two backlog items (re-decode under ablation, faster per-peak clicks). 144 tests pass.
 - 2026-11-24 — CLAUDE.md and STATUS.md brought up to date after V1-4b: CLAUDE.md goal, layout, dependency and causal-effect rules; V1-4a notes the renamed flag; V1-4c gets its metric and contexts; V1-6 spec built on the V1-4b API. No code changed.
+- 2026-11-24 — V1-4b commits pushed (`992b3b4`..`f8eb7df`); the joint-ablation caveat added to V1-4b's results (the joint figure is a reference scale, not a clean total). No code changed.

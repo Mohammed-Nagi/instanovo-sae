@@ -45,7 +45,11 @@ DICTIONARY_SCHEMA_VERSION = 1
 
 # inspector/runtime.py: the Explanation JSON returned by explain(), consumed by
 # the dashboard. Explanation.from_json rejects any other version.
-EXPLAIN_SCHEMA_VERSION = 1
+# v2 (V1-4b): features[L][f] is a summary (inspector.dictionary.SUMMARY_KEYS
+# plus spectrum fields) instead of the full dictionary row; provenance carries
+# each dictionary's sha256 so full rows are read from the matching file; the
+# `attribution` key is replaced by `ablation` (exact ablation at the latent token).
+EXPLAIN_SCHEMA_VERSION = 2
 
 # interpret.py: description runs live in interpret/layer_{L}/<run_tag>/. The
 # archive directory beside them keeps superseded runs as provenance; no stage

@@ -11,8 +11,8 @@ with honest labels and evidence indicators (association, causal and
 description coverage, with their effect sizes), and ablate a feature to see the effect
 on each predicted residue.
 
-Open, in order: V1-4b, V1-4c, V1-5, V1-6, V1-2c (when API credit is
-available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a.
+Open, in order: V1-4c, V1-5, V1-6, V1-2c (when API credit is
+available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a, V1-4b.
 
 - [x] **V1-1 Hub inventory** — `src/analysis.py`, output `analysis/hubs.csv`.
       From existing per-feature ablations in each layer's report.json: rank by
@@ -131,7 +131,7 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a.
       6 of 20 test predictions (rows 4506–4525) differ between
       `use_spectrum_utils` True and False, 5 only by I↔L, 1 a different
       peptide.
-- [ ] **V1-4b Slim JSON and exact ablation** (revised 2026-11-24: no
+- [x] **V1-4b Slim JSON and exact ablation** (revised 2026-11-24: no
       attribution patching in the tool; the AtP study moved to V1.1-1, where
       the planning preview is recorded). First step: slim the Explanation JSON
       as `EXPLAIN_SCHEMA_VERSION` 2. Each listed feature carries a per-feature
@@ -170,6 +170,32 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a.
       combinations the model rarely sees. A feature may be one part of a split
       concept, or a concept may be absorbed into another feature, so a small
       single-feature effect does not mean the concept is unimportant.
+      Done: `inspector/runtime.py` (`ablation_context`, `ablate`,
+      `ablate_token`, `explain(latent_ablation=)`, `feature_row`; the per-call
+      container is `AblationReport`), `inspector/dictionary.py`
+      (`SUMMARY_FIELDS`, `summary`, `sha256_16`, `causal_provenance`). Joint
+      ablation keeps b_dec (the SAE's "nothing active" state), so at the token
+      x′ − b_dec = x − x̂, matching the single ablations; the test asserts
+      that. `latent_ablation` defaults to False so `explain()` costs what it
+      did. Results (`python -m inspector.runtime time --ablation`, HF test rows
+      4506–4508 = 35 / 152 / 114 peaks, CPU, 6 threads):
+      JSON without latent ablation 325 / 871 / 766 KB (V1-4a 0.78 / 1.92 /
+      1.76 MB, so 55–58% smaller); features block 77% / 66%, ~406 B per
+      summary (mostly key names; the planning estimate of ~200 B was low),
+      so the next lever, not taken, is a compact encoding. With latent ablation
+      421 / 891 / 785 KB. L0 at the latent token 25–33 / 5–9 / 4–9 per layer.
+      Timings: one ablation (either scope) 0.10–0.11 / 0.20–0.22 /
+      0.17–0.19 s; ablation context 0.19 / 0.34 / 0.27 s; per-peak click (all
+      active features at one token, one layer, plus the joint) 1.0–1.7 /
+      3.8–6.5 / 2.5–5.0 s (L0 31–62, about 0.1 s per feature, batched 32 + 1);
+      latent click, one layer, 0.76–1.04 / 0.71–1.14 / 0.44–0.83 s; all four
+      latent layers 3.8 / 4.0 / 3.0 s, so `explain(latent_ablation=True)` takes
+      5.2–6.8 s warm. Interactive: single ablations, the latent panel, and the
+      per-peak view on small spectra; per-peak clicks on ~150-peak spectra take
+      4–6.5 s (borderline). Exhaustive ablation stays offline (V1-5). Joint vs
+      sum of singles differ widely, e.g. row 4506 L2 max-L0 peak: joint −3.39 vs
+      singles −0.69; L8 latent: −1.36 vs −0.10; row 4508 L8 latent: +0.79 vs
+      +1.93, consistent with redundancy and interaction. 144 tests pass (14 new).
 - [ ] **V1-4c Audit case study** — pick 3–5 confidently wrong predictions
       from the V1-4a accuracy run (seed 0); use the inspector to form a
       hypothesis for each failure; test it by exact ablation; record what
@@ -399,11 +425,25 @@ stated, with the tests that show it (V1-4a's in `tests/test_inspector_runtime.py
   no `src/.env` exists, the Docker/AIchor ignore files ship only `src/*.py`, and
   `run_pipeline.sh` passes `--env-file` from `INTERPRET_ENV_FILE`. Shown by
   `test_default_env_file_is_the_repo_root_dotenv`.
+- V1-4b, `inspector/runtime.py`: `explain()` emits Explanation schema 2.
+  `features[L][f]` is a summary (`dictionary.SUMMARY_KEYS` plus
+  `n_tokens_active`, `max_activation`, `fires_on_latent`) instead of the full
+  dictionary row; `provenance.dictionary[L]` carries the file's sha256 and the
+  layer's causal provenance (replacing `dictionary_schema` and
+  `dictionary_blinded_run`); the `attribution` key is replaced by `ablation`.
+  Schema 1 is rejected; none was ever written to disk.
+  `explain(attribution=…)`, which only raised `NotImplementedError` (its one
+  caller was the test), is replaced by `latent_ablation=False`.
+  `_capture_encoder_layers` gets `deltas=None`, unchanged when None, shown by
+  `test_activations_match_stored_chunk`, `test_teacher_forced_ce_matches_phase_7`
+  and `test_zero_delta_is_identity`. No pipeline module changed.
 
 ## Backlog (after v1; do not start early)
 
 Tool:
 - Warm up beam search at Inspector load: the first call costs ~12 s extra (V1-4a)
+- Re-decode under ablation (beam search with the ablation hook, ~2–4 s): V1-4b reports Δ log p of the original residues and teacher-forced argmax flips, not a new prediction
+- Faster per-peak clicks on large spectra (4–6.5 s at ~150 peaks, V1-4b): rerun only from layer L onward with the layer input cached, or a compact summary encoding for the JSON size
 - Corpus builder: run InstaNovo + the SAEs on an arbitrary spectra file (mgf/mzML/parquet) to produce feature examples, so the dictionary can be rebuilt on other datasets without the extraction pipeline
 
 Pipeline:
@@ -564,3 +604,4 @@ any result on the test split must state it.
 - 2026-11-22 — E1 planned, then moved to v1.1 as V1.1-3 (pre-specified, for the paper; the tool's v1 does not depend on it) with a revised design: Winnow baseline, top-32 class-mean-difference selection, random-encoder control S_rand in place of the raw-activation block, gradient boosting. Beam margin is available from the decoder (`return_beam`, already passed). Finding 7 added (every test-split chunk was SAE training data, with file and log evidence); V1-4c (audit case study) added after V1-4b; two cluster backlog items (exclude the test split at retraining; v1.2.0 is now InstaNovo's default model). Housekeeping: CLAUDE.md and STATUS.md tracked, `docs/` stays ignored (`4cea931`). No code changed.
 - 2026-11-22 — Public-facing fixes (`c1b7c35`), then a staleness audit: stale docs and comments fixed and the V1-7 README note extended (`b1ef982`); `build_dictionary` raises on a description run without a `blind` column and `interpret.py` defaults `--env-file` to the repo-root `.env` (see Behaviour changes). Rebuilding layers 2/4/6 in memory with `blind_v1` reproduces the stored dictionaries exactly. `extract.load_layer_activations` (unused) kept; `run_pipeline.sh` Step 6 stays in the backlog. 130 tests pass. No API calls.
 - 2026-11-24 — S_rand in V1.1-3 fixed before it runs (`992b3b4`): frozen-decoder SAE preferred, the untrained initialisation as fallback, with train.py lines cited. V1-4b planned, then revised after a read-only preview showed attribution patching unreliable at the top of the ranking (large effects underestimated up to 21×, sign errors): the tool uses exact error-preserving ablation only (local and global scopes, per-peak and latent panels over every active feature, a joint ablation per token, an optional target peptide). The AtP study and the preview's numbers moved to V1.1-1; offline exhaustive ablation for the demo set added to V1-5. No code changed.
+- 2026-11-24 — V1-4b done: Explanation schema 2 (summaries plus dictionary hash), exact error-preserving ablation (local/global scopes, `ablate_token` over every active feature at a token plus a joint ablation, optional target peptide), `explain(latent_ablation=)`. Results and timings under V1-4b; behaviour changes recorded; two backlog items (re-decode under ablation, faster per-peak clicks). 144 tests pass.

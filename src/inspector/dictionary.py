@@ -8,15 +8,38 @@ mismatch rather than serving rows from another layout.
 A feature absent from the dictionary never fired over the corpus. When it fires
 at runtime, ``lookup`` returns None and the caller reports it as not in the
 dictionary; it is not given a description, association or causal value.
+
+``summary`` is the slim per-feature view the Explanation JSON carries (schema
+2); the dashboard reads full rows with ``lookup``, after checking the
+explanation's ``sha256_16`` against this file's (``runtime.feature_row``).
 """
 from __future__ import annotations
 
+import hashlib
 import math
 from pathlib import Path
 
 import pyarrow.parquet as pq
 
 from schema import DICTIONARY_SCHEMA_VERSION
+
+# Summary key -> dictionary column. Association with its effect size, causal
+# coverage (null = untested, never "not important"), description coverage and
+# score: the evidence indicators a panel shows without the full row.
+SUMMARY_FIELDS = {
+    "firing_rate": "firing_rate",
+    "top_concept": "concept_1",
+    "top_concept_f1_dom": "f1_dom_1",
+    "has_significant_association": "has_significant_association",
+    "causal_delta_ce": "phase8_delta_ce",
+    "description_blinded": "description_blinded",
+    "description_r": "description_r",
+    "description_beats_baseline": "description_beats_baseline",
+    "latent_token_fraction": "latent_token_fraction",
+}
+# Keys of every summary: the mapped fields plus two derived ones.
+SUMMARY_KEYS = ("in_dictionary", "has_description", *SUMMARY_FIELDS)
+UNTESTED = "untested"   # build_dictionary's causal_provenance for unmeasured features
 
 
 def dictionary_path(root: Path, layer: int) -> Path:
@@ -34,10 +57,13 @@ def _clean(value):
 class FeatureDictionary:
     """The dictionary rows of one layer, keyed by feature index."""
 
-    def __init__(self, layer: int, rows: dict[int, dict], metadata: dict[str, str]):
+    def __init__(self, layer: int, rows: dict[int, dict], metadata: dict[str, str],
+                 path: Path | None = None, sha256_16: str | None = None):
         self.layer = layer
         self._rows = rows
         self.metadata = metadata
+        self.path = path
+        self.sha256_16 = sha256_16    # of the parquet file, so a reader can check it has this one
 
     @classmethod
     def load(cls, root: Path, layer: int) -> FeatureDictionary:
@@ -63,7 +89,8 @@ class FeatureDictionary:
             if row["layer"] != layer:
                 raise ValueError(f"{path}: row for layer {row['layer']} in the layer-{layer} file")
             rows[int(row["feature_idx"])] = {k: _clean(v) for k, v in row.items() if k != "layer"}
-        return cls(layer, rows, metadata)
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+        return cls(layer, rows, metadata, path=path, sha256_16=digest)
 
     def __len__(self) -> int:
         return len(self._rows)
@@ -79,3 +106,24 @@ class FeatureDictionary:
         """The feature's dictionary row (a copy), or None if it is not live in the corpus."""
         row = self._rows.get(int(feature_idx))
         return dict(row) if row is not None else None
+
+    def summary(self, feature_idx: int) -> dict:
+        """The slim per-feature view, keys SUMMARY_KEYS in that order. A feature
+        not in the dictionary gets in_dictionary False and None everywhere else.
+        A missing column raises: the file would not be the dictionary this tool reads."""
+        row = self._rows.get(int(feature_idx))
+        if row is None:
+            return {"in_dictionary": False, **{k: None for k in SUMMARY_KEYS[1:]}}
+        try:
+            mapped = {key: row[col] for key, col in SUMMARY_FIELDS.items()}
+        except KeyError as exc:
+            raise KeyError(f"layer {self.layer} dictionary has no column {exc}") from None
+        return {"in_dictionary": True, "has_description": row.get("description") is not None, **mapped}
+
+    def causal_provenance(self) -> str | None:
+        """The provenance string shared by every causally measured feature, or
+        None if none was measured. Raises if measured features disagree."""
+        found = {row.get("causal_provenance") for row in self._rows.values()} - {UNTESTED, None}
+        if len(found) > 1:
+            raise ValueError(f"layer {self.layer}: {len(found)} distinct causal provenance strings")
+        return found.pop() if found else None

@@ -27,7 +27,7 @@ src/                       one source root (run with PYTHONPATH=src)
 ├── analysis.py            post-hoc analysis over eval outputs           (v1, new)
 ├── build_dictionary.py    builds the feature dictionary                  (v1, new)
 └── inspector/             the tool                                       (v1, new)
-    ├── runtime.py         explain(spectrum), ablation (V1-4b, not yet)
+    ├── runtime.py         explain(spectrum), exact ablation (V1-4b)
     ├── dictionary.py      loads the feature dictionary
     └── app.py             dashboard                                      (V1-6, not yet)
 tests/                     pytest

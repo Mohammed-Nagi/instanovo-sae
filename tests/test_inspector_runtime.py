@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import socket
+import types
 from pathlib import Path
 
 import pyarrow as pa
@@ -30,14 +31,23 @@ import pytest
 import torch
 
 import annotate
-from inspector.dictionary import FeatureDictionary
+from inspector.dictionary import SUMMARY_FIELDS, SUMMARY_KEYS, FeatureDictionary
 from inspector.runtime import (
     DEFAULT_CHECKPOINT,
+    LATENT_LABEL,
+    SPECTRUM_SUMMARY_KEYS,
+    AblationContext,
+    AblationReport,
     Explanation,
     Inspector,
     Spectrum,
+    ablation_delta,
+    ablation_positions,
+    ablation_provenance,
     decoder_to_residue_order,
+    feature_row,
     fve,
+    joint_delta,
     peak_label,
     read_raw_spectra,
     top_k_features,
@@ -179,6 +189,110 @@ def test_dictionary_rejects_wrong_schema_or_layer(tmp_path, version, meta_layer)
     _write_dict(tmp_path, 2, version, meta_layer)
     with pytest.raises(ValueError):
         FeatureDictionary.load(tmp_path, 2)
+
+
+def test_summary_fields_exist_in_dictionary_schema():
+    from build_dictionary import _SCHEMA
+    assert set(SUMMARY_FIELDS.values()) | {"description", "causal_provenance"} <= set(_SCHEMA.names)
+
+
+def _write_summary_dict(root: Path, provenances: list[str]) -> Path:
+    n = len(provenances)
+    (root / "dictionary").mkdir(parents=True, exist_ok=True)
+    table = pa.table({
+        "layer": pa.array([2] * n, pa.int32()), "feature_idx": pa.array(list(range(7, 7 + n)), pa.int32()),
+        "firing_rate": [0.01] * n, "concept_1": ["is_y_ion"] * n, "f1_dom_1": [0.5] * n,
+        "has_significant_association": [True] * n, "phase8_delta_ce": [None] * n,
+        "description_blinded": [True] * n, "description_r": [float("nan")] * n,
+        "description_beats_baseline": [None] * n, "latent_token_fraction": [None] * n,
+        "description": ["fires on y ions"] + [None] * (n - 1), "causal_provenance": provenances,
+    }).replace_schema_metadata({"schema_version": str(DICTIONARY_SCHEMA_VERSION), "layer": "2"})
+    path = root / "dictionary" / "layer_2.parquet"
+    pq.write_table(table, path)
+    return path
+
+
+def test_dictionary_summary_hash_and_causal_provenance(tmp_path):
+    path = _write_summary_dict(tmp_path, ["untested", "SAE-patched, 5 spectra"])
+    d = FeatureDictionary.load(tmp_path, 2)
+    assert d.sha256_16 == hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    s = d.summary(7)
+    assert tuple(s) == SUMMARY_KEYS
+    assert s["in_dictionary"] and s["has_description"] and s["top_concept"] == "is_y_ion"
+    assert s["causal_delta_ce"] is None and s["description_r"] is None       # untested / NaN -> None
+    assert not d.summary(8)["has_description"]
+    absent = d.summary(99)
+    assert absent["in_dictionary"] is False and all(absent[k] is None for k in SUMMARY_KEYS[1:])
+    assert d.causal_provenance() == "SAE-patched, 5 spectra"
+
+    _write_summary_dict(tmp_path, ["SAE-patched, 5 spectra", "SAE-patched, 6 spectra"])
+    with pytest.raises(ValueError):
+        FeatureDictionary.load(tmp_path, 2).causal_provenance()
+
+
+# --- Ablation helpers (no model) ---------------------------------------------------
+
+def test_ablation_positions_and_delta():
+    feats = torch.tensor([[0.0, 2.0, 0.0], [1.5, 0.0, 0.0], [0.5, 3.0, 0.0]])
+    w = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+    assert ablation_positions(feats, 0, "global") == [1, 2]
+    assert ablation_positions(feats, 1, "local", 2) == [2]
+    for f, scope, pos in [(1, "local", 1), (2, "global", None), (0, "local", None),
+                          (0, "local", 3), (0, "both", None), (0, "global", 1)]:
+        with pytest.raises(ValueError):
+            ablation_positions(feats, f, scope, pos)
+    assert torch.equal(ablation_delta(feats, w, [(0, [1, 2])]),
+                       torch.tensor([[0.0, 0.0], [-1.5, 0.0], [-0.5, 0.0]]))
+    # Joint at token 2 removes 0.5 * w0 + 3.0 * w1 = x_hat[2] - b_dec.
+    assert torch.equal(joint_delta(feats, w, 2), torch.tensor([[0.0, 0.0], [0.0, 0.0], [-0.5, -3.0]]))
+
+
+def test_ablation_provenance_follows_target():
+    assert "teacher-forced on the predicted peptide" in ablation_provenance("prediction")
+    assert "teacher-forced on the given target peptide" in ablation_provenance("given")
+    with pytest.raises(ValueError):
+        ablation_provenance("true")
+
+
+def _fake_ablation_setup():
+    """An Inspector shell whose 'model' gives each ablation a delta log p equal,
+    at every decoder position, to the sum of the delta's entries."""
+    feats = torch.tensor([[0.0, 2.0, 0.0], [1.5, 0.0, 0.0], [0.5, 3.0, 0.0], [0.0, 0.0, 0.0]])
+    w = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+    insp = object.__new__(Inspector)
+    insp.saes = {2: types.SimpleNamespace(W_dec=w)}
+    insp._run_ablations = lambda ctx, layer, deltas: [
+        ([float(d.sum())] * (ctx.n_residues + 1), [bool(d.sum() < -2)] * (ctx.n_residues + 1))
+        for d in deltas]
+    ctx = AblationContext("toy", {}, {"kind": "prediction", "peptide": "PEK", "tokens": ["P", "E", "K"]},
+                          {2: feats}, torch.zeros(4))
+    return insp, ctx
+
+
+def test_ablate_token_covers_every_active_feature_sorted():
+    insp, ctx = _fake_ablation_setup()
+    rep = insp.ablate_token(ctx, 2, 2, with_summaries=False)
+    # Token 2: feature 0 (0.5 -> delta sum -0.5) and feature 1 (3.0 -> -3.0); 4 decoder positions.
+    assert [r["feature"] for r in rep.results] == [1, 0]                 # sorted by |delta_total|
+    assert [r["activation"] for r in rep.results] == [3.0, 0.5]
+    assert [r["delta_total"] for r in rep.results] == [-12.0, -2.0]
+    assert rep.results[0]["delta_log_prob"] == [-3.0] * 3 and rep.results[0]["delta_eos"] == -3.0
+    assert rep.results[0]["argmax_changed"] == [True] * 3 and not rep.results[1]["eos_argmax_changed"]
+    assert rep.joint["n_features"] == 2 and rep.joint_delta_total == -14.0 and rep.sum_of_singles == -14.0
+    assert rep.label == "peak 1 only" and rep.scope == "local" and rep.position == 2
+    assert "predicted peptide" in rep.provenance and rep.joint_note.startswith("joint = ")
+    assert tuple(rep.to_dict(include_summaries=False)) == AblationReport.KEYS
+
+    latent = insp.ablate_token(ctx, 2, 0, with_summaries=False)
+    assert latent.label == LATENT_LABEL and [r["feature"] for r in latent.results] == [1]
+    empty = insp.ablate_token(ctx, 2, 3, with_summaries=False)
+    assert empty.results == [] and empty.joint is None and empty.sum_of_singles is None
+    with pytest.raises(ValueError):
+        insp.ablate_token(ctx, 2, 4)
+
+    glob = insp.ablate(ctx, 2, [0], "global", with_summaries=False)
+    assert glob.results[0]["positions"] == [1, 2] and glob.results[0]["activation"] == 1.5
+    assert glob.joint is None and glob.scope_note.startswith("global")
 
 
 # --- Data-backed ------------------------------------------------------------------
@@ -388,18 +502,22 @@ def test_schema_round_trips_and_is_bounded(inspector, chunk0):
           f"bound {inspector.json_size_bound:,}")
 
     data = json.loads(text)
-    assert data["schema_version"] == EXPLAIN_SCHEMA_VERSION and data["attribution"] is None
+    assert data["schema_version"] == EXPLAIN_SCHEMA_VERSION == 2 and data["ablation"] is None
     assert set(data["layers"]) == {str(L) for L in LAYERS}
     assert all(len(t["top"]) <= inspector.top_k for b in data["layers"].values() for t in b["tokens"])
     assert data["provenance"]["preprocessing"]["use_spectrum_utils"] is True
     assert data["provenance"]["decoding"]["max_length"] == int(inspector.config["max_length"])
+    for L in LAYERS:
+        assert data["provenance"]["dictionary"][str(L)]["sha256_16"] == inspector.dictionaries[L].sha256_16
+        for summary in data["features"][str(L)].values():
+            assert list(summary) == [*SUMMARY_KEYS, *SPECTRUM_SUMMARY_KEYS]
+            assert summary["n_tokens_active"] >= 1 and summary["max_activation"] > 0
 
+    schema_1 = {k: v for k, v in data.items() if k != "ablation"} | {"attribution": None, "schema_version": 1}
     for bad in ({**data, "schema_version": EXPLAIN_SCHEMA_VERSION + 1},
-                {k: v for k, v in data.items() if k != "features"}):
+                {k: v for k, v in data.items() if k != "features"}, schema_1):
         with pytest.raises(ValueError):
             Explanation.from_dict(bad)
-    with pytest.raises(NotImplementedError):
-        inspector.explain(spec, attribution=True)
 
 
 @needs_data
@@ -470,3 +588,209 @@ def test_read_raw_records_groups_and_keeps_order(tmp_path):
     assert [r["x"] for r in read_raw_records(path, [7, 0, 4, 8], ["x"])] == [7, 0, 4, 8]
     with pytest.raises(IndexError):
         read_raw_records(path, [10], ["x"])
+
+
+# --- Exact ablation (V1-4b), on chunk 0 spectrum 0 ------------------------------------
+
+@pytest.fixture(scope="module")
+def explained0(inspector, chunk0):
+    spec, rec = _raw_spectrum_record(chunk0, 0)
+    exp = inspector.explain(spec)
+    assert exp.prediction is not None
+    return spec, rec, exp
+
+
+@pytest.fixture(scope="module")
+def ctx0(inspector, explained0):
+    spec, _rec, exp = explained0
+    return inspector.ablation_context(spec, exp)
+
+
+@pytest.fixture(scope="module")
+def explained_latent(inspector, chunk0):
+    spec, _ = _raw_spectrum(chunk0, 0)
+    with no_network():
+        exp = inspector.explain(spec, latent_ablation=True)
+    return spec, exp
+
+
+def _layer_outputs(inspector, ctx, deltas=None):
+    _logp, _top1, acts = inspector._tf_log_probs(ctx.batch, deltas=deltas, capture=True,
+                                                 capture_after_delta=deltas is not None)
+    return {L: a[0] for L, a in acts.items()}
+
+
+@needs_data
+def test_zero_delta_is_identity(inspector, chunk0, explained0, ctx0):
+    """The ablation hook with zero deltas changes nothing: the layer outputs
+    match the stored chunk (as in test_activations_match_stored_chunk) and
+    log p equals the explanation's."""
+    _spec, _rec, exp = explained0
+    n_tok = ctx0.features[2].size(0)
+    zeros = {L: torch.zeros(1, n_tok, int(inspector.config["dim_model"])) for L in LAYERS}
+    logp, _top1, acts = inspector._tf_log_probs(ctx0.batch, deltas=zeros, capture=True,
+                                                capture_after_delta=True)
+    torch.testing.assert_close(logp[0], ctx0.baseline_log_prob, rtol=0, atol=1e-6)
+    per_residue, eos = decoder_to_residue_order(logp[0].tolist(), ctx0.n_residues)
+    assert per_residue == pytest.approx([r["log_prob_tf"] for r in exp.prediction["residues"]],
+                                        rel=1e-5, abs=1e-5)
+    assert eos == pytest.approx(exp.prediction["eos_log_prob_tf"], rel=1e-5, abs=1e-5)
+    rows = _stored_rows(chunk0, 0)
+    for L in LAYERS:
+        stored = torch.load(CHUNKS / f"acts_L{L}_00000.pt", map_location="cpu",
+                            weights_only=False)["activations"][rows].float()
+        rms = float(stored.pow(2).mean().sqrt())
+        torch.testing.assert_close(acts[L][0], stored, rtol=2 ** -7, atol=2 ** -7 * rms)
+
+
+@needs_data
+def test_ablation_preserves_sae_error(inspector, ctx0):
+    """x' - x = -a * W_dec[f] at the ablated tokens only, so x' - x_hat' = x - x_hat."""
+    L = 4
+    feats, sae = ctx0.features[L], inspector.saes[L]
+    w = sae.W_dec.detach().cpu()
+    f = int(((feats > 0).sum(dim=0) >= 2).nonzero()[0])
+    base = _layer_outputs(inspector, ctx0)[L]
+    for scope, position in (("global", None), ("local", int((feats[:, f] > 0).nonzero()[0]))):
+        pos = ablation_positions(feats, f, scope, position)
+        delta = ablation_delta(feats, w, [(f, pos)])
+        after = _layer_outputs(inspector, ctx0, {L: delta[None]})[L]
+        torch.testing.assert_close(after - base, delta, rtol=0, atol=1e-5)
+        others = [t for t in range(feats.size(0)) if t not in pos]
+        assert float((after - base)[others].abs().max()) == 0.0
+        removed = feats.clone()
+        removed[pos, f] = 0
+        with torch.no_grad():
+            err_before = base - sae.decode(feats)
+            err_after = after - sae.decode(removed)
+        torch.testing.assert_close(err_after, err_before, rtol=0, atol=1e-4)
+
+
+@needs_data
+def test_batched_ablation_matches_single(inspector, ctx0):
+    L = 2
+    feats = ctx0.features[L]
+    w = inspector.saes[L].W_dec.detach().cpu()
+    fs = (feats[0] > 0).nonzero().flatten().tolist()[:3]
+    deltas = [ablation_delta(feats, w, [(f, ablation_positions(feats, f, "global"))]) for f in fs]
+    together = inspector._run_ablations(ctx0, L, deltas)
+    for d, (got, _changed) in zip(deltas, together, strict=True):
+        alone, _ = inspector._run_ablations(ctx0, L, [d])[0]
+        assert got == pytest.approx(alone, abs=1e-5)
+    assert any(abs(sum(g)) > 1e-4 for g, _ in together)        # the ablations do something
+
+
+@needs_data
+def test_local_equals_global_for_single_token_feature(inspector, ctx0):
+    for L in LAYERS:
+        feats = ctx0.features[L]
+        singles = ((feats > 0).sum(dim=0) == 1).nonzero().flatten()
+        if singles.numel():
+            break
+    f = int(singles[0])
+    t = int((feats[:, f] > 0).nonzero()[0])
+    loc = inspector.ablate(ctx0, L, [f], "local", t, with_summaries=False).results[0]
+    glo = inspector.ablate(ctx0, L, [f], "global", with_summaries=False).results[0]
+    assert loc["positions"] == glo["positions"] == [t]
+    assert loc["delta_log_prob"] == pytest.approx(glo["delta_log_prob"], abs=1e-7)
+    assert loc["delta_total"] == pytest.approx(glo["delta_total"], abs=1e-6)
+
+
+@needs_data
+def test_ablation_context_rejects_mismatched_explanation(inspector, chunk0, explained0):
+    spec, _rec, exp = explained0
+    other, _ = _raw_spectrum(chunk0, 1)
+    with pytest.raises(ValueError, match="input"):
+        inspector.ablation_context(other, exp)
+    # Same precursor and peak count, different peaks: caught by the log p check.
+    shuffled = Spectrum(spec.mz, spec.intensity[::-1], spec.precursor_mz, spec.precursor_charge)
+    with pytest.raises(ValueError, match="reproduce"):
+        inspector.ablation_context(shuffled, exp)
+
+
+@needs_data
+def test_joint_ablation_removes_the_token_reconstruction(inspector, ctx0):
+    """Joint ablation at a token leaves x' = (x - x_hat) + b_dec there: the SAE
+    error plus the SAE's 'nothing active' bias, so x' - b_dec is the error only."""
+    L = 6
+    feats, sae = ctx0.features[L], inspector.saes[L]
+    w = sae.W_dec.detach().cpu()
+    t = int((feats[1:] > 0).sum(dim=1).argmax()) + 1
+    base = _layer_outputs(inspector, ctx0)[L]
+    after = _layer_outputs(inspector, ctx0, {L: joint_delta(feats, w, t)[None]})[L]
+    with torch.no_grad():
+        x_hat = sae.decode(feats)
+        b_dec = sae.b_dec.detach().cpu()
+    torch.testing.assert_close(after[t] - b_dec, base[t] - x_hat[t], rtol=0, atol=1e-4)
+    others = [s for s in range(feats.size(0)) if s != t]
+    assert float((after - base)[others].abs().max()) == 0.0
+
+    rep = inspector.ablate_token(ctx0, L, t, with_summaries=False)
+    n_active = int((feats[t] > 0).sum())
+    assert len(rep.results) == rep.joint["n_features"] == n_active
+    assert rep.sum_of_singles == pytest.approx(sum(r["delta_total"] for r in rep.results))
+    totals = [abs(r["delta_total"]) for r in rep.results]
+    assert totals == sorted(totals, reverse=True)
+    assert len(rep.joint["delta_log_prob"]) == ctx0.n_residues
+    print(f"L{L} token {t}: {n_active} features; joint {rep.joint_delta_total:+.4f}, "
+          f"sum of singles {rep.sum_of_singles:+.4f}")
+
+
+@needs_data
+def test_ablation_with_true_peptide_target(inspector, explained0, ctx0):
+    spec, rec, exp = explained0
+    rs = inspector.residue_set
+    truth = [rs.residue_remapping.get(t, t) for t in rs.tokenize(rec["modified_sequence"])]
+    ctx_t = inspector.ablation_context(spec, exp, target=rec["modified_sequence"])
+    assert ctx_t.target == {"kind": "given", "peptide": "".join(truth), "tokens": truth}
+    ce_true = inspector.forward(spec, rec["modified_sequence"]).ce
+    torch.testing.assert_close(ctx_t.baseline_log_prob, -ce_true, rtol=0, atol=1e-5)
+    assert all(torch.equal(ctx_t.features[L], ctx0.features[L]) for L in LAYERS)
+
+    rep = inspector.ablate_token(ctx_t, 2, 0, with_summaries=False)
+    assert rep.target["kind"] == "given" and rep.target["tokens"] == truth
+    assert "teacher-forced on the given target peptide" in rep.provenance
+    assert all(len(r["delta_log_prob"]) == len(truth) for r in rep.results)
+    f = rep.results[0]["feature"]
+    pred_rep = inspector.ablate(ctx0, 2, [f], "local", 0, with_summaries=False)
+    assert "teacher-forced on the predicted peptide" in pred_rep.provenance
+    assert pred_rep.target["kind"] == "prediction"
+
+
+@needs_data
+def test_schema2_round_trip_bounded_with_latent_ablation(inspector, explained_latent):
+    spec, exp = explained_latent
+    text = exp.to_json()
+    back = Explanation.from_json(text)
+    assert back == exp and back.to_json() == text
+    data = json.loads(text)
+    abl = data["ablation"]
+    assert abl["label"] == LATENT_LABEL and abl["scope"] == "local" and abl["position"] == 0
+    counts = {int(L): len(rep["results"]) for L, rep in abl["layers"].items()}
+    bound = inspector.size_bound(counts)
+    print(f"json {len(text):,} bytes with latent ablation ({counts}); bound {bound:,}; "
+          f"without: bound {inspector.json_size_bound:,}")
+    assert len(text) <= bound
+
+    ctx = inspector.ablation_context(spec, exp)
+    for L, rep in abl["layers"].items():
+        assert counts[int(L)] == int((ctx.features[int(L)][0] > 0).sum())   # every active feature
+        assert rep["target"]["kind"] == "prediction" and rep["joint"]["n_features"] == counts[int(L)]
+        assert all(r["positions"] == [0] and "summary" not in r for r in rep["results"])
+        assert {str(r["feature"]) for r in rep["results"]} <= set(data["features"][L])
+        totals = [abs(r["delta_total"]) for r in rep["results"]]
+        assert totals == sorted(totals, reverse=True)
+
+    f = int(next(iter(data["features"]["2"])))
+    assert feature_row(exp, inspector.dictionaries, 2, f) == inspector.dictionaries[2].lookup(f)
+    prov = data["provenance"]
+    tampered = {**prov, "dictionary": {**prov["dictionary"],
+                                       "2": {**prov["dictionary"]["2"], "sha256_16": "0" * 16}}}
+    with pytest.raises(ValueError, match="sha256"):
+        feature_row(Explanation.from_dict({**data, "provenance": tampered}), inspector.dictionaries, 2, f)
+
+
+@needs_data
+def test_explain_with_latent_ablation_makes_no_network_calls(explained_latent):
+    _spec, exp = explained_latent        # built under no_network()
+    assert set(exp.ablation["layers"]) == {str(L) for L in LAYERS}

@@ -244,12 +244,31 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a.
         32 with the largest absolute class-mean difference (Kantamneni et al.
         2025, ICML). Why: a published, fixed-size selection rule; the list is
         short enough to inspect and feeds the audit case study (V1-4c).
-      - Control S_rand: per layer, a seeded random encoder of the same shape
-        with the same top-32 per-token sparsity, summarised and selected
-        identically. Why: random SAEs score close to trained ones on sparse
-        probing (Korznikov et al. 2026, arXiv 2602.14111), and a random code
-        also retains most raw-activation information, so this one control
-        replaces the raw-activation block.
+      - Control S_rand: to be fixed before V1.1-3 runs. Preferred: a
+        frozen-decoder SAE per Korznikov et al. 2026 (random decoder frozen,
+        rest trained), trained alongside any GPU retraining. Fallback if no
+        GPU: the SAE's own initialisation, untrained, which is a weaker
+        control; a positive Δ₂ against it would show only that the SAE beats a
+        random sparse code. Fallback recipe (`src/train.py`):
+        `_seed_everything(seed)` (`train.py:572-578`, called at `:773`), then
+        `SparseAutoencoder(d_model=768, d_dict=12288, k=32)` (`:787-793`). No
+        torch RNG is drawn in between (`_split_chunks` uses Python's `random`,
+        `:581-600`), so on CPU with the same torch version this should
+        reproduce seed 0's starting weights; they were never saved, so this
+        cannot be checked. Init (`SparseAutoencoder.__init__`, `:158-167`):
+        W_dec rows are unit-normalised `torch.randn(d_dict, d_model)`,
+        W_enc = W_dec.T (tied), b_enc = b_dec = 0. Input preprocessing: none;
+        the SAE reads raw layer outputs, cast from the stored bf16 to float32
+        (`:469`, `:508`), with no centring or scaling; the only offset is b_dec,
+        subtracted in `preactivations` (`:188-190`) and 0 at init. The init
+        JumpReLU threshold is 0 (`:174`), which would keep every positive
+        pre-activation (about half the dictionary); match the trained SAEs'
+        sparsity with `calibrate_threshold` (`:536-567`, the mean BatchTopK
+        boundary at k = 32) on the same training chunks. Summarised and
+        selected identically to S. Why: random SAEs score close to trained
+        ones on sparse probing (Korznikov et al. 2026, arXiv 2602.14111), and
+        a random code also retains most raw-activation information, so this
+        one control replaces the raw-activation block.
       - Model: `HistGradientBoostingClassifier` with defaults, identical for
         B, B+S and B+S_rand. Why: Winnow reports a non-monotonic mass-error
         effect; trees are scale-free (no scaling or rare-feature rules) and

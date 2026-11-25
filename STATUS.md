@@ -11,8 +11,8 @@ with honest labels and evidence indicators (association, causal and
 description coverage, with their effect sizes), and ablate a feature to see the effect
 on each predicted residue.
 
-Open, in order: V1-3b, V1-4c, V1-5, V1-6, V1-2c (when API credit is
-available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a, V1-4b.
+Open, in order: V1-4c, V1-5, V1-6, V1-2c (when API credit is
+available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-3b, V1-4a, V1-4b.
 
 - [x] **V1-1 Hub inventory** — `src/analysis.py`, output `analysis/hubs.csv`.
       From existing per-feature ablations in each layer's report.json: rank by
@@ -93,7 +93,7 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a, V1-4b.
       partial descriptions. Existing run moves to `interpret/layer_L/unblinded_v1/`.
       (Since then: V1-2a defined `description_beats_baseline`, and V1-2b moved
       unblinded_v1 to `interpret/layer_L/archive/`.)
-- [ ] **V1-3b Concept reliability** — make the dictionary honest about the
+- [x] **V1-3b Concept reliability** (`1ffa8ea`, `31338d9`) — make the dictionary honest about the
       concepts Finding 9 found unreliable, without rebuilding labels. No API,
       GPU or cluster.
       Part A, reliability table (`analysis.concept_reliability`, written by
@@ -704,7 +704,16 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a, V1-4b.
         the encoder does not see the peptide; H2, H3 (and the deamidation
         labels in check (a)) may be label errors; the layer choice was post hoc.
 - [ ] **V1-5 Data for the tool** — feature examples; demo set from the HF test
-      split. Verified by Finding 7 from code and logs: chunk 520's spectrum
+      split. Feature examples are the primary evidence of what a feature does
+      (Finding 10: concept associations are negligible for nearly all
+      features). For each feature: its top-activating peaks with their spectrum
+      context (neighbouring peaks with m/z and intensity, the precursor, and
+      the spectrum's prediction), drawn from the local chunks, with provenance
+      (chunk, spectrum id, layer, activation, SAE checkpoint, and the note
+      that every test-split spectrum was SAE training data, Finding 7). Start
+      the demo set from `analysis/reliable_associations.csv` (the features
+      whose best reliable concept association has F1dom ≥ 0.1).
+      Verified by Finding 7 from code and logs: chunk 520's spectrum
       IDs start at row 532,480, and the SAE validation chunks are 17, 116, 135,
       141, 230, 292, 316, 397, 448, 462, 489, 495. Offline exhaustive exact
       ablation for the demo set, both scopes (local over every active
@@ -722,8 +731,14 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a, V1-4b.
       metadata).
 - [ ] **V1-6 Dashboard** — `src/inspector/app.py`, Streamlit.
       Spectrum plot with peaks coloured by annotation, layer selector, per-peak
-      feature panel, feature card (labels, evidence indicators, top examples),
-      an "encoder-only" scope note, and the InstaNovo version the SAEs explain
+      feature panel, feature card. The card leads with the feature's examples
+      (V1-5) and measured effects (exact ablation, with scope and provenance),
+      then the blinded description with its score. Concept associations are
+      secondary (Finding 10): each is always shown with its F1dom and chance
+      fraction (CI from the dictionary metadata, `concept_reliability()`),
+      under the display name for re-documented concepts (is_I_ion, is_first_ion
+      as m/z windows, `display_name()`), with the reliable associations
+      (`reliable_*`) beside the top 3; an "encoder-only" scope note; and the InstaNovo version the SAEs explain
       (v1.1.0). Ablation, built on V1-4b: per-peak panel = `ablate_token` on
       the clicked peak for the selected layer (every active feature, sorted by
       |delta_total|, activation shown, joint vs sum of singles; 1–6.5 s per
@@ -1025,28 +1040,41 @@ Rigour (CPU):
 - Per-feature shuffled null (more shuffles per feature) instead of the per-layer pooled p95 (V1-2b note b)
 - Peptide-level describe/held-out split: the V1-2 split is by spectrum, and the same peptide can still appear on both sides in different spectra; precursor m/z gives it away even blind
 - Depth ordering with an F1dom-weighted peak layer and tie margins
-- Annotator fixes and decisions for the next label rebuild (Finding 9; each
-  changes the labels, so dictionary, F1dom, Phase 4 and V1-2 strata follow):
-  restrict immonium ions to residues in the peptide (spectrum_utils generates
-  all 23); make `IonGeometry` treat spectrum_utils' internal end as exclusive;
-  decide on labelling ¹³C isotope peaks (excess 8% of noise above m/z 1,000) and
-  a ions (excess 2.8% of noise); fragment charges are capped at z − 1 (the
-  spectrum_utils default, not passed explicitly), so charge-2 precursors get no
-  2+ fragments, decide at the rebuild; immonium ions of modified residues; and
-  whether chance-level classes (internal fragments, chance fraction 0.54; NH3
-  losses on internal 0.92) should drive concepts at all
+- Check which residue pairs InstaNovo's mass metric merges (< 0.1 Da apart in
+  its residue set, beyond the notation-equivalent N[UNIMOD:7]/D and
+  Q[UNIMOD:7]/E), computed from the residue masses; Q/K (0.036 Da) is one
+  (Finding 8(b))
 
 Rigour (cluster/GPU):
 - Phase 8 rerun: error-preserving ablation, per-feature scan, ~50 controls, bootstrap CIs
 - Phase 7/8 rerun with `modified_sequence` targets (Finding 5): report how much the layer-level CE, loss recovered and per-feature ΔCE move; then drop the caveat from the dictionary's `causal_provenance` (`build_dictionary.PHASE8_TARGET_CAVEAT`)
 - Random-init InstaNovo control
 - Seed stability (2–3 more seeds per layer)
-- Phase 4 on the updated annotations
+- Full label rebuild (Findings 9 and 10; V1-3b only documents the current
+  labels), recomputed on the original 625-chunk data: annotation → Phase 4 →
+  dictionary → V1-2 strata → concept reliability table. Fixes and decisions:
+  restrict immonium ions to residues in the peptide (spectrum_utils generates
+  all 23), and decide on immonium ions of modified residues; make `IonGeometry`
+  treat spectrum_utils' internal end as exclusive; neutral losses on b/y only;
+  decide whether internal fragments are labelled at all (chance fraction 0.54;
+  NH3 losses on internal 0.92); ¹³C isotope peaks (excess 8% of noise above
+  m/z 1,000); 2+ fragments (charges are capped at z − 1, the spectrum_utils
+  default, not passed explicitly, so charge-2 precursors get none); a ions
+  (excess 2.8% of noise). Rerun the label audit on the new labels.
+- Decoy null for F1dom: per concept, the F1dom each feature reaches against the
+  same concept computed from decoy-peptide labels (same-composition decoys as
+  in the label audit), so an association can be compared with what chance
+  matches alone produce
 - Check InstaNovo v1.1 training data vs the nine-species benchmark
 - If the SAEs are retrained, exclude the test split (chunks ≥ 515) (Finding 7)
 - InstaNovo v1.2.0 (instanovo-v1.2.0.ckpt) is now the default release model; the SAEs explain v1.1.0. At the next retraining, decide whether to retrain on v1.2.0 (check its preprocessing, since 1.2.x predict passes use_spectrum_utils=False), excluding the test split (Finding 7). The tool and dashboard must state the model version.
 
-Paper: revisit once v1 and the rigour items are done.
+Paper: revisit once v1 and the rigour items are done. Before any publication,
+revisit every concept-level result: the F1dom analyses (Finding 3 correlations,
+depth ordering, Phase 4 tables), the V1-2 concept stratum (mostly m/z detectors,
+Finding 9) and the Phase 8 concept groups. They rest on labels with two bugs and
+chance-dominated classes (Findings 9 and 10), and need the label rebuild and the
+F1dom decoy null above.
 
 ## Findings (November 2026 review)
 
@@ -1157,7 +1185,15 @@ them wrong; InstaNovo's mass-based peptide metric (`Metrics.compute_precision_re
 on each pair) counts them right. That metric gives 127 of the 200 predictions
 (V1-4a: 127) against 123 exact: the 3 notation-equivalent pairs plus row 43804
 (rank 10, H7; Q vs K, 0.036 Da, inside the metric's 0.1 Da per-residue
-tolerance), so InstaNovo's own metric counts H7's case as correct.
+tolerance), so InstaNovo's own metric counts H7's case as correct. Q and K are
+different residues all the same, and high-resolution data separate them: their
+0.036 Da difference (candidates.csv region Δm −0.036) is ~20–36 ppm for a
+singly charged fragment at m/z 1,000–1,800, against the 20 ppm fragment
+tolerance and an instrument accuracy of 0.93 ppm MAD at the precursor (8(d)),
+and in H7's spectrum the y10–y15 and b9–b14 ions containing the residue match
+only K. The metric's 0.1 Da per-residue tolerance merges such pairs, so its
+accuracy overstates correctness for them (backlog: list the residue pairs it
+merges).
 (c) The confidence-ranked top 6 hold no clear model failure: two
 notation-equivalent (ranks 1, 5), one probable label artefact (3), two
 unresolvable from the spectrum (4: no distinguishing peak; 6: one true-only
@@ -1329,6 +1365,24 @@ Results that rest on the affected concepts:
   control" is mostly m/z detectors.
 - Phase 4 and the evaluation reports use the same labels (not re-examined here).
 
+**10. After the display rule, concept associations are negligible for nearly
+all features (descriptive, found 2026-11-25, V1-3b).** Only 8 of the 50
+concepts meet the display rule (chance fraction ≤ 0.2, no bug-added positives,
+peptide-dependent): is_b_ion, is_y_ion, the three position_* and
+cleaves_N_to_Pro / C_to_Asp / C_to_Glu. Over the rebuilt dictionaries (`python
+-m analysis --root sae_pipeline_outputs --reliable-associations`,
+`analysis/reliable_associations_summary.json`), 4,078 / 4,278 / 4,455 / 5,491
+live features at L2/4/6/8 have a BH-significant association with one of them,
+but the median of their best reliable F1dom is 0.0012 / 0.0014 / 0.0013 /
+0.0015. It reaches 0.1 for 44 / 47 / 62 / 97 features (listed in
+`analysis/reliable_associations.csv`) and 0.3 for 0 / 2 / 2 / 2. Of the
+listed features' best reliable concepts, 69 are position_Cterm, 56 is_y_ion, 44
+position_middle and 35 is_b_ion; the six at ≥ 0.3 include the Finding 2 hubs L4
+F11376 and L6 F9282 / F10689. So concept labels cannot carry the tool's
+interpretation of features. Measured effects (exact ablation, V1-4b), feature
+examples (V1-5) and blinded descriptions must; concept associations are
+secondary evidence, shown with their F1dom and chance fraction.
+
 ## Log
 
 - 2026-11-20 — Review of paper, thesis and repo; findings above.
@@ -1369,3 +1423,4 @@ Results that rest on the affected concepts:
 - 2026-11-24 — V1-4c part A, case selection: `runtime.py` gets the `audit-cases` subcommand and pure helpers (`differing_region`, `mismatch_type`, `distinguishing_peaks`, `evidence_class`, `mean_residue_log_prob`, `select_audit_cases`, `case_view`), additive; the CLI's `main` now returns a subcommand's exit code (the existing ones return 0 as before). The regenerated predictions reproduce V1-4a (123 exact, 167 meeting the precursor); 44 candidates, 6 selected; table under V1-4c. No ablation calls. 167 tests pass (23 new).
 - 2026-11-24 — V1-4c part A, pre-registration, amended at review before commit: hypotheses H1–H7 (H7 a logged deviation; all at layer 8, a post-hoc choice now recorded) and the part-B protocol under V1-4c (ctx_t target = the prediction outside the region plus the I→L-mapped true region, since ablation_context does not canonicalise I/L; control pools with a 0.5× activation floor and an underpowered mark; removed-norm ratios; "undetermined" below 10 distinct control draws, which H3, H4 and H6 hit by construction). Descriptive checks (no ablation) under V1-4c: 23 of 35 true-only peaks of the 7 isotope-offset deamidation candidates are 13C peaks of predicted fragments; decoys match 5–8% of peaks as internal fragments. hypotheses.json sha256 2177039b…e84a9. Not in this commit (STATUS.md only, as asked): the check code (`runtime.audit_descriptive_checks`, `control_pool`, `n_distinct_control_sets`, `peptide_decoys`, the `audit-checks` subcommand), the additive `max_isotope` flag of `annotate.run_spectrum_utils` (default 0, unchanged behaviour) and 4 tests; they stay in the working tree for review and go into the repo with part B. No ablation calls.
 - 2026-11-25 — Committed the V1-4c descriptive-check code and the `max_isotope` flag (`f4933d3`, 171 tests). Finding 8 (descriptive) and review notes under V1-4c (`82ed2f6`): ranks 1, 5, 12 are notation-equivalent; InstaNovo's mass metric (127/200) also counts H7's Q/K case correct; corpus-level, 182 of 813 local deamidated labels (22%) fit a ¹³C misassignment and not deamidation at the instrument's accuracy (MAD 0.93 ppm). Label-quality audit (Finding 9, `analysis --label-audit`, 56 s; 8(d) pass 6 s): stored labels reproduce exactly on 200 spectra; two labelling bugs (immonium for absent residues, 56% of immonium labels; internal-fragment end off by one), chance fractions per class and concept; annotator decisions moved to the backlog. CLAUDE.md's /doctor trim was not committed; restoring it was blocked by the permission classifier and is left to the user. No ablation, API calls or rebuilds. 191 tests pass.
+- 2026-11-25 — V1-3b done: concept reliability table (`1ffa8ea`; the label audit also counts what an immonium filter would change, `concepts.csv` gains two columns, the rest byte-identical) and dictionary schema 2 with reliability beside every association and `reliable_*` associations (`31338d9`; all four layers rebuilt, existing columns identical; Explanation schema 3). Only 8 of 50 concepts meet the display rule; Finding 9's "reliable" covers_R, covers_C and ion_contains_cam_cys carry 4.1–4.3% bug-added positives, and the immonium bug also hides one y positive each from is_y_ion and position_Cterm, so the rule counts bug-added positives only (hidden ones are reported). Finding 10: reliable associations are negligible for nearly all features (median best F1dom 0.0012–0.0015); `analysis/reliable_associations.csv` lists the 250 at ≥ 0.1; V1-5 and V1-6 specs now lead with examples and measured effects. V1-4c amendment 1 (`0a87fee`): evidence classes on b/y peaks only, 8 of 44 candidates change, hypotheses unchanged. Finding 8(b) addendum (Q/K merged by the mass metric); backlog: full label rebuild, F1dom decoy null, merged residue pairs; paper note on concept-level results. No API, GPU or cluster. 203 tests pass.

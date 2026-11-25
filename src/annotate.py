@@ -588,10 +588,9 @@ def _candidate_sort_key(fa, ion_type: str, neutral_loss: str, charge: int) -> tu
     )
 
 
-def _annotation_to_dict(peak_interpretation) -> dict:
-    """Reduce one PeakInterpretation to {ion_type, ion_index, charge,
-    neutral_loss}, picking the best candidate (see _candidate_sort_key).
-    Unannotated peaks become noise."""
+def _annotation_candidates(peak_interpretation) -> list[dict]:
+    """Every recognised annotation of one peak, best first (_candidate_sort_key),
+    as {ion_type, ion_index, charge, neutral_loss, isotope, mz_delta}."""
     frags = getattr(peak_interpretation, "fragment_annotations", None) or []
     candidates = []
     for fa in frags:
@@ -601,6 +600,7 @@ def _annotation_to_dict(peak_interpretation) -> dict:
         nl_raw = getattr(fa, "neutral_loss", None)
         neutral_loss = str(nl_raw).lstrip("-") if nl_raw else ""
         charge = int(getattr(fa, "charge", 1))
+        mz_delta = getattr(fa, "mz_delta", None)
         candidates.append((
             _candidate_sort_key(fa, ion_type, neutral_loss, charge),
             {
@@ -608,13 +608,100 @@ def _annotation_to_dict(peak_interpretation) -> dict:
                 "ion_index": ion_index,
                 "charge": charge,
                 "neutral_loss": neutral_loss,
+                "isotope": int(getattr(fa, "isotope", 0) or 0),
+                "mz_delta": float(mz_delta[0]) if mz_delta else 0.0,
             },
         ))
+    candidates.sort(key=lambda c: c[0])
+    return [c[1] for c in candidates]
 
+
+_LABEL_KEYS = ("ion_type", "ion_index", "charge", "neutral_loss")
+
+
+def _annotation_to_dict(peak_interpretation) -> dict:
+    """Reduce one PeakInterpretation to {ion_type, ion_index, charge,
+    neutral_loss}, picking the best candidate (see _candidate_sort_key).
+    Unannotated peaks become noise."""
+    candidates = _annotation_candidates(peak_interpretation)
     if not candidates:
         return dict(_NOISE)
-    candidates.sort(key=lambda c: c[0])
-    return candidates[0][1]
+    return {k: candidates[0][k] for k in _LABEL_KEYS}
+
+
+def select_annotation(candidates: list[dict], max_isotope: int = 0, exclude: tuple[str, ...] = ("a",)) -> dict:
+    """The label a run with fewer options would give a peak, from the
+    candidates of a run with more (label audit). Candidates are sorted best
+    first and the sort key does not depend on which others are present, so the
+    first candidate with isotope <= max_isotope and an ion type not in
+    `exclude` is that run's winner. The default reproduces the pipeline
+    setting (monoisotopic, no a ions) from a max_isotope=1, 'a'-enabled run."""
+    for c in candidates:
+        if c["isotope"] <= max_isotope and c["ion_type"] not in exclude:
+            return {k: c[k] for k in _LABEL_KEYS} | {"isotope": c["isotope"]}
+    return dict(_NOISE) | {"isotope": 0}
+
+
+def is_composition_determined(ann: dict, peptide_length: int) -> bool:
+    """Whether a label's m/z is the same for every same-composition peptide
+    with the same C-terminal residue (label audit: excluded from chance rates).
+    Immonium (spectrum_utils generates every residue's, whatever the peptide),
+    precursor, y1, and b_{L-1} and a_{L-1} (all residues but the fixed last
+    one), with any loss or isotope."""
+    t, k = ann["ion_type"], ann["ion_index"]
+    return (t in ("I", "precursor")
+            or (t == "y" and k == 1)
+            or (t in ("a", "b") and k == peptide_length - 1))
+
+
+def annotation_inputs_from_tokens(tokens: list[str], modifications: list[dict]) -> tuple[str, str, list[dict]]:
+    """(peptide, proforma, modifications) for a permuted token list, e.g. a
+    decoy from peptide_decoys over proforma_residue_tokens. Each modified
+    residue keeps its modification dict (mod_name, unimod_id), moved to its new
+    1-indexed position; an N-terminal tag token stays at position 0."""
+    pool: dict[str, list[dict]] = {}
+    for m in modifications:
+        pool.setdefault(str(m["mod_name"]), []).append(m)
+    bare, mods, pos = [], [], 0
+    for tok in tokens:
+        tag = _PROFORMA_TAG_RE.search(tok)
+        if tok[0].isalpha():
+            pos += 1
+            bare.append(tok[0])
+        if tag:
+            name = tag.group(1)
+            if not pool.get(name):
+                raise ValueError(f"token {tok!r} has no matching modification in {modifications}")
+            src = pool[name].pop(0)
+            mods.append({**src, "position": pos if tok[0].isalpha() else 0})
+    if any(pool.values()):
+        raise ValueError(f"modifications not placed: {pool}")
+    return "".join(bare), "".join(tokens), mods
+
+
+def peptide_decoys(tokens: list[str], n: int, rng: np.random.Generator,
+                   exclude: list[list[str]], max_tries: int = 1000) -> list[list[str]]:
+    """n distinct same-composition decoys: the C-terminal residue (and an
+    N-terminal modification token) kept in place, the rest shuffled, each
+    residue keeping its modification; decoys equal (I = L) to any of `exclude`
+    are skipped. (V1-4c check (c)'s rule; also used by the label audit.)"""
+    def norm(ts):
+        return tuple("L" if t == "I" else t for t in ts)
+
+    lead = tokens[:1] if not tokens[0][0].isalpha() else []
+    core, tail = tokens[len(lead):-1], tokens[-1:]
+    banned = {norm(e) for e in exclude}
+    out, seen = [], set()
+    for _ in range(max_tries):
+        d = lead + [core[i] for i in rng.permutation(len(core))] + tail
+        key = norm(d)
+        if key in banned or key in seen:
+            continue
+        seen.add(key)
+        out.append(d)
+        if len(out) == n:
+            return out
+    raise RuntimeError(f"only {len(out)} distinct decoys of {tokens} after {max_tries} tries")
 
 
 def run_spectrum_utils(
@@ -629,8 +716,12 @@ def run_spectrum_utils(
     enable_internal: bool,
     strict: bool = False,
     max_isotope: int = 0,
-) -> list[dict]:
+    return_candidates: bool = False,
+) -> list:
     """Annotate one spectrum and return a flat label dict per peak.
+
+    return_candidates=True (label audit) returns instead, per peak, every
+    candidate annotation best first (_annotation_candidates; [] = noise).
 
     max_isotope (default 0, the pipeline's setting) is passed to spectrum_utils;
     1 also matches the first 13C isotope peak of each fragment (V1-4c check).
@@ -671,11 +762,13 @@ def run_spectrum_utils(
         if strict:
             raise ValueError(f"spectrum_utils could not annotate {proforma!r}: {exc}") from exc
         LOG.warning("spectrum_utils annotation failed for %r: %s", proforma, exc)
-        return [dict(_NOISE) for _ in range(len(mz_np))]
+        return [[] if return_candidates else dict(_NOISE) for _ in range(len(mz_np))]
 
     annotations = getattr(spectrum, "annotation", None)
     if annotations is None:
-        return [dict(_NOISE) for _ in range(len(mz_np))]
+        return [[] if return_candidates else dict(_NOISE) for _ in range(len(mz_np))]
+    if return_candidates:
+        return [_annotation_candidates(a) for a in annotations]
     return [_annotation_to_dict(a) for a in annotations]
 
 

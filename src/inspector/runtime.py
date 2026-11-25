@@ -1579,26 +1579,9 @@ def n_distinct_control_sets(pools: list[tuple[int, list[int]]], cap: int = 10_00
     return len(seen)
 
 
-def peptide_decoys(tokens: list[str], n: int, rng: np.random.Generator,
-                   exclude: list[list[str]], max_tries: int = 1000) -> list[list[str]]:
-    """n distinct same-composition decoys: the C-terminal residue (and an
-    N-terminal modification token) kept in place, the rest shuffled, each
-    residue keeping its modification; decoys equal (I = L) to any of `exclude`
-    are skipped."""
-    lead = tokens[:1] if not tokens[0][0].isalpha() else []
-    core, tail = tokens[len(lead):-1], tokens[-1:]
-    banned = {tuple(normalise_peptide(e)) for e in exclude}
-    out, seen = [], set()
-    for _ in range(max_tries):
-        d = lead + [core[i] for i in rng.permutation(len(core))] + tail
-        key = tuple(normalise_peptide(d))
-        if key in banned or key in seen:
-            continue
-        seen.add(key)
-        out.append(d)
-        if len(out) == n:
-            return out
-    raise RuntimeError(f"only {len(out)} distinct decoys of {tokens} after {max_tries} tries")
+# peptide_decoys (V1-4c check (c)'s decoy rule) lives in annotate, beside the
+# label audit that also uses it; re-exported here for the audit checks.
+peptide_decoys = annotate.peptide_decoys
 
 
 def _is_fragment(ann: dict) -> bool:

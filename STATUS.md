@@ -455,7 +455,9 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a, V1-4b.
         top-k entries shown in the 7 case views (45% of their 1,031 distinct
         features; 31% of all 8,732 L8 features); F1dom < 0.3 for 97% of those
         features (99.6% of L8); no L8 feature has a description (V1-2c).
-      - Finding 8 records which top candidates are not model failures.
+      - Finding 8 records which top candidates are not model failures; Finding
+        9 audits the labels these hypotheses rest on (immonium and
+        internal-fragment labels, covers_*).
 
       Part B protocol (fixed with the hypotheses):
       - Contexts: ctx_p = `ablation_context(spec, exp)` and
@@ -770,6 +772,24 @@ stated, with the tests that show it (V1-4a's in `tests/test_inspector_runtime.py
   `_capture_encoder_layers` gets `deltas=None`, unchanged when None, shown by
   `test_activations_match_stored_chunk`, `test_teacher_forced_ce_matches_phase_7`
   and `test_zero_delta_is_identity`. No pipeline module changed.
+- V1-4c (`f4933d3`), `annotate.run_spectrum_utils`: new `max_isotope` flag,
+  default 0 (the pipeline's setting, previously hard-coded). Shown by
+  `test_run_spectrum_utils_max_isotope_flag` and the stored-label tests.
+- 2026-11-25 (Finding 9), `annotate.py`, additive except one refactor:
+  `_annotation_to_dict` now takes the first of `_annotation_candidates` (the
+  same parse and `_candidate_sort_key` order, moved into a function that keeps
+  every candidate); `run_spectrum_utils` gets `return_candidates=False`;
+  new pure helpers `select_annotation`, `is_composition_determined`,
+  `proforma_residue_tokens`, `annotation_inputs_from_tokens`,
+  `proforma_neutral_mass`, `proforma_mz`, `precursor_ppm` (label audit only).
+  `peptide_decoys` moved here from `inspector/runtime.py` unchanged (runtime
+  re-exports it) so the pipeline does not import the tool. Shown by
+  `test_chunk_annotator_unchanged_by_refactor`,
+  `test_annotation_via_tokens_reproduces_stored_labels`, the audit's own
+  reproduction check (200 spectra over 13 chunks, exact) and
+  `test_annotation_to_dict_is_first_candidate`. `analysis.py` gets
+  `--deamidation-precursor` and `--label-audit`, which import torch lazily;
+  its existing modes are unchanged.
 
 ## Backlog (after v1; do not start early)
 
@@ -798,7 +818,16 @@ Rigour (CPU):
 - Per-feature shuffled null (more shuffles per feature) instead of the per-layer pooled p95 (V1-2b note b)
 - Peptide-level describe/held-out split: the V1-2 split is by spectrum, and the same peptide can still appear on both sides in different spectra; precursor m/z gives it away even blind
 - Depth ordering with an F1dom-weighted peak layer and tie margins
-- Annotator: immonium ions of modified residues, isotope peaks
+- Annotator fixes and decisions for the next label rebuild (Finding 9; each
+  changes the labels, so dictionary, F1dom, Phase 4 and V1-2 strata follow):
+  restrict immonium ions to residues in the peptide (spectrum_utils generates
+  all 23); make `IonGeometry` treat spectrum_utils' internal end as exclusive;
+  decide on labelling ¹³C isotope peaks (excess 8% of noise above m/z 1,000) and
+  a ions (excess 2.8% of noise); fragment charges are capped at z − 1 (the
+  spectrum_utils default, not passed explicitly), so charge-2 precursors get no
+  2+ fragments, decide at the rebuild; immonium ions of modified residues; and
+  whether chance-level classes (internal fragments, chance fraction 0.54; NH3
+  losses on internal 0.92) should drive concepts at all
 
 Rigour (cluster/GPU):
 - Phase 8 rerun: error-preserving ablation, per-feature scan, ~50 controls, bootstrap CIs
@@ -963,6 +992,136 @@ expected if the assignment could only be made where the gap fell inside the
 search's precursor tolerance. This says which explanation the precursor mass
 supports, not which label is wrong.
 
+**9. Label quality: two labelling bugs, and chance matches that contaminate
+about half of the label-derived concepts (descriptive, found 2026-11-25).**
+`python -m analysis --root sae_pipeline_outputs --label-audit` (outputs
+`analysis/label_audit/`; 56 s on this machine: reproduction 7 s, annotation
+28 s, metrics 20 s). 200 local spectra, `default_rng(0)`, 15–16 per chunk
+over the 13 chunks, 22,682 peaks, re-annotated from the stored processed peaks.
+(0) Reproduction: `annotate.annotate_spectrum` with the pipeline settings
+reproduces the stored labels, ion types, indices, charges and loss ids exactly
+for all 200. Annotator settings: 20 ppm; b, y, immonium, precursor and internal
+fragments (b-type, ≥ 2 residues, never residue 1 or L); H2O and NH3 losses, one
+at a time, on every ion type; fragment charges 1…max(1, z − 1) (the
+spectrum_utils default `max_ion_charge`, never passed; immonium charge 1);
+`max_isotope` 0; one label per peak by `_candidate_sort_key`: monoisotopic >
+no loss > b/y > a/c/x/z > immonium > internal > precursor > lower charge >
+smaller |ppm|. Pipeline labels in the sample: b 1,489, y 2,846, internal 2,931,
+immonium 706, precursor 48, noise 14,662.
+Labelling bugs (confirmed with toy inputs, `tests/test_label_audit.py`):
+- **Immonium labels ignore the peptide.** spectrum_utils generates immonium
+  ions for all 23 residue letters (including J, O, U) whatever the peptide, so
+  `is_I_ion` is a fixed set of m/z values, the same for every peptide; 398 of
+  the 706 immonium-labelled peaks (56%) name a residue the peptide lacks
+  (I/L/J counted as one). Through `IonGeometry.covers_any_residue` these also
+  set covers_<residue> for an absent residue: covers_Y 100 of 1,294
+  positives, covers_F 87 / 1,348, covers_W 31 / 401, covers_M 22 / 702,
+  covers_E 19 / 2,941, others ≤ 4.
+- **Internal fragments cover one residue too many.** spectrum_utils labels
+  residues s…e−1 as `m{s}:{e}` (end exclusive: H6's m13:15, m/z 215.139, is
+  "IT", residues 13–14), but `IonGeometry.covers` treats the end as inclusive,
+  so covers_* and ion_contains_* of an internal ion include the next residue,
+  up to the C-terminal residue that internal fragments never contain.
+  Positives due only to that residue: covers_K 166 of 2,565, covers_P 139 /
+  1,731, covers_E 136 / 2,941, covers_F 101, covers_Y 91, covers_D 79,
+  covers_N 73, covers_R 56, covers_M 37, covers_W 33, covers_C 7;
+  ion_contains_deamidation 7 / 132, ion_contains_cam_cys 7 / 162.
+  Together the two bugs account for 3.5–16% of each covers_* concept's
+  positives (W 16%, Y 15%, F 14%, M 8%, P 8%, K 7%, E 5%, N 4%, R 4%, C 4%,
+  D 3.5%).
+(1) Chance matches: each spectrum against its true peptide and 20
+same-composition decoys (`annotate.peptide_decoys`, C-terminal residue fixed;
+195 spectra, 5 short peptides cannot give 20). Chance fraction = mean decoy
+count / true count, bootstrap 95% CI over spectra (2,000). Immonium,
+precursor, y1, b_{L−1} and a_{L−1} winners are excluded from both sides: their
+m/z is the same for every decoy (y1 1.96 / spectrum, immonium 3.53, precursor
+0.24, b_{L−1} 0.14). Per spectrum (full table `per_class.csv`):
+
+| class | loss | charge | true | decoys | chance fraction [95% CI] |
+|---|---|---|---|---|---|
+| y | none | 1 | 8.23 | 0.57 | 0.069 [0.062, 0.076] |
+| y | all | all | 12.42 | 1.35 | 0.109 [0.101, 0.117] |
+| y | H2O / NH3 | all | 2.04 / 1.73 | 0.40 / 0.32 | 0.19 / 0.18 |
+| y | all | 2 | 0.65 | 0.17 | 0.27 [0.21, 0.34] |
+| b | none | 1 | 4.14 | 0.72 | 0.174 [0.155, 0.195] |
+| b | all | all | 7.43 | 1.32 | 0.177 [0.161, 0.196] |
+| b | H2O / NH3 | all | 2.06 / 1.08 | 0.32 / 0.22 | 0.16 / 0.20 |
+| b | all | 2 | 0.31 | 0.14 | 0.45 [0.32, 0.67] |
+| internal | none | 1 | 9.98 | 4.31 | 0.43 [0.40, 0.47] |
+| internal | all | all | 15.00 | 8.03 | 0.54 [0.50, 0.57] |
+| internal | H2O / NH3 | all | 3.32 / 1.39 | 2.09 / 1.28 | 0.63 / 0.92 |
+| internal | all | 2 | 0.72 | 0.77 | 1.06 [0.88, 1.35] |
+| a (a ions on) | all | all | 3.28 | 1.22 | 0.37 [0.34, 0.42] |
+| b + y + internal | all | all | 34.85 | 10.70 | 0.31 [0.29, 0.32] |
+
+(2) Isotope peaks in "noise": with max_isotope 1, 5.4% of the 14,411 noise
+peaks become ¹³C peaks of fragments against 3.7% for decoys, excess 1.7%
+[1.2, 2.2]; requiring the same ion's monoisotopic peak to be labelled, 2.5% vs
+0.4%, excess 2.1% [1.7, 2.4]. By m/z: < 300 excess 0.1% [−0.2, 0.5]; 300–1,000
+1.0% [0.4, 1.6]; ≥ 1,000 8.3% [6.3, 10.4] (with monoisotopic partner 7.5%).
+The excess is b and y (y 284 vs decoys 108, b 144 vs 97); internal isotope
+matches are at chance (334 vs 491).
+(3) Precedence: 407 of 8,020 matched peaks (5.1%; decoys 3.0%) match more than
+one class. Of 1,524 peaks with a b candidate, 35 are labelled otherwise: 17
+internal and 18 y; 26 of the 35 because the b candidate carries a loss and the
+winner does not (loss is ranked above ion class), 9 on charge or ppm against a
+y. Of 2,918 peaks with a y candidate, 72 are labelled otherwise (52 internal,
+19 b, 1 immonium; 68 by the loss rule).
+(4) Coverage (observed / theoretical indices, y1 and b_{L−1} excluded,
+`coverage.csv`): charge 1 without losses b 0.35 [0.32, 0.38] vs y 0.70 [0.66,
+0.73], decoys 0.06 / 0.05, chance fraction b 0.17, y 0.07; with losses b 0.40,
+y 0.71. Charge 2 (66 spectra with z ≥ 3): b 0.03, y 0.08 without losses
+(chance fraction 0.37 / 0.17). a ions: 539 of the noise peaks (3.7%; decoys
+1.0%, excess 2.8% [2.3, 3.3]) become a ions, 181 of them a2 (excess 0.9%);
+internal → a 49 of 2,925 (1.7% vs 1.3%, excess 0.4% [−0.2, 1.0]). Under the
+current concept code an a ion gets no position or cover concepts.
+(5) Concepts (`concepts.csv`; chance fraction over non-determined peaks; F1dom
+not recomputed, dictionary not rebuilt):
+- Label-derived and reliable (chance fraction ≤ 0.2, CI mostly below): is_y_ion
+  0.11, position_middle 0.09, cleaves_N_to_Pro 0.10, cleaves_C_to_Asp 0.11,
+  cleaves_C_to_Glu 0.12, position_Nterm 0.16, is_b_ion 0.18 [0.16, 0.20],
+  position_Cterm 0.18 (420 of its 1,292 positives are y1 or b_{L−1}), covers_R 0.17,
+  covers_C 0.19 [0.14, 0.26], ion_contains_cam_cys 0.19 [0.14, 0.26].
+- Contaminated by chance (> 0.2): is_internal_fragment 0.54, is_fragment_charge_2
+  0.64, is_NH3_loss 0.43, has_neutral_loss 0.40, is_H2O_loss 0.38,
+  ion_contains_oxidation 0.50 [0.26, 0.81], ion_contains_deamidation 0.32,
+  is_matched_peak 0.31, covers_M 0.31, covers_F 0.30, covers_D 0.28,
+  covers_Y 0.28, covers_N 0.28, covers_E 0.26, covers_P 0.26, cleaves_C_to_Lys
+  0.24, covers_W 0.23, covers_K 0.23, is_last_ion 0.22, is_fragment_charge_1
+  0.29, cleaves_C_to_Arg 0.20 [0.10, 0.36]. covers_* and ion_contains_* also
+  carry the bug positives above.
+- Peptide- or composition-determined: is_I_ion (peptide-independent, 56%
+  absent residues), is_precursor_related, and is_first_ion, 392 of whose 412
+  positives are y1 (two m/z values for tryptic K/R peptides; the b1 remainder
+  is too small to judge, chance 0.83 [0.58, 1.44]). These are m/z detectors
+  in practice.
+- Not label-derived: the mz bins, top_decile_intensity, precursor charge,
+  peptide length, spectrum_contains_* (unaffected).
+- Change under (2), isotope peaks labelled: is_y_ion +286 (+10%; decoys +108),
+  is_b_ion +146 (+10%; +97), is_internal_fragment +335 (decoys +491), covers_*
+  +11–17%, most of it matched by decoys (+8–17%). Under (4), a ions on: is_matched_peak +550 (decoys +184),
+  is_internal_fragment −49, is_I_ion −46 (a1 coincides with the immonium of
+  residue 1), has_neutral_loss +228 (decoys +88).
+Results that rest on the affected concepts:
+- Dictionary: the top concept is covers_* for 535 / 626 / 633 / 679 features
+  at L2/4/6/8, ion_contains_* for 360 / 356 / 279 / 230, is_I_ion for 290 /
+  363 / 362 / 325, and is_internal_fragment for 82 / 132 / 161 / 299; their
+  F1dom and associations use the affected labels.
+- V1-4c case views: peak labels and concepts come from the same annotator.
+  H6's evidence is F6206's top concept is_I_ion (F1dom 0.137), a
+  peptide-independent label, and one internal-fragment match within chance; H2
+  rests on is_internal_fragment features and internal-fragment peaks (chance
+  0.54); H1 and H5 name covers_N / covers_D features and H7 a covers_E feature
+  (chance 0.26–0.28 plus 3.5–5% bug positives). The candidates' evidence
+  classes count internal (and immonium) peaks as fragments. The hypotheses are
+  unchanged.
+- V1-2 concept stratum (selected by F1dom over chemical concepts; 40 per layer):
+  top concept is_I_ion for 14 / 9 / 8 and is_first_ion for 9 / 12 / 7 at
+  L2/4/6; with the mz bins and intensity (17 / 16 / 22), at most one feature
+  per layer has a label-derived concept with chance ≤ 0.2. The "positive
+  control" is mostly m/z detectors.
+- Phase 4 and the evaluation reports use the same labels (not re-examined here).
+
 ## Log
 
 - 2026-11-20 — Review of paper, thesis and repo; findings above.
@@ -1002,3 +1161,4 @@ supports, not which label is wrong.
 - 2026-11-24 — V1-4b commits pushed (`992b3b4`..`f8eb7df`); the joint-ablation caveat added to V1-4b's results (the joint figure is a reference scale, not a clean total). No code changed.
 - 2026-11-24 — V1-4c part A, case selection: `runtime.py` gets the `audit-cases` subcommand and pure helpers (`differing_region`, `mismatch_type`, `distinguishing_peaks`, `evidence_class`, `mean_residue_log_prob`, `select_audit_cases`, `case_view`), additive; the CLI's `main` now returns a subcommand's exit code (the existing ones return 0 as before). The regenerated predictions reproduce V1-4a (123 exact, 167 meeting the precursor); 44 candidates, 6 selected; table under V1-4c. No ablation calls. 167 tests pass (23 new).
 - 2026-11-24 — V1-4c part A, pre-registration, amended at review before commit: hypotheses H1–H7 (H7 a logged deviation; all at layer 8, a post-hoc choice now recorded) and the part-B protocol under V1-4c (ctx_t target = the prediction outside the region plus the I→L-mapped true region, since ablation_context does not canonicalise I/L; control pools with a 0.5× activation floor and an underpowered mark; removed-norm ratios; "undetermined" below 10 distinct control draws, which H3, H4 and H6 hit by construction). Descriptive checks (no ablation) under V1-4c: 23 of 35 true-only peaks of the 7 isotope-offset deamidation candidates are 13C peaks of predicted fragments; decoys match 5–8% of peaks as internal fragments. hypotheses.json sha256 2177039b…e84a9. Not in this commit (STATUS.md only, as asked): the check code (`runtime.audit_descriptive_checks`, `control_pool`, `n_distinct_control_sets`, `peptide_decoys`, the `audit-checks` subcommand), the additive `max_isotope` flag of `annotate.run_spectrum_utils` (default 0, unchanged behaviour) and 4 tests; they stay in the working tree for review and go into the repo with part B. No ablation calls.
+- 2026-11-25 — Committed the V1-4c descriptive-check code and the `max_isotope` flag (`f4933d3`, 171 tests). Finding 8 (descriptive) and review notes under V1-4c (`82ed2f6`): ranks 1, 5, 12 are notation-equivalent; InstaNovo's mass metric (127/200) also counts H7's Q/K case correct; corpus-level, 182 of 813 local deamidated labels (22%) fit a ¹³C misassignment and not deamidation at the instrument's accuracy (MAD 0.93 ppm). Label-quality audit (Finding 9, `analysis --label-audit`, 56 s; 8(d) pass 6 s): stored labels reproduce exactly on 200 spectra; two labelling bugs (immonium for absent residues, 56% of immonium labels; internal-fragment end off by one), chance fractions per class and concept; annotator decisions moved to the backlog. CLAUDE.md's /doctor trim was not committed; restoring it was blocked by the permission classifier and is left to the user. No ablation, API calls or rebuilds. 191 tests pass.

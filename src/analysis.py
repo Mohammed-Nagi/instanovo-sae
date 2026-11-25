@@ -3,7 +3,8 @@
 Everything here reads each layer's ``report.json`` (Phase 8 results) and, with
 ``--descriptions``, the interpret.py description runs. Those modes need neither
 torch nor the activation chunks, so they run on any machine; only
-``--deamidation-precursor`` (below) reads the extract chunks.
+``--deamidation-precursor`` and ``--label-audit`` (below) read the extract
+chunks (torch, imported lazily).
 
 Hub inventory
     Phase 8 ablates, for every concept, its top ``ablation_per_feature_top``
@@ -56,12 +57,29 @@ Deamidation vs 13C at the precursor (``--deamidation-precursor``, Finding 8(d))
     robust sigma (1.4826 x MAD). Writes
     ``analysis/label_audit/deamidation_precursor{.csv,_summary.json}``.
 
+Label-quality audit (``--label-audit``, Finding 9)
+    Also reads the extract chunks, plus the stored labels. A seeded sample of
+    200 local spectra (15-16 per chunk) is re-annotated from the stored
+    processed peaks: first through ``annotate.annotate_spectrum``, which must
+    reproduce the stored labels exactly (otherwise the audit stops), then with
+    one spectrum_utils call per peptide that returns every candidate (a ions
+    on, max_isotope 1), from which ``annotate.select_annotation`` derives the
+    pipeline, isotope-1 and a-ion settings. The true peptide and 20
+    same-composition decoys (``annotate.peptide_decoys``) give, per class and
+    per concept, the chance fraction (decoy mean / true count; immonium,
+    precursor, y1, b_{L-1}, a_{L-1} excluded as composition-determined), the
+    isotope-1 and a-ion transitions, co-matching classes, and b/y coverage, with
+    percentile-bootstrap 95% CIs over spectra. Writes ``analysis/label_audit/``:
+    reproduction.json, sample.csv, per_class.csv, determined.csv, isotope.csv,
+    precedence.csv, coverage.csv, a_ions.csv, concepts.csv, summary.json.
+
 Usage (from the repo root)::
 
     PYTHONPATH=src uv run python -m analysis
     PYTHONPATH=src uv run python -m analysis --root sae_pipeline_outputs --layers 2 4
     PYTHONPATH=src uv run python -m analysis --descriptions blind_v1 unblinded_v2
     PYTHONPATH=src uv run python -m analysis --root sae_pipeline_outputs --deamidation-precursor
+    PYTHONPATH=src uv run python -m analysis --root sae_pipeline_outputs --label-audit
 
 Outputs under ``<root>/analysis/``: ``hubs.csv`` (a ranked list, no flag) and
 ``f1dom_selectivity.csv``; with ``--descriptions``, only
@@ -488,6 +506,465 @@ def deamidation_precursor(root: Path, tol: float = PRECURSOR_TOL_PPM) -> tuple[l
     return rows, summary
 
 
+# --- Label-quality audit (Finding 9) ------------------------------------------
+# Read-only: the stored processed peaks of a seeded sample of local spectra are
+# re-annotated with the pipeline's annotator. One spectrum_utils call per
+# peptide (ion types abyIp + internal, max_isotope 1, all candidates); the
+# pipeline setting (monoisotopic, no a ions), the isotope-1 setting and the
+# a-ion setting are read off it with annotate.select_annotation.
+
+AUDIT_N = 200
+AUDIT_N_DECOYS = 20
+AUDIT_N_BOOT = 2_000
+AUDIT_ION_TYPES = "abyIp"                     # + internal ('m', added by run_spectrum_utils)
+CHANCE_FLAG = 0.20                            # concepts above this chance fraction are flagged
+FAMILY = {"b": "b", "y": "y", "a": "a", "internal": "internal", "I": "immonium",
+          "precursor": "precursor", "noise": "noise"}
+CHANCE_FAMILIES = ("b", "y", "a", "internal")
+
+# Which label classes each of the 50 concepts depends on (Finding 9).
+_COVER_CLASSES = "b, y, internal, precursor, immonium (residue only)"
+_NOT_LABEL = "not label-derived"
+_STRUCTURAL = "structural (latent token)"
+CONCEPT_LABEL_CLASSES: dict[str, str] = {
+    "is_b_ion": "b", "is_y_ion": "y", "is_I_ion": "immonium", "is_internal_fragment": "internal",
+    "is_precursor_related": "precursor", "is_matched_peak": "any class",
+    "is_noise_peak": "no class (complement of any)", "is_latent_token": _STRUCTURAL,
+    "is_H2O_loss": "any class with an H2O loss", "is_NH3_loss": "any class with an NH3 loss",
+    "has_neutral_loss": "any class with a loss",
+    "is_fragment_charge_1": "any class at charge 1", "is_fragment_charge_2": "any class at charge 2",
+    **{c: _NOT_LABEL for c in ("precursor_charge_2", "precursor_charge_3", "precursor_charge_4",
+                               "mz_low", "mz_mid", "mz_high", "top_decile_intensity",
+                               "peptide_length_short", "peptide_length_medium", "peptide_length_long",
+                               "spectrum_contains_oxidation", "spectrum_contains_cam_cys",
+                               "spectrum_contains_deamidation")},
+    **{c: "b, y" for c in ("position_Nterm", "position_middle", "position_Cterm", "is_first_ion",
+                           "is_last_ion", "cleaves_C_to_Lys", "cleaves_C_to_Arg", "cleaves_N_to_Pro",
+                           "cleaves_C_to_Asp", "cleaves_C_to_Glu")},
+    **{f"covers_{r}": _COVER_CLASSES for r in "KRWFYPMCDEN"},
+    **{f"ion_contains_{p}": "b, y, internal, precursor" for p in ("oxidation", "cam_cys", "deamidation")},
+}
+
+
+def allocate_sample(n_chunks: int, n: int, rng: np.random.Generator) -> list[int]:
+    """Spectra per chunk: n // n_chunks each, plus one in n % n_chunks chunks
+    drawn without replacement."""
+    k = [n // n_chunks] * n_chunks
+    for i in rng.choice(n_chunks, n % n_chunks, replace=False):
+        k[int(i)] += 1
+    return k
+
+
+def _family(ann: dict) -> str:
+    return FAMILY.get(ann["ion_type"], ann["ion_type"])
+
+
+def _mz_bin(mz: float) -> str:
+    import annotate
+    low, high = annotate.MZ_LOW_HIGH_CUT
+    return "mz_low" if mz < low else ("mz_mid" if mz < high else "mz_high")
+
+
+def _ion_key(ann: dict) -> tuple:
+    return ann["ion_type"], ann["ion_index"], ann["charge"], ann["neutral_loss"]
+
+
+def _class_keys(fam: str, loss: str, charge: int) -> list[str]:
+    loss = loss or "none"
+    keys = [f"{fam}|{loss}|{charge}", f"{fam}|{loss}|*", f"{fam}|*|{charge}", f"{fam}|*|*"]
+    if fam in ("b", "y", "internal"):
+        keys.append("b+y+internal|*|*")
+    return keys
+
+
+def _determined_reason(ann: dict) -> str:
+    t, k = ann["ion_type"], ann["ion_index"]
+    if t in ("I", "precursor"):
+        return FAMILY[t]
+    return "y1" if (t == "y" and k == 1) else f"{t}_L-1"
+
+
+def _lost_reason(best: dict, winner: dict) -> str:
+    """Why a b (or y) candidate lost to the winner, by _candidate_sort_key's order."""
+    if bool(best["neutral_loss"]) and not winner["neutral_loss"]:
+        return "loss"
+    if bool(best["neutral_loss"]) == bool(winner["neutral_loss"]) and winner["ion_type"] in ("b", "y"):
+        return "charge" if best["charge"] > winner["charge"] else "ppm"
+    return "other"
+
+
+def peptide_label_metrics(cands: list[list[dict]], mz, intensity, peptide: str, mods: list[dict],
+                          precursor_charge: int, registry) -> dict[str, float]:
+    """Counts for one (spectrum, peptide) annotation, from per-peak candidate
+    lists (run_spectrum_utils(return_candidates=True)) of a run with a ions and
+    max_isotope 1. Keys:
+      cls|family|loss|charge  pipeline-setting winners (a: a-ion setting),
+                              composition-determined winners excluded
+      det|reason              composition-determined winners
+      iso|noise|bin, iso|became|bin, iso|became_m0|bin, iso|became_fam|family
+                              pipeline-noise peaks that become isotope-1
+                              matches (m0: the same ion's monoisotopic peak is
+                              labelled in the spectrum)
+      prec|...                classes co-matching a peak, and why b/y lost
+      cov|series|charge|losses|indices|num/den   series coverage
+      aion|den|family, aion|from|family[|a2/other]  peaks that become a ions
+      con|cur/det/nodet|c     concept positives (pipeline setting; det = on a
+                              composition-determined winner)
+      con|diso|c, con|da|c    change under isotope-1 / a ions
+      con|intextra|c          positives due only to the internal end residue
+      con|imm_absent|c, imm|peaks, imm|absent   immonium of a residue the
+                              peptide lacks (I, L and J count as one)."""
+    import annotate
+    import torch
+    out: dict[str, float] = {}
+
+    def add(key, v=1):
+        out[key] = out.get(key, 0) + v
+
+    L = len(peptide)
+    zmax = max(1, precursor_charge - 1)
+    thr = annotate.compute_top_decile_threshold(torch.as_tensor(intensity))
+    spec_c = annotate.compute_spectrum_concepts(mods, precursor_charge, peptide)
+
+    def concepts(ann, j):
+        c = annotate.compute_peak_concepts(ann, float(mz[j]), float(intensity[j]), thr, peptide, mods, L, registry)
+        annotate.merge_spectrum_concepts(c, spec_c)
+        return {k for k, v in c.items() if v}
+
+    cur = [annotate.select_annotation(c, 0, ("a",)) for c in cands]
+    iso = [annotate.select_annotation(c, 1, ("a",)) for c in cands]
+    pla = [annotate.select_annotation(c, 0, ()) for c in cands]
+    m0_keys = {_ion_key(a) for a in cur if a["ion_type"] != "noise"}
+    covered = set()
+    present = set(peptide) | ({"I", "L", "J"} if set(peptide) & {"I", "L"} else set())
+    for j, (c, a, ai, aa) in enumerate(zip(cands, cur, iso, pla, strict=True)):
+        fam = _family(a)
+        det = fam != "noise" and annotate.is_composition_determined(a, L)
+        # (1) classes
+        if fam != "noise":
+            if det:
+                add(f"det|{_determined_reason(a)}")
+            elif fam in CHANCE_FAMILIES:
+                for k in _class_keys(fam, a["neutral_loss"], a["charge"]):
+                    add("cls|" + k)
+        if _family(aa) == "a" and not annotate.is_composition_determined(aa, L):
+            for k in _class_keys("a", aa["neutral_loss"], aa["charge"]):
+                add("cls|" + k)
+        # (2) isotope peaks among pipeline noise
+        if fam == "noise":
+            b = _mz_bin(float(mz[j]))
+            for tag in (b, "all"):
+                add(f"iso|noise|{tag}")
+            if ai["ion_type"] != "noise":
+                for tag in (b, "all"):
+                    add(f"iso|became|{tag}")
+                    if _ion_key(ai) in m0_keys:
+                        add(f"iso|became_m0|{tag}")
+                add(f"iso|became_fam|{_family(ai)}")
+        # (3) precedence among pipeline-setting candidates
+        cc = [x for x in c if x["isotope"] == 0 and x["ion_type"] != "a"]
+        if cc:
+            fams = {_family(x) for x in cc}
+            add("prec|matched")
+            if len(fams) > 1:
+                add("prec|multi")
+            for f in fams:
+                add(f"prec|co|{f}|{fam}")
+            for s in ("b", "y"):
+                sc = [x for x in cc if x["ion_type"] == s]
+                if sc:
+                    add(f"prec|{s}cand")
+                    if fam != s:
+                        add(f"prec|{s}cand_win|{fam}")
+                        add(f"prec|{s}cand_reason|{_lost_reason(sc[0], a)}")
+        # (4) series coverage, a ions
+        if a["ion_type"] in ("b", "y"):
+            covered.add(_ion_key(a))
+        add(f"aion|den|{fam}")
+        if _family(aa) == "a" and fam != "a":
+            add(f"aion|from|{fam}")
+            add(f"aion|from|{fam}|{'a2' if aa['ion_index'] == 2 else 'other'}")
+        # (5) concepts
+        base = concepts(a, j)
+        for k in base:
+            add(f"con|cur|{k}")
+            add(f"con|{'det' if det else 'nodet'}|{k}")
+        for tag, alt in (("diso", ai), ("da", aa)):
+            if _ion_key(alt) != _ion_key(a):
+                new = concepts(alt, j)
+                for k in new - base:
+                    add(f"con|{tag}|{k}")
+                for k in base - new:
+                    add(f"con|{tag}|{k}", -1)
+        if fam == "internal":
+            s0, e0 = a["ion_index"]
+            fixed = concepts(dict(a, ion_index=(s0, e0 - 1)), j)   # spectrum_utils' end is exclusive
+            for k in base - fixed:
+                add(f"con|intextra|{k}")
+        if fam == "immonium":
+            add("imm|peaks")
+            if a["ion_index"] not in present:
+                add("imm|absent")
+                for k in base:
+                    if k.startswith("covers_") and k[-1] not in peptide:
+                        add(f"con|imm_absent|{k}")
+    for s in ("b", "y"):
+        idx_all = set(range(1, L))
+        idx_ch = {k for k in idx_all if not annotate.is_composition_determined({"ion_type": s, "ion_index": k}, L)}
+        for z in [*range(1, zmax + 1), "*"]:
+            for mode in ("none", "any"):
+                ks = {k for (t, k, ch, nl) in covered
+                      if t == s and (z == "*" or ch == z) and (mode == "any" or not nl)}
+                for name, idx in (("all", idx_all), ("chance", idx_ch)):
+                    add(f"cov|{s}|{z}|{mode}|{name}|num", len(ks & idx))
+                    add(f"cov|{s}|{z}|{mode}|{name}|den", len(idx))
+    return out
+
+
+def bootstrap_indices(n: int, n_boot: int, seed: int) -> np.ndarray:
+    return np.random.default_rng(seed).integers(0, n, size=(n_boot, n))
+
+
+def _safe_div(a, b):
+    """a / b elementwise, NaN where b == 0 (a resample with no denominator)."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    return np.divide(a, b, out=np.full(np.broadcast(a, b).shape, np.nan), where=b != 0)
+
+
+def ratio_ci(num, den, idx: np.ndarray) -> tuple[float, float, float]:
+    """sum(num) / sum(den) with a percentile bootstrap 95% CI over the resamples
+    `idx` (rows of indices into the spectra)."""
+    num, den = np.asarray(num, float), np.asarray(den, float)
+    est = num.sum() / den.sum() if den.sum() else math.nan
+    boot = _safe_div(num[idx].sum(1), den[idx].sum(1))
+    if not np.isfinite(boot).any():
+        return float(est), math.nan, math.nan
+    lo, hi = np.nanpercentile(boot, [2.5, 97.5])
+    return float(est), float(lo), float(hi)
+
+
+def ratio_diff_ci(n1, d1, n2, d2, idx: np.ndarray) -> tuple[float, float, float]:
+    """sum(n1)/sum(d1) - sum(n2)/sum(d2), paired bootstrap 95% CI over spectra."""
+    n1, d1, n2, d2 = (np.asarray(x, float) for x in (n1, d1, n2, d2))
+    est = float(_safe_div(n1.sum(), d1.sum()) - _safe_div(n2.sum(), d2.sum()))
+    boot = _safe_div(n1[idx].sum(1), d1[idx].sum(1)) - _safe_div(n2[idx].sum(1), d2[idx].sum(1))
+    if not np.isfinite(boot).any():
+        return float(est), math.nan, math.nan
+    lo, hi = np.nanpercentile(boot, [2.5, 97.5])
+    return float(est), float(lo), float(hi)
+
+
+def label_audit(root: Path, n: int = AUDIT_N, seed: int = DEFAULT_SEED, n_decoys: int = AUDIT_N_DECOYS,
+                n_boot: int = AUDIT_N_BOOT) -> dict:
+    """Run the audit and write its tables under ``root/analysis/label_audit/``.
+    Stops after writing reproduction.json if re-annotating the true peptides
+    does not reproduce the stored labels exactly."""
+    import time
+    import torch
+    import annotate
+    t_start = time.perf_counter()
+    out_dir = root / "analysis" / "label_audit"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest = json.loads((root / "extract" / "manifest.json").read_text())
+    registry = annotate.ConceptRegistry.build()
+    config = annotate.AnnotationConfig(extract_dir=Path(), output_dir=Path())
+    rng = np.random.default_rng(seed)
+    per_chunk = allocate_sample(len(manifest["chunks"]), n, rng)
+    timings = {"reproduction": 0.0, "annotate": 0.0, "metrics": 0.0}
+    sample, true_m, decoy_m, mismatches = [], [], [], []
+
+    for ch, k in zip(manifest["chunks"], per_chunk, strict=True):
+        meta = torch.load(root / "extract" / ch["meta"], map_location="cpu", weights_only=False)
+        labels = torch.load(root / "annotation" / "labels" / f"chunk_{ch['idx']:05d}.pt",
+                            map_location="cpu", weights_only=False)
+        if labels["chunk_idx"] != ch["idx"] or labels["total_tokens"] != meta["total_tokens"]:
+            raise RuntimeError(f"chunk {ch['idx']}: labels do not align with the extract metadata")
+        for s in sorted(rng.choice(meta["n_spectra"], k, replace=False).tolist()):
+            pep, prof, mods = meta["peptides"][s], meta["proforma_strings"][s], meta["modifications"][s]
+            mz, inten = meta["mz_arrays"][s], meta["intensity_arrays"][s]
+            pmz, z = float(meta["precursor_mzs"][s]), int(meta["precursor_charges"][s])
+            sid = int(meta["spectrum_ids"][s])
+            # (0) reproduction through the pipeline's own path
+            t0 = time.perf_counter()
+            anns, tok = annotate.annotate_spectrum(pep, prof, mods, mz, inten, pmz, z, config, registry,
+                                                   strict=True)
+            rows = (meta["token_to_spectrum"] == s).nonzero().flatten()
+            fields = {"token_labels": tok.labels, "ion_type_ids": tok.ion_type, "ion_indices": tok.ion_index,
+                      "fragment_charges": tok.fragment_charge, "neutral_loss_ids": tok.neutral_loss_id}
+            bad = [f for f, v in fields.items() if not torch.equal(v, labels[f][rows])]
+            if bad:
+                mismatches.append({"chunk": ch["idx"], "spectrum": s, "spectrum_id": sid, "fields": bad})
+            timings["reproduction"] += time.perf_counter() - t0
+
+            def candidates(proforma):
+                return annotate.run_spectrum_utils(
+                    proforma=proforma, mz_array=mz, intensity_array=inten, precursor_mz=pmz,
+                    precursor_charge=z, ion_types=AUDIT_ION_TYPES, fragment_tol_mass=config.fragment_tol_mass,
+                    fragment_tol_mode=config.fragment_tol_mode, enable_internal=config.enable_internal,
+                    strict=True, max_isotope=1, return_candidates=True)
+
+            t0 = time.perf_counter()
+            cands = candidates(prof)
+            derived = [annotate.select_annotation(c, 0, ("a",)) for c in cands]
+            if any({kk: d[kk] for kk in annotate._LABEL_KEYS} != a for d, a in zip(derived, anns, strict=True)):
+                mismatches.append({"chunk": ch["idx"], "spectrum": s, "spectrum_id": sid,
+                                   "fields": ["derived pipeline-setting winners"]})
+            tokens = annotate.proforma_residue_tokens(prof)
+            if not tokens[0][0].isalpha():
+                raise RuntimeError(f"spectrum {sid}: N-terminal modification (Finding 6) in {prof!r}")
+            try:
+                decoys = annotate.peptide_decoys(tokens, n_decoys, np.random.default_rng([seed, sid]),
+                                                 exclude=[tokens])
+            except RuntimeError:
+                decoys = []
+            decoy_inputs = [annotate.annotation_inputs_from_tokens(d, mods) for d in decoys]
+            decoy_cands = [candidates(dp) for _db, dp, _dm in decoy_inputs]
+            timings["annotate"] += time.perf_counter() - t0
+
+            t0 = time.perf_counter()
+            true_m.append(peptide_label_metrics(cands, mz, inten, pep, mods, z, registry))
+            dm: dict[str, float] = {}
+            for (db, _dp, dmods), dc in zip(decoy_inputs, decoy_cands, strict=True):
+                for kk, v in peptide_label_metrics(dc, mz, inten, db, dmods, z, registry).items():
+                    dm[kk] = dm.get(kk, 0) + v / len(decoys)
+            decoy_m.append(dm if decoys else None)
+            timings["metrics"] += time.perf_counter() - t0
+            sample.append({"chunk": ch["idx"], "spectrum": s, "spectrum_id": sid, "peptide": pep,
+                           "proforma": prof, "length": len(pep), "precursor_charge": z, "n_peaks": len(mz),
+                           "n_decoys": len(decoys)})
+        del meta, labels
+
+    settings = {
+        "fragment_tol": f"{config.fragment_tol_mass:g} {config.fragment_tol_mode}",
+        "pipeline_ion_types": config.ion_types + ("m" if config.enable_internal else ""),
+        "neutral_losses": annotate.NEUTRAL_LOSSES, "max_isotope": 0,
+        "fragment_charges": "1..max(1, z-1) (spectrum_utils default max_ion_charge; never passed)",
+        "precedence": "monoisotopic > no loss > b/y > a/c/x/z > immonium > internal > precursor > lower charge "
+                      "> smaller |ppm| (annotate._candidate_sort_key)",
+        "audit_run": f"ion types {AUDIT_ION_TYPES}+m, max_isotope 1, all candidates; settings derived with "
+                     "annotate.select_annotation",
+        "decoys": f"{n_decoys} per spectrum, annotate.peptide_decoys of the true peptide (C-terminal residue "
+                  "fixed, rest shuffled with modifications), default_rng([seed, spectrum_id])",
+        "excluded_from_chance": "immonium, precursor, y1, b_{L-1}, a_{L-1} (any loss/isotope): the same for "
+                                "every same-composition decoy with the C-terminal residue fixed",
+        "bootstrap": f"{n_boot} resamples of spectra, percentile 95% CI, default_rng({seed}); the decoy mean "
+                     "per spectrum is the unit",
+        "seed": seed, "n": n, "per_chunk": dict(zip([c["idx"] for c in manifest["chunks"]], per_chunk)),
+    }
+    repro = {"ok": not mismatches, "n_spectra": len(sample), "mismatches": mismatches}
+    (out_dir / "reproduction.json").write_text(json.dumps(repro, indent=1))
+    _write_csv(out_dir / "sample.csv", list(sample[0]), sample)
+    if mismatches:
+        summary = {"settings": settings, "reproduction": repro, "stopped": "labels not reproduced",
+                   "timings_s": timings}
+        (out_dir / "summary.json").write_text(json.dumps(summary, indent=1, default=str))
+        return summary
+
+    t0 = time.perf_counter()
+    keep = [i for i, d in enumerate(decoy_m) if d is not None]
+    idx_dec = bootstrap_indices(len(keep), n_boot, seed)
+
+    def arr(key, which="true", subset=None):
+        src = true_m if which == "true" else decoy_m
+        ids = range(len(true_m)) if subset is None else subset
+        return np.array([(src[i] or {}).get(key, 0.0) for i in ids], float)
+
+    def T(key):                                   # true values, spectra with decoys
+        return arr(key, "true", keep)
+
+    def D(key):                                   # decoy means, spectra with decoys
+        return arr(key, "decoy", keep)
+
+    keys = set().union(*true_m)
+    # (1) per class
+    cls_rows = []
+    for key in sorted(k[4:] for k in keys if k.startswith("cls|")):
+        fam, loss, charge = key.split("|")
+        t, d = T("cls|" + key), D("cls|" + key)
+        cf, lo, hi = ratio_ci(d, t, idx_dec)
+        cls_rows.append({"family": fam, "loss": loss, "charge": charge,
+                         "setting": "a ions on" if fam == "a" else "pipeline", "n_spectra": len(keep),
+                         "true_mean": t.mean(), "decoy_mean": d.mean(), "chance_fraction": cf,
+                         "ci_low": lo, "ci_high": hi, "excess_mean": (t - d).mean()})
+    det_rows = [{"reason": k[4:], "true_mean": arr(k).mean(), "true_total": arr(k).sum()}
+                for k in sorted(k for k in keys if k.startswith("det|"))]
+    # (2) isotope
+    iso_rows = []
+    for tag in ("all", "mz_low", "mz_mid", "mz_high"):
+        nt, nd = T(f"iso|noise|{tag}"), D(f"iso|noise|{tag}")
+        row = {"mz_bin": tag, "n_noise_true": nt.sum()}
+        for kind in ("became", "became_m0"):
+            bt, bd = T(f"iso|{kind}|{tag}"), D(f"iso|{kind}|{tag}")
+            diff, lo, hi = ratio_diff_ci(bt, nt, bd, nd, idx_dec)
+            row |= {f"{kind}_true": bt.sum() / nt.sum(), f"{kind}_decoy": bd.sum() / nd.sum(),
+                    f"{kind}_excess": diff, f"{kind}_excess_ci_low": lo, f"{kind}_excess_ci_high": hi}
+        iso_rows.append(row)
+    iso_fam = {k.split("|")[2]: (T(k).sum(), D(k).sum()) for k in keys if k.startswith("iso|became_fam|")}
+    # (3) precedence
+    prec_rows = [{"key": k[5:], "true_total": arr(k).sum(), "true_total_decoy_spectra": T(k).sum(),
+                  "decoy_mean_total": D(k).sum()}
+                 for k in sorted(k for k in keys if k.startswith("prec|"))]
+    # (4) coverage and a ions
+    cov_rows = []
+    for k in sorted(k for k in keys if k.startswith("cov|") and k.endswith("|num")):
+        _c, s, zc, mode, name, _n = k.split("|")
+        base = k[:-4]
+        tn, td, dn = T(base + "|num"), T(base + "|den"), D(base + "|num")
+        ct, clo, chi = ratio_ci(tn, td, idx_dec)
+        cf, flo, fhi = ratio_ci(dn, tn, idx_dec)
+        cov_rows.append({"series": s, "charge": zc, "losses": mode, "indices": name,
+                         "n_spectra": int((td > 0).sum()), "coverage_true": ct, "ci_low": clo, "ci_high": chi,
+                         "coverage_decoy": dn.sum() / td.sum() if td.sum() else math.nan,
+                         "chance_fraction": cf, "cf_ci_low": flo, "cf_ci_high": fhi})
+    a_rows = []
+    for src in ("noise", "internal", "immonium", "precursor", "b", "y"):
+        nt, nd = T(f"aion|den|{src}"), D(f"aion|den|{src}")
+        if nt.sum() == 0:
+            continue
+        for sub in ("", "|a2", "|other"):
+            bt, bd = T(f"aion|from|{src}{sub}"), D(f"aion|from|{src}{sub}")
+            diff, lo, hi = ratio_diff_ci(bt, nt, bd, nd, idx_dec)
+            a_rows.append({"from": src, "a_index": sub.strip("|") or "any", "n_from_true": nt.sum(),
+                           "became_a_true": bt.sum(), "frac_true": bt.sum() / nt.sum(),
+                           "frac_decoy": bd.sum() / nd.sum() if nd.sum() else math.nan,
+                           "excess": diff, "ci_low": lo, "ci_high": hi})
+    # (5) concepts
+    con_rows = []
+    for c in registry.names:
+        nodet_t, nodet_d = T(f"con|nodet|{c}"), D(f"con|nodet|{c}")
+        label_derived = CONCEPT_LABEL_CLASSES[c] not in (_NOT_LABEL, _STRUCTURAL)
+        if label_derived and nodet_t.sum():
+            cf, lo, hi = ratio_ci(nodet_d, nodet_t, idx_dec)
+        else:
+            cf = lo = hi = math.nan
+        con_rows.append({
+            "concept": c, "label_classes": CONCEPT_LABEL_CLASSES[c], "positives": arr(f"con|cur|{c}").sum(),
+            "from_determined": arr(f"con|det|{c}").sum(),
+            "d_isotope_true": arr(f"con|diso|{c}").sum(), "d_isotope_decoy_mean": D(f"con|diso|{c}").sum(),
+            "d_a_ions_true": arr(f"con|da|{c}").sum(), "d_a_ions_decoy_mean": D(f"con|da|{c}").sum(),
+            "chance_fraction": cf, "ci_low": lo, "ci_high": hi,
+            "flag_chance_over_20pct": bool(label_derived and cf > CHANCE_FLAG),
+            "internal_end_only": arr(f"con|intextra|{c}").sum(),
+            "immonium_absent_residue": arr(f"con|imm_absent|{c}").sum()})
+    timings["tables"] = time.perf_counter() - t0
+    timings["total"] = time.perf_counter() - t_start
+
+    for name, rows_ in (("per_class", cls_rows), ("determined", det_rows), ("isotope", iso_rows),
+                        ("precedence", prec_rows), ("coverage", cov_rows), ("a_ions", a_rows),
+                        ("concepts", con_rows)):
+        _write_csv(out_dir / f"{name}.csv", list(rows_[0]), rows_)
+    summary = {
+        "settings": settings, "reproduction": repro, "timings_s": timings,
+        "n_spectra": len(true_m), "n_with_decoys": len(keep),
+        "n_peaks": int(sum(r["n_peaks"] for r in sample)),
+        "pipeline_label_counts": {f: arr(f"aion|den|{f}").sum() for f in FAMILY.values() if f != "a"},
+        "immonium": {"peaks": arr("imm|peaks").sum(), "absent_residue": arr("imm|absent").sum()},
+        "isotope_became_by_family": {f: {"true": v[0], "decoy_mean": v[1]} for f, v in sorted(iso_fam.items())},
+    }
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=1, default=float))
+    return summary
+
+
 def _write_csv(path: Path, columns: list[str], rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as fh:
@@ -506,7 +983,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--deamidation-precursor", action="store_true",
                         help="Finding 8(d): deamidated labels vs the precursor at isotope offsets 0/1 "
                              "(reads the extract chunks; needs torch)")
+    parser.add_argument("--label-audit", action="store_true",
+                        help="Finding 9: label-quality audit over a seeded sample of local spectra "
+                             "(reads the extract chunks and labels; needs torch)")
     args = parser.parse_args(argv)
+
+    if args.label_audit:
+        summary = label_audit(args.root, seed=args.seed)
+        print(json.dumps(summary, indent=1, default=float))
+        return
 
     if args.deamidation_precursor:
         out_dir = args.root / "analysis" / "label_audit"

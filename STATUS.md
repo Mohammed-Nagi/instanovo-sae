@@ -11,8 +11,8 @@ with honest labels and evidence indicators (association, causal and
 description coverage, with their effect sizes), and ablate a feature to see the effect
 on each predicted residue.
 
-Open, in order: V1-4c, V1-5, V1-6, V1-2c (when API credit is
-available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-3b, V1-4a, V1-4b.
+Open, in order: V1-5, V1-6, V1-2c (when API credit is
+available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-3b, V1-4a, V1-4b, V1-4c.
 
 - [x] **V1-1 Hub inventory** — `src/analysis.py`, output `analysis/hubs.csv`.
       From existing per-feature ablations in each layer's report.json: rank by
@@ -340,7 +340,7 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-3b, V1-4a, V
       every feature at a token is a large edit that can produce states the
       model rarely sees; the joint figure is a reference scale, not a clean
       total. 144 tests pass (14 new).
-- [ ] **V1-4c Audit case study** — pick 3–5 confidently wrong predictions
+- [x] **V1-4c Audit case study** — pick 3–5 confidently wrong predictions
       from the V1-4a accuracy run (seed 0); use the inspector to form a
       hypothesis for each failure; test it by exact ablation; record what
       held and what didn't. Metric: Δ[log p(pred) − log p(true)], from two
@@ -743,6 +743,204 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-3b, V1-4a, V
         evidence above is concept associations only, all weak (F1dom ≤ 0.63);
         the encoder does not see the peptide; H2, H3 (and the deamidation
         labels in check (a)) may be label errors; the layer choice was post hoc.
+
+      Part B results (2026-11-25, `python -m inspector.runtime audit-part-b
+      --parquet <HF test>`, 272 s on CPU against a 5–10 min estimate; code
+      `800558a`). Outputs in `analysis/v1_4c/`, with sha256:
+      - part_b.json `ca24461c9bf06b865d91dcd9b82b5888e0b1cc268765e17974020b40d72f46d9`
+      - part_b_summary.csv `5d391c258b497a5453a85880aa43fb632eed974350e838f4568fd2f9e749702a`
+      - part_b_controls.csv `e6b09a55d0972f4d86c8bedf8d2b71724c808a346d9a2b9f5ef69119297bbf2a`
+      - part_b_token_sweep.csv `e5a950ef386b557fc11628d4102a5547ae02cc8be5d75ccb7139bf85dd648b56`
+
+      Run as registered, with the following checks (the run stops if any fails):
+      - hypotheses.json matched the registered sha256.
+      - For all 7 rows, the fresh explain() reproduced the saved prediction,
+        its per-residue log p (to 1e-5) and the candidates.csv region.
+      - T round-tripped through the tokenizer, and ctx_t saw the same L8 features.
+      - Every recomputed control pool and set count equalled
+        descriptive_checks.json.
+
+      H6's set E equals its single-feature E (one item). H7's secondary batch
+      reproduced the set's E exactly. Provenance for every number below:
+      exact error-preserving ablation, local at the named tokens, L8, joint
+      removal of the named set; contexts ctx_p and ctx_t as registered;
+      n = 1 spectrum per hypothesis; no CI.
+
+      | hyp | row | class (Amendment 1) | sign | M(intact) | E | E / M | control percentile | secondary (H7) | outcome |
+      |---|---|---|---|---|---|---|---|---|---|
+      | H1 | 19475 | amb | + | 2.743 | −1.043 | −0.380 | 0.45 | | not supported |
+      | H2 | 51238 | amb | + | 2.498 | −0.005 | −0.002 | 0.10 | | not supported |
+      | H3 | 109208 | true | + | 7.138 | +0.096 | +0.013 | – | | undetermined by construction (registered) |
+      | H4 | 29350 | amb | + | 1.439 | −0.093 | −0.064 | – | | undetermined by construction (registered) |
+      | H5 | 60182 | amb | + | 0.544 | +0.779 | +1.431 | 1.00 | | supported |
+      | H6 | 29977 | amb | − | 1.479 | +0.232 | +0.157 | – | | undetermined by construction (registered) |
+      | H7 | 43804 | true | − | 0.933 | +0.351 | +0.377 | 0.10 | 0.20 | not supported |
+
+      M(intact) > 0 in every case, so E / M is well defined. Percentiles are
+      taken in the predicted direction. Distinct control draws among the 20
+      (possible sets): H1 17 (49), H2 20 (1,080), H5 20 (540), H7 15 (48);
+      H7 secondary 20 (330). Underpowered items: H1 F511@9, H2 F5902@75, H7
+      F3971@123 and F12249@112. Control removed-norm ratios Σact(control) /
+      Σact(named): H1 0.73–1.37, H2 0.60–0.80, H5 0.70–1.34, H7 0.65–0.85;
+      H7 secondary 0.80–1.27.
+
+      How to read the result set: about 0.19 false "supported" results are
+      expected across the four decidable tests (4/21) if the controls are
+      exchangeable with the named sets. One test came out "supported". With
+      n = 1 spectrum each and 5% control resolution, it is one data point,
+      not a finding about the model. The cases are mostly not model failures
+      (Finding 8):
+      - H5's case is notation-equivalent.
+      - H3's case is a probable ¹³C artefact.
+      - H1's and H4's cases cannot be resolved from the spectrum.
+      - Under Amendment 1, H2's and H6's cases have no distinguishing b/y peak.
+
+      The concept evidence the hypotheses cite (covers_N/D/E,
+      is_internal_fragment, is_I_ion, m/z bins) is weak or contaminated
+      (Findings 9, 10). L8 has no descriptions, the layer choice was post hoc,
+      and every test spectrum was SAE training data (Finding 7). Single-feature
+      effects show what removing that feature alone does. The joint ablation of
+      a whole token is a large edit, quoted only as a reference scale (V1-4b).
+
+      Per case (E > 0: the named set pushed the model towards its wrong answer):
+      - H1, row 19475. InstaNovo wrote VN**N[UNIMOD:7]**… where the label has
+        VN**D**…, the same composition (Finding 8(b)). The tool suggested that
+        covers_N features on the b2 peak (VN) favour the N[UNIMOD:7] reading.
+        Removing them lowered log p of D in ctx_t by 1.02 and barely changed
+        log p of N[UNIMOD:7] (+0.02). So E = −1.04: the set supported D, the
+        opposite of the claim. Single E: F511 −0.74, F9744 −0.30, F3490 −0.13.
+        But every control drawn at the same peak also had negative E (−1.23 to
+        −0.52, percentile 0.45). Removing any strong feature on that b2 peak
+        lowers log p(D) about as much, so the effect belongs to the peak, not
+        to the named features. Joint at the token: −1.79 (sum of singles −4.10).
+        Step (c): F511 and F9744 rank 2 and 4 of 26 by |effect on M|, F3490
+        rank 11.
+      - H2, row 51238. InstaNovo wrote **VL**STI… for **IV**STI… (a swap). The
+        tool suggested that internal-fragment features on two peaks only the
+        prediction explains push towards VL; those matches are at chance level
+        (Finding 9). E = −0.005 (E / M −0.002), so removing the set changes
+        little. The single effects are of mixed sign and
+        ≤ 0.05; the controls run −0.02 to +0.08 (percentile 0.10). Joint per
+        token: −0.18 and −0.07.
+      - H3, row 109208. InstaNovo wrote Q where the label has Q[UNIMOD:7], a
+        probable ¹³C-as-deamidation label artefact (Finding 8(a)). The tool
+        suggested that the top features on the four most intense pred-only
+        b-ion peaks favour unmodified Q. E = +0.096 (E / M 0.013): a small push
+        in the claimed direction, mostly from F5569 (+0.063). The set's
+        largest whole-sequence effect is elsewhere: it lowers log p of the
+        residue at index 9 (V) by 0.67 in ctx_p. Undetermined by construction:
+        every pool had 0–3 members, as check (d) found.
+      - H4, row 29350. InstaNovo wrote **TG**NL… for **SA**NI…, isobaric with
+        no distinguishing peak. The tool suggested that three latent-token
+        features favour TG. E = −0.093 (the set leaned slightly towards SA),
+        mostly from F1276 (−0.089). Undetermined by construction (4 possible
+        control sets). The joint over all 7 latent features is +0.165.
+      - H5, row 60182. InstaNovo wrote DVTFI**D**DC… where the label has
+        DVTFI**N[UNIMOD:7]**DC…, the same molecule written differently
+        (Finding 8(b)). InstaNovo's own metric counts it correct. The tool
+        suggested that covers_D features on the most intense peak (y13) favour
+        writing D. Removing the three items lowered log p(D) by 0.36 and
+        raised log p(N[UNIMOD:7]) by 0.42. So E = +0.78, E / M 1.43: under
+        teacher forcing, the region's preference turns towards N[UNIMOD:7]
+        (M from +0.54 to −0.23; this is not a re-decode). All 20 controls had
+        smaller E (−1.61 to +0.24), so the outcome is "supported". Most of the
+        effect is F11636 on y13 alone (+0.75; step (c) rank 2 of 41). F12167
+        does little (−0.03, rank 30 of 41), and F11636 on y13-H2O adds +0.16.
+        The joint at y13 is +0.003 (sum of singles −0.12), so other features
+        at that peak offset it. What this measures is a naming choice between
+        two notations of one molecule, not a sequencing error. covers_D's
+        chance fraction is 0.28 (Finding 9), so the claim that F11636 encodes
+        D content is not established by the dictionary.
+      - H6, row 29977. InstaNovo wrote …TN**AV**TS… for …TN**GI**TS…,
+        isobaric. The one true-only peak is an internal-fragment match within
+        chance (Amendment 1: ambiguous). The tool suggested that F6206 on that
+        peak, the only active L8 feature there, pushes towards the truth.
+        E = +0.23: removing it raised log p of GL in ctx_t by 0.18, so it
+        pushed the other way, towards AV. Undetermined by construction (no
+        control pool), so no outcome. F6206 is a generic lone-firing feature
+        (review note), so this says little.
+      - H7, row 43804. InstaNovo wrote …EET**Q**AH… where the label has
+        …EET**K**AH…. Q and K differ by 0.036 Da, and 13 b/y peaks match only
+        K. This is the one candidate with clear b/y evidence for the true
+        peptide. The tool suggested that the top features on the four most
+        intense true-only b/y peaks push towards K. Removing all four lowered
+        log p(Q) by 0.11 and raised log p(K) by 0.24. So E = +0.35: as a set
+        they pushed towards Q, the wrong answer, and the outcome is "not
+        supported" (percentile 0.10 in the predicted direction; secondary
+        peak-matched control 0.20). The items disagree:
+        - F9707 on y13+ (−0.21) and y12+ (−0.14) pushed towards K, as
+          claimed.
+        - F12249 on y11+ (+0.71) pushed towards Q and dominates the set.
+        - F3971 on y13+-H2O did little (+0.03).
+
+        Step (c): F9707@124 and F12249@112 rank 1 and 2 of 36–37 by |effect
+        on M|; F3971 and F9707@119 rank 6. Removing the set also raises the
+        EOS log p (intact −5.70) by 0.05 in ctx_p and 0.22 in ctx_t; EOS is
+        not in M.
+
+      Step (c), each named feature's rank by |effect on M| among all active L8
+      features at its token (activation rank in brackets):
+      - H1: 2, 4, 11 of 26 (2, 4, 5)
+      - H2: 20/34 (1), 3/37 (1), 5/34 (5), 1/37 (4), 25/34 (3)
+      - H3: 8/43, 38/50, 3/50, 1/49 (all 1)
+      - H4: 3, 6, 7 of 7 (4, 6, 7)
+      - H5: 2/41 (2), 30/41 (8), 5/36 (8)
+      - H6: 1/1
+      - H7: 1/36, 6/30, 6/38, 2/37 (all 1)
+
+      Being among the top-k by activation and having a large effect on M
+      overlap only partly.
+
+      Exploratory (not pre-registered), H7: effect on M of every active L8
+      feature at the 13 true-only b/y peaks (482 pairs; peaks 87, 88 y14++
+      with losses, 98 b9+, 105 b10+, 110 y10+, 111 y11+, 116 y12+-H2O, 118
+      y12+, 120 b13+, 122 y13+-H2O, 123 y13+, 124 b14+, 130 y15+; full list in
+      part_b_token_sweep.csv).
+      - The largest effects of both signs sit on y10+ (token 111) and y11+
+        (token 112).
+      - Pushing towards Q: F7761@111 +2.55 (act 9.07, rank 4), F3879@111
+        +1.45 (12.38, rank 1), F12249@112 +0.71, F884@111 +0.60, F2483@112
+        +0.58.
+      - Pushing towards K: F8109@112 −2.20 (7.15, rank 5), F3422@111 −1.85
+        (5.96), F8109@111 −1.51, F7859@111 −0.73, F3993@111 −0.52. F8109
+        pushes towards K at four of the y peaks (111, 112, 117, 119).
+      - Joints per peak are much smaller than these singles (y10+ +0.23,
+        y11+ +0.27, y12+ −0.60). Large opposing single effects at one peak
+        suggest redundancy or cancellation.
+      - Dictionary evidence for these features is weak. Top concepts are
+        mostly m/z bins (no chance fraction: not label-derived). The best
+        reliable concepts are is_y_ion, position_middle, cleaves_N_to_Pro and
+        cleaves_C_to_Asp, with F1dom ≤ 0.27 (F10566 cleaves_C_to_Asp 0.27,
+        chance fraction 0.11; F9750 is_y_ion 0.26, chance 0.11; F8109 is_y_ion
+        0.12; F7761 position_middle 0.03).
+
+      What held and what didn't:
+      - Of the four decidable tests, one is "supported" (H5) and three are
+        "not supported" (H1 and H7 with the wrong sign, H2 with E ≈ 0). About
+        0.19 false "supported" results were expected by chance.
+      - H5's supported effect concerns a choice between two notations of one
+        molecule. In the one case with a real b/y-supported error (H7), the
+        tool's top-activation features did not, as a set, push towards the
+        truth: one item pushed hard the other way.
+      - In H1 the named features mattered, but no more than any strong feature
+        on the same peak. The control is what showed this.
+      - Lesson for the tool: top-k by activation and a concept label are not a
+        guide to causal role. The per-peak ablation panel (V1-4b), not the
+        concept column, is what a user should read, as Finding 10 already
+        implies.
+
+      V1-5 demo set:
+      - H7 (row 43804). The one genuine, spectrum-resolvable error. It shows
+        mixed-sign features on the true-only y peaks, a set effect dominated
+        by one item, and joint vs single differences. It is a good showcase of
+        why the dashboard leads with measured effects.
+      - H1 (row 19475). Shows why controls matter: a large single effect that
+        is a property of the peak, not of the named features. The case itself
+        is notation-equivalent, so label it as such.
+      - H5 (row 60182). Usable only labelled as a notation choice (D vs
+        N[UNIMOD:7]) with a clear measured effect, not as a model error.
+      - Not suited: H2 and H3 (possible label errors, ¹³C artefact), H4 and H6
+        (undetermined, no spectrum evidence).
 - [ ] **V1-5 Data for the tool** — feature examples; demo set from the HF test
       split. Feature examples are the primary evidence of what a feature does
       (Finding 10: concept associations are negligible for nearly all
@@ -1052,6 +1250,17 @@ stated, with the tests that show it (V1-4a's in `tests/test_inspector_runtime.py
   reads candidates.csv only and loads no model. `--parquet` is no longer an
   argparse requirement; every other command still fails without it (now via
   `p.error`). Shown by `test_backbone_evidence_classes_toy_and_stored_counts`.
+- V1-4c part B (`800558a`), `inspector/runtime.py`, additive: `set_delta`,
+  `Inspector.ablate_sets` / `ablate_set` (joint local ablation of an arbitrary
+  set of (feature, token) pairs at one layer, reported as an `AblationReport`
+  whose `joint` carries the pairs and `SET_NOTE`), the part B helpers
+  (`saved_prediction`, `audit_target_tokens`, `audit_effect`, `draw_controls`,
+  `control_percentile`, `audit_outcome`, `intensity_ranks`,
+  `peak_matched_pool`) and the `audit-part-b` subcommand. Existing functions
+  are unchanged. Shown by `test_ablate_set_single_pair_equals_ablate`,
+  `test_ablate_set_full_token_equals_ablate_token_joint`,
+  `test_ablate_set_is_error_preserving_at_the_named_tokens_only` and nine
+  more.
 
 ## Backlog (after v1; do not start early)
 
@@ -1464,3 +1673,4 @@ secondary evidence, shown with their F1dom and chance fraction.
 - 2026-11-24 — V1-4c part A, pre-registration, amended at review before commit: hypotheses H1–H7 (H7 a logged deviation; all at layer 8, a post-hoc choice now recorded) and the part-B protocol under V1-4c (ctx_t target = the prediction outside the region plus the I→L-mapped true region, since ablation_context does not canonicalise I/L; control pools with a 0.5× activation floor and an underpowered mark; removed-norm ratios; "undetermined" below 10 distinct control draws, which H3, H4 and H6 hit by construction). Descriptive checks (no ablation) under V1-4c: 23 of 35 true-only peaks of the 7 isotope-offset deamidation candidates are 13C peaks of predicted fragments; decoys match 5–8% of peaks as internal fragments. hypotheses.json sha256 2177039b…e84a9. Not in this commit (STATUS.md only, as asked): the check code (`runtime.audit_descriptive_checks`, `control_pool`, `n_distinct_control_sets`, `peptide_decoys`, the `audit-checks` subcommand), the additive `max_isotope` flag of `annotate.run_spectrum_utils` (default 0, unchanged behaviour) and 4 tests; they stay in the working tree for review and go into the repo with part B. No ablation calls.
 - 2026-11-25 — Committed the V1-4c descriptive-check code and the `max_isotope` flag (`f4933d3`, 171 tests). Finding 8 (descriptive) and review notes under V1-4c (`82ed2f6`): ranks 1, 5, 12 are notation-equivalent; InstaNovo's mass metric (127/200) also counts H7's Q/K case correct; corpus-level, 182 of 813 local deamidated labels (22%) fit a ¹³C misassignment and not deamidation at the instrument's accuracy (MAD 0.93 ppm). Label-quality audit (Finding 9, `analysis --label-audit`, 56 s; 8(d) pass 6 s): stored labels reproduce exactly on 200 spectra; two labelling bugs (immonium for absent residues, 56% of immonium labels; internal-fragment end off by one), chance fractions per class and concept; annotator decisions moved to the backlog. CLAUDE.md's /doctor trim was not committed; restoring it was blocked by the permission classifier and is left to the user. No ablation, API calls or rebuilds. 191 tests pass.
 - 2026-11-25 — V1-3b done: concept reliability table (`1ffa8ea`; the label audit also counts what an immonium filter would change, `concepts.csv` gains two columns, the rest byte-identical) and dictionary schema 2 with reliability beside every association and `reliable_*` associations (`31338d9`; all four layers rebuilt, existing columns identical; Explanation schema 3). Only 8 of 50 concepts meet the display rule; Finding 9's "reliable" covers_R, covers_C and ion_contains_cam_cys carry 4.1–4.3% bug-added positives, and the immonium bug also hides one y positive each from is_y_ion and position_Cterm, so the rule counts bug-added positives only (hidden ones are reported). Finding 10: reliable associations are negligible for nearly all features (median best F1dom 0.0012–0.0015); `analysis/reliable_associations.csv` lists the 250 at ≥ 0.1; V1-5 and V1-6 specs now lead with examples and measured effects. V1-4c amendment 1 (`0a87fee`): evidence classes on b/y peaks only, 8 of 44 candidates change, hypotheses unchanged. Finding 8(b) addendum (Q/K merged by the mass metric); backlog: full label rebuild, F1dom decoy null, merged residue pairs; paper note on concept-level results. No API, GPU or cluster. 203 tests pass.
+- 2026-11-25 — V1-4c part B done. Amendment 2 committed before any ablation on the selected cases (`16ec5a2`): H7's peak-matched secondary control, the sampling rule (rejection, at most 10,000 attempts), "distinct control draws" = possible sets, ties at 1e-6; H8 and the noise-peak check dropped. Code (`800558a`): `ablate_set` / `ablate_sets` (joint ablation of arbitrary (feature, token) sets), the part B helpers and `audit-part-b`; 215 tests pass (12 new). Run 272 s, every reproduction check held. Outcomes: H5 supported (a notation choice, D vs N[UNIMOD:7]), H1, H2 and H7 not supported, H3, H4 and H6 undetermined by construction; ~0.19 false "supported" expected across the 4 decidable tests. Step (c), the H7 exploratory sweep and the V1-5 demo picks (H7, H1, H5 with labels) recorded under V1-4c. No API, GPU or cluster.

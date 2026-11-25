@@ -891,28 +891,98 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-3b, V1-4a, V
       Being among the top-k by activation and having a large effect on M
       overlap only partly.
 
-      Exploratory (not pre-registered), H7: effect on M of every active L8
-      feature at the 13 true-only b/y peaks (482 pairs; peaks 87, 88 y14++
-      with losses, 98 b9+, 105 b10+, 110 y10+, 111 y11+, 116 y12+-H2O, 118
-      y12+, 120 b13+, 122 y13+-H2O, 123 y13+, 124 b14+, 130 y15+; full list in
-      part_b_token_sweep.csv).
-      - The largest effects of both signs sit on y10+ (token 111) and y11+
-        (token 112).
-      - Pushing towards Q: F7761@111 +2.55 (act 9.07, rank 4), F3879@111
-        +1.45 (12.38, rank 1), F12249@112 +0.71, F884@111 +0.60, F2483@112
-        +0.58.
-      - Pushing towards K: F8109@112 −2.20 (7.15, rank 5), F3422@111 −1.85
-        (5.96), F8109@111 −1.51, F7859@111 −0.73, F3993@111 −0.52. F8109
-        pushes towards K at four of the y peaks (111, 112, 117, 119).
-      - Joints per peak are much smaller than these singles (y10+ +0.23,
-        y11+ +0.27, y12+ −0.60). Large opposing single effects at one peak
-        suggest redundancy or cancellation.
-      - Dictionary evidence for these features is weak. Top concepts are
-        mostly m/z bins (no chance fraction: not label-derived). The best
-        reliable concepts are is_y_ion, position_middle, cleaves_N_to_Pro and
-        cleaves_C_to_Asp, with F1dom ≤ 0.27 (F10566 cleaves_C_to_Asp 0.27,
-        chance fraction 0.11; F9750 is_y_ion 0.26, chance 0.11; F8109 is_y_ion
-        0.12; F7761 position_middle 0.03).
+      Exploratory (not pre-registered), H7, row 43804. The effect on M of every
+      active L8 feature at the 13 true-only b/y peaks (482 pairs). The peaks
+      are 87, 88 (y14++ with losses), 98 b9+, 105 b10+, 110 y10+, 111 y11+,
+      116 y12+-H2O, 118 y12+, 120 b13+, 122 y13+-H2O, 123 y13+, 124 b14+ and
+      130 y15+; the full list is in part_b_token_sweep.csv.
+
+      E_f is the effect on M of removing one feature at one peak (local,
+      exact, error-preserving, both contexts). E_f > 0 means the feature
+      pushed towards Q, the wrong answer; E_f < 0 means it pushed towards K.
+      Token = peak + 1. Rank = activation rank among the features active at
+      that peak. "–" = no chance fraction, because m/z bins are not derived
+      from peak labels.
+
+      Pushing towards Q (E_f > 0):
+
+      | feature | token | peak (true label) | activation | rank | E_f | top concept (F1dom, chance) | reliable concept (F1dom, chance) |
+      |---|---|---|---|---|---|---|---|
+      | F7761 | 111 | y10+ | 9.07 | 4/47 | +2.548 | mz_mid (0.058, –) | position_middle (0.029, 0.092) |
+      | F3879 | 111 | y10+ | 12.38 | 1/47 | +1.451 | mz_high (0.627, –) | position_middle (0.102, 0.092) |
+      | F12249 (named, H7) | 112 | y11+ | 16.65 | 1/37 | +0.711 | mz_mid (0.081, –) | is_b_ion (0.011, 0.177) |
+      | F884 | 111 | y10+ | 4.92 | 11/47 | +0.601 | position_middle (0.099, 0.092) | position_middle (0.099, 0.092) |
+      | F2483 | 112 | y11+ | 6.22 | 7/37 | +0.576 | mz_high (0.488, –) | is_y_ion (0.087, 0.109) |
+      | F7859 | 112 | y11+ | 13.36 | 2/37 | +0.507 | mz_high (0.452, –) | is_y_ion (0.083, 0.109) |
+      | F9750 | 112 | y11+ | 7.61 | 4/37 | +0.396 | mz_high (0.454, –) | is_y_ion (0.259, 0.109) |
+      | F2134 | 111 | y10+ | 2.09 | 32/47 | +0.366 | mz_mid (0.070, –) | position_middle (0.009, 0.092) |
+      | F3093 | 112 | y11+ | 4.38 | 10/37 | +0.324 | is_y_ion (0.140, 0.109) | is_y_ion (0.140, 0.109) |
+      | F10566 | 112 | y11+ | 3.24 | 18/37 | +0.267 | cleaves_C_to_Asp (0.272, 0.108) | cleaves_C_to_Asp (0.272, 0.108) |
+
+      Pushing towards K (E_f < 0):
+
+      | feature | token | peak (true label) | activation | rank | E_f | top concept (F1dom, chance) | reliable concept (F1dom, chance) |
+      |---|---|---|---|---|---|---|---|
+      | F8109 | 112 | y11+ | 7.15 | 5/37 | −2.203 | mz_high (0.224, –) | is_y_ion (0.123, 0.109) |
+      | F3422 | 111 | y10+ | 5.96 | 6/47 | −1.849 | covers_K (0.039, 0.228) | cleaves_N_to_Pro (0.014, 0.101) |
+      | F8109 | 111 | y10+ | 5.55 | 8/47 | −1.512 | mz_high (0.224, –) | is_y_ion (0.123, 0.109) |
+      | F7859 | 111 | y10+ | 5.39 | 9/47 | −0.728 | mz_high (0.452, –) | is_y_ion (0.083, 0.109) |
+      | F3993 | 111 | y10+ | 3.35 | 17/47 | −0.520 | mz_mid (0.081, –) | cleaves_N_to_Pro (0.050, 0.101) |
+      | F8109 | 117 | y12+-H2O | 6.67 | 5/47 | −0.446 | mz_high (0.224, –) | is_y_ion (0.123, 0.109) |
+      | F8109 | 119 | y12+ | 5.88 | 8/38 | −0.341 | mz_high (0.224, –) | is_y_ion (0.123, 0.109) |
+      | F5800 | 112 | y11+ | 2.90 | 21/37 | −0.327 | mz_high (0.484, –) | is_y_ion (0.081, 0.109) |
+      | F7859 | 119 | y12+ | 13.96 | 2/38 | −0.302 | mz_high (0.452, –) | is_y_ion (0.083, 0.109) |
+      | F9750 | 119 | y12+ | 4.92 | 10/38 | −0.245 | mz_high (0.454, –) | is_y_ion (0.259, 0.109) |
+
+      Removing every active feature at a peak together (joint, a reference
+      scale; V1-4b caveat) gives a much smaller net effect: y10+ +0.23,
+      y11+ +0.27, y12+ −0.60, y13+ −0.18. The other nine peaks lie between
+      −0.07 and +0.17.
+
+      What it suggests (exploratory):
+      - Effects are concentrated on y10–y12. All 20 listed pairs sit there.
+        y10 and y11 are the smallest y ions that contain residue 7, the K/Q
+        position, so they are where the 0.036 Da difference first shows. The
+        b ions and the larger y ions have small net effects. The encoder does
+        not ignore the evidence for K; this is where the choice is shaped.
+      - Mixed signs and cancellation. Single effects are large and opposed
+        (+2.55, −2.20, −1.85) but net to about ±0.2–0.6 per peak, which
+        suggests redundancy or cancellation; any one feature's single effect
+        overstates its role. At y10 and y11 the parts pushing towards Q
+        outweigh those pushing towards K (net +0.23, +0.27); at y12 and y13
+        the net is towards K. So the encoding of the evidence peaks does not
+        come down cleanly on K, and at the two most direct peaks it tips
+        slightly towards Q. From the raw m/z, these y peaks lie 0–6 ppm from
+        K and 18–28 ppm from Q (y10 −6.1 / +23.3, y11 +0.8 / +28.0, y12
+        −3.3 / +21.5, y13 −1.0 / +21.8 ppm). One untested possibility: the
+        model may not resolve m/z that finely, so these peaks look consistent
+        with both residues and something else tips the choice to Q. The
+        backlog's peak-shift test addresses this.
+      - A feature's effect depends on the peak. F7859 pushes towards Q at y11
+        (+0.51) but towards K at y10 (−0.73) and y12 (−0.30); F9750 does the
+        same between y11 (+0.40) and y12 (−0.25). Only F8109 pushes
+        consistently, towards K at four y peaks. These are not "Q detectors"
+        or "K detectors".
+      - The dictionary cannot say what these features encode. Most top
+        concepts are m/z bins, and the reliable concepts (is_y_ion,
+        position_middle, cleaves_N_to_Pro, cleaves_C_to_Asp) have F1dom
+        ≤ 0.27. F3422's covers_K has F1dom 0.039 and is a contaminated
+        concept (chance fraction 0.23, Finding 9), so it is not evidence.
+      - Activation as a screen, a first look. The activation ranks of the
+        20 largest effects are 1, 1, 2, 2, 4, 4, 5, 5, 6, 7, 8, 8, 9, 10,
+        10, 11, 17, 18, 21, 32. The three largest |E_f| (+2.55, −2.20,
+        −1.85) rank 4–6. 8 of the 20 lie outside the top 8 that explain()
+        lists (|E_f| 0.25–0.73), the furthest at rank 32 of 47. So a top-8
+        activation cut would keep the largest effects here but miss
+        mid-sized ones. Step (c) points the same way: named features ranked
+        1 by activation ranged from 1 to 38 by |effect on M|.
+
+      Limits: one spectrum. The lists are the extreme end of 482 pairs, so
+      their top values will tend to be overstated. They compare two
+      teacher-forced targets; nothing was re-decoded. They cover the encoder
+      only, so they do not explain the decoder's final choice (EOS log p
+      −5.70 is unexplained too). The SAEs were trained on this spectrum
+      (Finding 7).
 
       What held and what didn't:
       - Of the four decidable tests, one is "supported" (H5) and three are
@@ -1263,6 +1333,9 @@ stated, with the tests that show it (V1-4a's in `tests/test_inspector_runtime.py
   more.
 
 ## Backlog (after v1; do not start early)
+
+High priority after V1-6:
+- Pre-registered peak-shift test for H7 (row 43804): shift the true-only y10–y15 peaks by ±0.036 Da (towards an exact Q match / further away), recompute M with no SAE involvement, to test whether InstaNovo resolves the ~20 ppm K/Q difference. Fix the shifts, peaks and prediction before running. (From the V1-4c exploratory sweep: the y peaks lie 0–6 ppm from K and 18–28 ppm from Q.)
 
 Tool:
 - Warm up beam search at Inspector load: the first call costs ~12 s extra (V1-4a)
@@ -1674,3 +1747,4 @@ secondary evidence, shown with their F1dom and chance fraction.
 - 2026-11-25 — Committed the V1-4c descriptive-check code and the `max_isotope` flag (`f4933d3`, 171 tests). Finding 8 (descriptive) and review notes under V1-4c (`82ed2f6`): ranks 1, 5, 12 are notation-equivalent; InstaNovo's mass metric (127/200) also counts H7's Q/K case correct; corpus-level, 182 of 813 local deamidated labels (22%) fit a ¹³C misassignment and not deamidation at the instrument's accuracy (MAD 0.93 ppm). Label-quality audit (Finding 9, `analysis --label-audit`, 56 s; 8(d) pass 6 s): stored labels reproduce exactly on 200 spectra; two labelling bugs (immonium for absent residues, 56% of immonium labels; internal-fragment end off by one), chance fractions per class and concept; annotator decisions moved to the backlog. CLAUDE.md's /doctor trim was not committed; restoring it was blocked by the permission classifier and is left to the user. No ablation, API calls or rebuilds. 191 tests pass.
 - 2026-11-25 — V1-3b done: concept reliability table (`1ffa8ea`; the label audit also counts what an immonium filter would change, `concepts.csv` gains two columns, the rest byte-identical) and dictionary schema 2 with reliability beside every association and `reliable_*` associations (`31338d9`; all four layers rebuilt, existing columns identical; Explanation schema 3). Only 8 of 50 concepts meet the display rule; Finding 9's "reliable" covers_R, covers_C and ion_contains_cam_cys carry 4.1–4.3% bug-added positives, and the immonium bug also hides one y positive each from is_y_ion and position_Cterm, so the rule counts bug-added positives only (hidden ones are reported). Finding 10: reliable associations are negligible for nearly all features (median best F1dom 0.0012–0.0015); `analysis/reliable_associations.csv` lists the 250 at ≥ 0.1; V1-5 and V1-6 specs now lead with examples and measured effects. V1-4c amendment 1 (`0a87fee`): evidence classes on b/y peaks only, 8 of 44 candidates change, hypotheses unchanged. Finding 8(b) addendum (Q/K merged by the mass metric); backlog: full label rebuild, F1dom decoy null, merged residue pairs; paper note on concept-level results. No API, GPU or cluster. 203 tests pass.
 - 2026-11-25 — V1-4c part B done. Amendment 2 committed before any ablation on the selected cases (`16ec5a2`): H7's peak-matched secondary control, the sampling rule (rejection, at most 10,000 attempts), "distinct control draws" = possible sets, ties at 1e-6; H8 and the noise-peak check dropped. Code (`800558a`): `ablate_set` / `ablate_sets` (joint ablation of arbitrary (feature, token) sets), the part B helpers and `audit-part-b`; 215 tests pass (12 new). Run 272 s, every reproduction check held. Outcomes: H5 supported (a notation choice, D vs N[UNIMOD:7]), H1, H2 and H7 not supported, H3, H4 and H6 undetermined by construction; ~0.19 false "supported" expected across the 4 decidable tests. Step (c), the H7 exploratory sweep and the V1-5 demo picks (H7, H1, H5 with labels) recorded under V1-4c. No API, GPU or cluster.
+- 2026-11-25 — V1-4c exploratory H7 sweep recorded in full under V1-4c (two top-10 tables, per-peak joints, interpretation, activation as a screen: 8 of the 20 largest effects lie outside the top 8 by activation, limits). Backlog: pre-registered H7 peak-shift test (y10–y15 shifted by ±0.036 Da, no SAE), high priority after V1-6. No code or runs.

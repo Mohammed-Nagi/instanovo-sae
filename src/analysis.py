@@ -545,6 +545,132 @@ CONCEPT_LABEL_CLASSES: dict[str, str] = {
     **{f"ion_contains_{p}": "b, y, internal, precursor" for p in ("oxidation", "cam_cys", "deamidation")},
 }
 
+# --- Concept reliability (V1-3b) ------------------------------------------------
+# One record per concept from the label audit's concepts table: how much of the
+# concept is chance, whether a labelling bug changes it, and whether it depends
+# on the peptide at all. The dictionary carries these records beside every
+# association, and the display rule picks which concepts may be shown as a
+# feature's "reliable" associations.
+
+PEPTIDE_DEPENDENT = "peptide-dependent"
+PEPTIDE_INDEPENDENT = "peptide-independent m/z window"
+COMPOSITION_DETERMINED = "composition-determined"
+COMPLEMENT = "complement of is_matched_peak"
+_DEPENDENCE_OVERRIDES = {
+    # spectrum_utils generates immonium ions of all 23 residue letters whatever
+    # the peptide, so the label is a fixed set of m/z values (Finding 9).
+    "is_I_ion": PEPTIDE_INDEPENDENT,
+    # b1 or y1; nearly all positives are y1, whose m/z is fixed by the C-terminal
+    # residue (two values for tryptic K/R peptides) (Finding 9).
+    "is_first_ion": PEPTIDE_INDEPENDENT,
+    # precursor-related ions: m/z fixed by the precursor, which the encoder receives.
+    "is_precursor_related": COMPOSITION_DETERMINED,
+    "is_noise_peak": COMPLEMENT,
+}
+CONCEPT_DEPENDENCE: dict[str, str] = {
+    c: (_DEPENDENCE_OVERRIDES.get(c)
+        or (_NOT_LABEL if cls == _NOT_LABEL else _STRUCTURAL if cls == _STRUCTURAL else PEPTIDE_DEPENDENT))
+    for c, cls in CONCEPT_LABEL_CLASSES.items()
+}
+# Re-documented concepts: the key stays (it is in the annotation vocabulary, the
+# Phase 4 CSVs and the description prompts); the tool shows this name instead.
+CONCEPT_DISPLAY_NAMES = {
+    "is_I_ion": "immonium m/z window (all 23 residue letters, peptide-independent)",
+    "is_first_ion": "y1/b1 m/z window (mostly y1 of a C-terminal K or R)",
+}
+CONCEPT_NOTES = {
+    "is_I_ion": "'I' is spectrum_utils' immonium code, not isoleucine; immonium ions are generated for "
+                "every residue letter whatever the peptide, so the label marks fixed m/z values (Finding 9)",
+    "is_first_ion": "positives are almost all y1, whose m/z is fixed by the C-terminal residue; the chance "
+                    "fraction is computed on the small b1 remainder only (Finding 9)",
+    "is_precursor_related": "m/z fixed by the precursor m/z, which the encoder receives",
+    "is_noise_peak": "complement of is_matched_peak: decoys match fewer peaks, so its chance fraction "
+                     "exceeds 1 and is not comparable with the others",
+    "ion_contains_deamidation": "part of the local deamidated labels fit a 13C misassignment better than "
+                                "deamidation (Finding 8(d))",
+    "spectrum_contains_deamidation": "part of the local deamidated labels fit a 13C misassignment better "
+                                     "than deamidation (Finding 8(d))",
+}
+DISPLAY_RULE_MAX_CHANCE = 0.2
+DISPLAY_RULE = (
+    "display rule, not a statistical test: a concept is shown as a feature's reliable association when its "
+    f"chance fraction (point estimate) is <= {DISPLAY_RULE_MAX_CHANCE}, no labelling bug adds any of its "
+    "positives in the audit sample (positives a bug hides are reported, not counted), and it depends on the "
+    "peptide. Why 0.2: at that level at most about one "
+    "in five of the concept's positives would be expected from a random same-composition sequence; it is the "
+    "cut Finding 9 used, and it falls in the gap between the b/y position and cleavage concepts (0.09-0.18) "
+    "and internal fragments, neutral losses and most covers_* concepts (0.23-0.64). Concepts close to it can "
+    "fall on either side by chance, so the chance fraction and its CI are always shown."
+)
+RELIABILITY_COLUMNS = [
+    "concept", "display_name", "label_classes", "dependence", "positives", "determined_fraction",
+    "chance_fraction", "ci_low", "ci_high", "internal_end_positives", "immonium_bug_positives",
+    "immonium_bug_missed", "bug_share", "meets_display_rule", "reasons", "note",
+]
+
+
+def concept_reliability(concepts) -> list[dict]:
+    """Reliability records (RELIABILITY_COLUMNS) from the label audit's
+    concepts table (rows of concepts.csv, as dicts or a DataFrame). Requires
+    exactly the concepts of CONCEPT_LABEL_CLASSES, in any order, and returns
+    them in the table's order.
+
+    Bug counts: internal_end_positives are positives due only to the
+    internal-fragment end residue; immonium_bug_positives are positives that an
+    immonium ion of an absent residue adds. Both are wrong labels, and
+    bug_share is their sum over the concept's positives; the display rule
+    requires it to be 0. immonium_bug_missed counts positives the immonium bug
+    hides (the next candidate's concepts, e.g. a y ion with a loss outranked by
+    an immonium ion without one): the concept's labelled positives are still
+    right, so it is reported in the note, not counted against the rule. NaN
+    chance fractions (not label-derived, structural, no positives outside
+    composition-determined ions) stay NaN."""
+    rows = concepts.to_dict("records") if hasattr(concepts, "to_dict") else list(concepts)
+    names = [r["concept"] for r in rows]
+    if len(set(names)) != len(names) or set(names) != set(CONCEPT_LABEL_CLASSES):
+        raise ValueError(f"concept table does not match the 50 registry concepts: missing "
+                         f"{sorted(set(CONCEPT_LABEL_CLASSES) - set(names))}, extra "
+                         f"{sorted(set(names) - set(CONCEPT_LABEL_CLASSES))}, "
+                         f"{len(names) - len(set(names))} duplicated")
+    out = []
+    for r in rows:
+        c = r["concept"]
+        positives = float(r["positives"])
+        chance = float(r["chance_fraction"])
+        int_end, imm_add, imm_miss = (float(r[k]) for k in
+                                      ("internal_end_only", "immonium_fix_lost", "immonium_fix_gained"))
+        bug = int_end + imm_add
+        share = bug / positives if positives else math.nan
+        dependence = CONCEPT_DEPENDENCE[c]
+        label_derived = dependence not in (_NOT_LABEL, _STRUCTURAL)
+        det = float(r["from_determined"]) / positives if positives and label_derived else math.nan
+        reasons = []
+        if dependence != PEPTIDE_DEPENDENT:
+            reasons.append(dependence)
+        elif not math.isfinite(chance):
+            reasons.append("no chance fraction")
+        elif chance > DISPLAY_RULE_MAX_CHANCE:
+            reasons.append(f"chance fraction {chance:.2f} > {DISPLAY_RULE_MAX_CHANCE}")
+        if bug:
+            reasons.append(f"labelling bugs add {share:.1%} of positives")
+        notes = [CONCEPT_NOTES[c]] if c in CONCEPT_NOTES else []
+        if dependence == PEPTIDE_DEPENDENT and det > 0:
+            notes.append(f"{det:.0%} of positives are on composition-determined ions (immonium, precursor, "
+                         f"y1, b_(L-1)), whose m/z does not depend on the residue order")
+        if imm_miss:
+            notes.append(f"the immonium bug hides {int(imm_miss)} positive(s) in the audit sample")
+        note = "; ".join(notes)
+        out.append({
+            "concept": c, "display_name": CONCEPT_DISPLAY_NAMES.get(c, c),
+            "label_classes": CONCEPT_LABEL_CLASSES[c], "dependence": dependence,
+            "positives": int(positives), "determined_fraction": det,
+            "chance_fraction": chance, "ci_low": float(r["ci_low"]), "ci_high": float(r["ci_high"]),
+            "internal_end_positives": int(int_end), "immonium_bug_positives": int(imm_add),
+            "immonium_bug_missed": int(imm_miss), "bug_share": share,
+            "meets_display_rule": not reasons, "reasons": "; ".join(reasons), "note": note,
+        })
+    return out
+
 
 def allocate_sample(n_chunks: int, n: int, rng: np.random.Generator) -> list[int]:
     """Spectra per chunk: n // n_chunks each, plus one in n % n_chunks chunks
@@ -613,7 +739,10 @@ def peptide_label_metrics(cands: list[list[dict]], mz, intensity, peptide: str, 
       con|diso|c, con|da|c    change under isotope-1 / a ions
       con|intextra|c          positives due only to the internal end residue
       con|imm_absent|c, imm|peaks, imm|absent   immonium of a residue the
-                              peptide lacks (I, L and J count as one)."""
+                              peptide lacks (I, L and J count as one)
+      con|immfix_lost|c, con|immfix_gained|c   concept positives lost / gained
+                              on those peaks when such immonium candidates
+                              are dropped (the next candidate wins)."""
     import annotate
     import torch
     out: dict[str, float] = {}
@@ -708,6 +837,14 @@ def peptide_label_metrics(cands: list[list[dict]], mz, intensity, peptide: str, 
                 for k in base:
                     if k.startswith("covers_") and k[-1] not in peptide:
                         add(f"con|imm_absent|{k}")
+                # The label under an immonium filter (V1-3b): the next candidate
+                # once immonium ions of absent residues are dropped.
+                rest = [x for x in c if not (x["ion_type"] == "I" and x["ion_index"] not in present)]
+                fixed = concepts(annotate.select_annotation(rest, 0, ("a",)), j)
+                for k in base - fixed:
+                    add(f"con|immfix_lost|{k}")
+                for k in fixed - base:
+                    add(f"con|immfix_gained|{k}")
     for s in ("b", "y"):
         idx_all = set(range(1, L))
         idx_ch = {k for k in idx_all if not annotate.is_composition_determined({"ion_type": s, "ion_index": k}, L)}
@@ -945,7 +1082,9 @@ def label_audit(root: Path, n: int = AUDIT_N, seed: int = DEFAULT_SEED, n_decoys
             "chance_fraction": cf, "ci_low": lo, "ci_high": hi,
             "flag_chance_over_20pct": bool(label_derived and cf > CHANCE_FLAG),
             "internal_end_only": arr(f"con|intextra|{c}").sum(),
-            "immonium_absent_residue": arr(f"con|imm_absent|{c}").sum()})
+            "immonium_absent_residue": arr(f"con|imm_absent|{c}").sum(),
+            "immonium_fix_lost": arr(f"con|immfix_lost|{c}").sum(),
+            "immonium_fix_gained": arr(f"con|immfix_gained|{c}").sum()})
     timings["tables"] = time.perf_counter() - t0
     timings["total"] = time.perf_counter() - t_start
 
@@ -953,6 +1092,8 @@ def label_audit(root: Path, n: int = AUDIT_N, seed: int = DEFAULT_SEED, n_decoys
                         ("precedence", prec_rows), ("coverage", cov_rows), ("a_ions", a_rows),
                         ("concepts", con_rows)):
         _write_csv(out_dir / f"{name}.csv", list(rows_[0]), rows_)
+    reliability = concept_reliability(con_rows)
+    _write_csv(out_dir / "concept_reliability.csv", RELIABILITY_COLUMNS, reliability)
     summary = {
         "settings": settings, "reproduction": repro, "timings_s": timings,
         "n_spectra": len(true_m), "n_with_decoys": len(keep),

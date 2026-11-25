@@ -11,7 +11,7 @@ with honest labels and evidence indicators (association, causal and
 description coverage, with their effect sizes), and ablate a feature to see the effect
 on each predicted residue.
 
-Open, in order: V1-4c, V1-5, V1-6, V1-2c (when API credit is
+Open, in order: V1-3b, V1-4c, V1-5, V1-6, V1-2c (when API credit is
 available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a, V1-4b.
 
 - [x] **V1-1 Hub inventory** — `src/analysis.py`, output `analysis/hubs.csv`.
@@ -93,6 +93,118 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a, V1-4b.
       partial descriptions. Existing run moves to `interpret/layer_L/unblinded_v1/`.
       (Since then: V1-2a defined `description_beats_baseline`, and V1-2b moved
       unblinded_v1 to `interpret/layer_L/archive/`.)
+- [ ] **V1-3b Concept reliability** — make the dictionary honest about the
+      concepts Finding 9 found unreliable, without rebuilding labels. No API,
+      GPU or cluster.
+      Part A, reliability table (`analysis.concept_reliability`, written by
+      `python -m analysis --root sae_pipeline_outputs --label-audit` as
+      `analysis/label_audit/concept_reliability.csv`; the audit is unchanged
+      except two new columns of `concepts.csv`, `immonium_fix_lost` and
+      `immonium_fix_gained`: the concept positives lost and gained on each
+      absent-residue immonium peak when such immonium candidates are dropped
+      and the next candidate wins). Rerun: reproduction exact on the same 200
+      spectra; every other audit file and every existing `concepts.csv` column
+      byte-identical; `immonium_fix_lost` equals `immonium_absent_residue` on
+      all covers_*.
+      What is stored, checked before building: `feature_label_associations.csv`
+      holds every BH-significant (feature, concept) pair and no other
+      (`evaluate.py:2969-2980`; BH over all 12,288 × 50 pairs at q 0.05,
+      `:1169-1171`, `:173`): 283,454 / 316,812 / 331,398 / 397,842 rows at
+      L2/4/6/8, all 50 concepts present. `per_feature_stats.csv` keeps only
+      each feature's best significant concept (`:3010-3049`). F1dom > 0 implies
+      enrichment (`:281-286`), so the dictionary's top 3 (significant,
+      F1dom > 0) cannot hold a depleted pair. Phase 4 streamed all 625 cluster
+      chunks: its ChunkStream has no `chunk_indices` (`:2735-2745`, `:439-440`)
+      and report.json `n_tokens` 67,503,495 equals the 625-chunk manifests
+      (`extract/manifest_run{1,3,4}.json`). The chance fractions come from the
+      audit's 200 local spectra (13 chunks), a property of each concept's labels;
+      both sources are recorded in the dictionary metadata.
+      Record per concept: dependence on the peptide, chance fraction with its
+      bootstrap 95% CI, positives that a bug adds (internal end + absent-residue
+      immonium; wrong labels) and positives the immonium bug hides (a y ion with
+      a loss outranked by an immonium ion without one: the labelled positives
+      are still right, so reported, not counted), the share of positives on
+      composition-determined ions, display name, reasons and notes.
+      Display rule (`analysis.DISPLAY_RULE`): chance fraction (point estimate)
+      ≤ 0.2, no bug-added positives, peptide-dependent. It is a display rule, not
+      a test. Why 0.2: at most about one in five positives expected from a random
+      same-composition sequence; the cut Finding 9 used; it falls in the gap
+      between the b/y position and cleavage concepts (0.09–0.18) and internal
+      fragments, losses and most covers_* (0.23–0.64). Concepts near it (e.g.
+      cleaves_C_to_Arg 0.203 [0.104, 0.364], covers_C 0.190 [0.140, 0.259]) can
+      fall either side by chance, so the chance fraction and CI are always
+      shown.
+      Finding 9's "reliable" list checked against the bugs: is_y_ion, is_b_ion,
+      the three position_* and cleaves_N_to_Pro / C_to_Asp / C_to_Glu have no
+      bug-added positives; is_y_ion and position_Cterm each have one hidden y
+      positive (1 / 2,846 and 1 / 1,292). Touched: covers_R 56 + 4 of 1,467
+      (4.1%), covers_C 7 of 163 (4.3%), ion_contains_cam_cys 7 of 162 (4.3%);
+      they fail the rule. is_I_ion and is_first_ion are re-documented as m/z
+      windows (display names; the keys stay, since they are in the annotation
+      vocabulary, the Phase 4 CSVs, `concept_phi.pt` and the description
+      prompts). 8 concepts meet the rule:
+
+      | concept | dependence | chance [95% CI] | bug adds (int. end + imm.) / positives | hidden | determined | rule |
+      |---|---|---|---|---|---|---|
+      | is_b_ion | dep. | 0.177 [0.161, 0.196] | 0 |  | 2% | yes |
+      | is_y_ion | dep. | 0.109 [0.101, 0.117] | 0 | 1 | 14% | yes |
+      | is_I_ion | m/z window | — | 0 + 398 / 706 (56.4%) |  | 100% |  |
+      | is_internal_fragment | dep. | 0.535 [0.503, 0.570] | 0 | 1 | 0% |  |
+      | is_precursor_related | comp.-determined | — | 0 |  | 100% |  |
+      | is_matched_peak | dep. | 0.307 [0.291, 0.323] | 0 + 396 / 8020 (4.9%) |  | 15% |  |
+      | is_noise_peak | complement | 1.327 [1.290, 1.367] | 0 | 396 | 0% |  |
+      | is_latent_token | structural | — | 0 |  | — |  |
+      | is_H2O_loss | dep. | 0.379 [0.355, 0.406] | 0 + 1 / 1601 (0.1%) | 1 | 9% |  |
+      | is_NH3_loss | dep. | 0.432 [0.385, 0.484] | 0 + 9 / 989 (0.9%) | 1 | 16% |  |
+      | has_neutral_loss | dep. | 0.398 [0.371, 0.427] | 0 + 10 / 2590 (0.4%) | 2 | 12% |  |
+      | is_fragment_charge_1 | dep. | 0.286 [0.273, 0.301] | 0 + 397 / 7666 (5.2%) |  | 15% |  |
+      | is_fragment_charge_2 | dep. | 0.643 [0.564, 0.732] | 0 | 1 | 0% |  |
+      | precursor_charge_2 | not label | — | 0 |  | — |  |
+      | precursor_charge_3 | not label | — | 0 |  | — |  |
+      | precursor_charge_4 | not label | — | 0 |  | — |  |
+      | position_Nterm | dep. | 0.155 [0.141, 0.169] | 0 |  | 0% | yes |
+      | position_middle | dep. | 0.092 [0.083, 0.101] | 0 |  | 0% | yes |
+      | position_Cterm | dep. | 0.183 [0.168, 0.200] | 0 | 1 | 33% | yes |
+      | mz_low | not label | — | 0 |  | — |  |
+      | mz_mid | not label | — | 0 |  | — |  |
+      | mz_high | not label | — | 0 |  | — |  |
+      | top_decile_intensity | not label | — | 0 |  | — |  |
+      | is_first_ion | m/z window | 0.830 [0.576, 1.441] | 0 | 1 | 95% |  |
+      | is_last_ion | dep. | 0.222 [0.188, 0.265] | 0 |  | 18% |  |
+      | cleaves_C_to_Lys | dep. | 0.241 [0.180, 0.326] | 0 |  | 21% |  |
+      | cleaves_C_to_Arg | dep. | 0.203 [0.104, 0.364] | 0 |  | 0% |  |
+      | cleaves_N_to_Pro | dep. | 0.101 [0.082, 0.123] | 0 |  | 0% | yes |
+      | cleaves_C_to_Asp | dep. | 0.108 [0.090, 0.130] | 0 |  | 6% | yes |
+      | cleaves_C_to_Glu | dep. | 0.124 [0.104, 0.149] | 0 |  | 9% | yes |
+      | covers_K | dep. | 0.228 [0.206, 0.250] | 166 + 4 / 2565 (6.6%) |  | 13% |  |
+      | covers_R | dep. | 0.172 [0.152, 0.196] | 56 + 4 / 1467 (4.1%) | 1 | 10% |  |
+      | covers_W | dep. | 0.229 [0.189, 0.281] | 33 + 31 / 401 (16.0%) |  | 15% |  |
+      | covers_F | dep. | 0.298 [0.266, 0.337] | 101 + 87 / 1348 (13.9%) |  | 13% |  |
+      | covers_Y | dep. | 0.277 [0.245, 0.313] | 91 + 100 / 1294 (14.8%) |  | 14% |  |
+      | covers_P | dep. | 0.255 [0.226, 0.288] | 139 + 0 / 1731 (8.0%) | 1 | 2% |  |
+      | covers_M | dep. | 0.305 [0.255, 0.371] | 37 + 22 / 702 (8.4%) |  | 9% |  |
+      | covers_C | dep. | 0.190 [0.140, 0.259] | 7 + 0 / 163 (4.3%) |  | 2% |  |
+      | covers_D | dep. | 0.280 [0.255, 0.307] | 79 + 1 / 2288 (3.5%) |  | 2% |  |
+      | covers_E | dep. | 0.261 [0.243, 0.281] | 136 + 19 / 2941 (5.3%) |  | 4% |  |
+      | covers_N | dep. | 0.275 [0.246, 0.305] | 73 + 2 / 1778 (4.2%) |  | 2% |  |
+      | peptide_length_short | not label | — | 0 |  | — |  |
+      | peptide_length_medium | not label | — | 0 |  | — |  |
+      | peptide_length_long | not label | — | 0 |  | — |  |
+      | ion_contains_oxidation | dep. | 0.498 [0.261, 0.814] | 0 |  | 3% |  |
+      | ion_contains_cam_cys | dep. | 0.191 [0.141, 0.263] | 7 + 0 / 162 (4.3%) |  | 2% |  |
+      | ion_contains_deamidation | dep. | 0.321 [0.231, 0.446] | 7 + 0 / 132 (5.3%) |  | 2% |  |
+      | spectrum_contains_oxidation | not label | — | 0 |  | — |  |
+      | spectrum_contains_cam_cys | not label | — | 0 |  | — |  |
+      | spectrum_contains_deamidation | not label | — | 0 |  | — |  |
+
+      dep. = peptide-dependent; m/z window = peptide-independent; comp.-determined
+      = fixed by the precursor m/z; complement = of is_matched_peak (decoys match
+      fewer peaks, so its chance fraction exceeds 1); determined = share of
+      positives on immonium, precursor, y1 or b_{L−1} ions. The deamidation
+      concepts carry a note: part of the local deamidated labels fit a ¹³C
+      misassignment better (Finding 8(d)). Chance fractions exclude
+      composition-determined ions, so is_first_ion's 0.830 is its small b1
+      remainder.
 - [x] **V1-4a Runtime forward pass** (`2a3166c`) — `src/inspector/runtime.py`,
       `dictionary.py`. Input: a raw spectrum (m/z array, intensity array,
       precursor m/z, charge), preprocessed by InstaNovo's own pipeline via
@@ -790,6 +902,14 @@ stated, with the tests that show it (V1-4a's in `tests/test_inspector_runtime.py
   `test_annotation_to_dict_is_first_candidate`. `analysis.py` gets
   `--deamidation-precursor` and `--label-audit`, which import torch lazily;
   its existing modes are unchanged.
+- V1-3b, `analysis.py` label audit: `peptide_label_metrics` also records the
+  concept changes on absent-residue immonium peaks under an immonium filter
+  (`con|immfix_lost|c`, `con|immfix_gained|c`); `concepts.csv` gains
+  `immonium_fix_lost` and `immonium_fix_gained`, and the audit writes
+  `concept_reliability.csv` (`concept_reliability`). Every other output and
+  column is unchanged (rerun compared byte for byte). Shown by
+  `test_immonium_fix_counts_toy`, `test_concept_reliability_display_rule`,
+  `test_concept_reliability_requires_every_concept` and the existing audit tests.
 
 ## Backlog (after v1; do not start early)
 

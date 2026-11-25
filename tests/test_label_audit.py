@@ -220,3 +220,71 @@ def test_peptide_label_metrics_toy():
     assert m["con|diso|is_y_ion"] == 1 and m["con|da|is_noise_peak"] == -1
     assert m["cov|b|1|none|all|num"] == 1 and m["cov|b|1|none|all|den"] == 7
     assert m["cov|y|1|any|chance|den"] == 6 and m["cov|y|1|any|chance|num"] == 1   # y1 excluded
+
+
+def test_immonium_fix_counts_toy():
+    import torch
+    pep = "PEPDIDEK"
+    cands = [
+        [_cand("I", "W")],                                    # absent W immonium, nothing else -> noise
+        [_cand("I", "Y"), _cand("b", 3, "H2O")],              # absent Y immonium hides b3-H2O
+        [_cand("I", "P")],                                    # P is in the peptide: not the bug
+    ]
+    mz = torch.tensor([159.09, 300.0, 70.07], dtype=torch.float64)
+    m = analysis.peptide_label_metrics(cands, mz, torch.ones(3), pep, [], 2, annotate.ConceptRegistry.build())
+    assert m["imm|peaks"] == 3 and m["imm|absent"] == 2
+    assert m["con|immfix_lost|is_I_ion"] == 2
+    # the second peak stays a charge-1 match (b3-H2O), so only the first loses these
+    assert m["con|immfix_lost|is_matched_peak"] == 1 and m["con|immfix_lost|is_fragment_charge_1"] == 1
+    assert m["con|immfix_lost|covers_W"] == 1 and m["con|immfix_lost|covers_Y"] == 1
+    assert "con|immfix_lost|covers_P" not in m
+    assert m["con|immfix_gained|is_noise_peak"] == 1
+    assert m["con|immfix_gained|is_b_ion"] == 1 and m["con|immfix_gained|is_H2O_loss"] == 1
+
+
+# --- Concept reliability (V1-3b) ---------------------------------------------------
+
+def _concept_rows(**over):
+    rows = []
+    for c in analysis.CONCEPT_LABEL_CLASSES:
+        label = analysis.CONCEPT_DEPENDENCE[c] not in (analysis._NOT_LABEL, analysis._STRUCTURAL)
+        rows.append({"concept": c, "positives": 100.0, "from_determined": 10.0,
+                     "chance_fraction": 0.1 if label else float("nan"), "ci_low": 0.05, "ci_high": 0.15,
+                     "internal_end_only": 0.0, "immonium_fix_lost": 0.0, "immonium_fix_gained": 0.0})
+    for c, fields in over.items():
+        next(r for r in rows if r["concept"] == c).update(fields)
+    return rows
+
+
+def test_concept_reliability_display_rule():
+    import math
+    rows = _concept_rows(is_b_ion={"chance_fraction": 0.2}, is_y_ion={"chance_fraction": 0.2001},
+                         covers_R={"internal_end_only": 1.0}, position_Cterm={"immonium_fix_gained": 1.0},
+                         is_internal_fragment={"chance_fraction": float("nan")})
+    rec = {r["concept"]: r for r in analysis.concept_reliability(rows)}
+    assert [r["concept"] for r in analysis.concept_reliability(rows)] == list(analysis.CONCEPT_LABEL_CLASSES)
+    assert rec["is_b_ion"]["meets_display_rule"] and rec["is_b_ion"]["reasons"] == ""   # 0.2 inclusive
+    assert not rec["is_y_ion"]["meets_display_rule"] and "> 0.2" in rec["is_y_ion"]["reasons"]
+    assert not rec["covers_R"]["meets_display_rule"] and rec["covers_R"]["bug_share"] == pytest.approx(0.01)
+    # a hidden positive is reported, not counted against the rule
+    assert rec["position_Cterm"]["meets_display_rule"] and "hides 1" in rec["position_Cterm"]["note"]
+    assert rec["position_Cterm"]["bug_share"] == 0.0
+    for c in ("is_I_ion", "is_first_ion", "is_precursor_related", "is_noise_peak", "mz_low", "is_latent_token"):
+        assert not rec[c]["meets_display_rule"]
+    assert rec["is_I_ion"]["dependence"] == analysis.PEPTIDE_INDEPENDENT
+    assert rec["is_I_ion"]["display_name"].startswith("immonium m/z window")
+    assert rec["is_first_ion"]["display_name"].startswith("y1/b1 m/z window")
+    assert math.isnan(rec["mz_low"]["chance_fraction"]) and math.isnan(rec["mz_low"]["determined_fraction"])
+    assert math.isnan(rec["is_internal_fragment"]["chance_fraction"])
+    assert rec["is_internal_fragment"]["reasons"] == "no chance fraction"
+    assert set(rec["is_b_ion"]) == set(analysis.RELIABILITY_COLUMNS)
+
+
+def test_concept_reliability_requires_every_concept():
+    rows = _concept_rows()
+    with pytest.raises(ValueError, match="missing"):
+        analysis.concept_reliability(rows[1:])
+    with pytest.raises(ValueError, match="extra"):
+        analysis.concept_reliability(rows + [dict(rows[0], concept="is_z_ion")])
+    with pytest.raises(ValueError, match="duplicated"):
+        analysis.concept_reliability(rows + [dict(rows[0])])

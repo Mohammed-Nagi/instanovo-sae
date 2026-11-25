@@ -1012,3 +1012,190 @@ def test_backbone_evidence_classes_toy_and_stored_counts():
         with open(stored, newline="", encoding="utf-8") as f:
             out = backbone_evidence_classes(list(csv.DictReader(f)))
         assert len(out) == 44 and sum(r["changed"] for r in out) == 8
+
+
+# --- V1-4c part B: joint ablation of a set of (feature, token) pairs ----------------------
+
+def _busiest_peak(feats: torch.Tensor) -> int:
+    return int((feats[1:] > 0).sum(dim=1).argmax()) + 1
+
+
+@needs_data
+def test_ablate_set_single_pair_equals_ablate(inspector, ctx0):
+    L = 8
+    feats = ctx0.features[L]
+    t = _busiest_peak(feats)
+    f = int(feats[t].argmax())
+    one = inspector.ablate_set(ctx0, L, [(f, t)])
+    ref = inspector.ablate(ctx0, L, [f], "local", t, with_summaries=False).results[0]
+    assert one.joint["pairs"] == [[f, t]] and one.joint["positions"] == [t]
+    assert one.joint["activation_sum"] == pytest.approx(float(feats[t, f]))
+    assert one.joint["delta_log_prob"] == pytest.approx(ref["delta_log_prob"], abs=1e-5)
+    assert one.joint["delta_eos"] == pytest.approx(ref["delta_eos"], abs=1e-5)
+    assert one.joint_delta_total == pytest.approx(ref["delta_total"], abs=1e-5)
+    assert one.results == [] and one.sum_of_singles is None
+    assert one.scope == "local" and "error-preserving" in one.provenance
+
+
+@needs_data
+def test_ablate_set_full_token_equals_ablate_token_joint(inspector, ctx0):
+    from inspector.runtime import set_delta
+    L = 8
+    feats = ctx0.features[L]
+    t = _busiest_peak(feats)
+    active = (feats[t] > 0).nonzero().flatten().tolist()
+    full = inspector.ablate_set(ctx0, L, [(f, t) for f in active])
+    tok = inspector.ablate_token(ctx0, L, t, with_summaries=False)
+    assert full.joint["n_features"] == tok.joint["n_features"] == len(active)
+    assert full.joint["delta_log_prob"] == pytest.approx(tok.joint["delta_log_prob"], abs=1e-5)
+    assert full.joint_delta_total == pytest.approx(tok.joint_delta_total, abs=1e-5)
+    w = inspector.saes[L].W_dec.detach().cpu()
+    assert torch.equal(set_delta(feats, w, [(f, t) for f in active]), joint_delta(feats, w, t))
+
+
+@needs_data
+def test_ablate_set_is_error_preserving_at_the_named_tokens_only(inspector, ctx0):
+    """Pairs at two tokens, a subset of the features at each: x' - x = -sum a W_dec
+    at the named tokens, nothing elsewhere, and the SAE error is unchanged."""
+    from inspector.runtime import set_delta
+    L = 4
+    feats, sae = ctx0.features[L], inspector.saes[L]
+    w = sae.W_dec.detach().cpu()
+    tokens = [t for t in range(1, feats.size(0)) if int((feats[t] > 0).sum()) >= 3][:2]
+    pairs = [(int(f), t) for t in tokens for f in (feats[t] > 0).nonzero().flatten().tolist()[:2]]
+    delta = set_delta(feats, w, pairs)
+    base = _layer_outputs(inspector, ctx0)[L]
+    after = _layer_outputs(inspector, ctx0, {L: delta[None]})[L]
+    torch.testing.assert_close(after - base, delta, rtol=0, atol=1e-5)
+    others = [s for s in range(feats.size(0)) if s not in tokens]
+    assert float((after - base)[others].abs().max()) == 0.0
+    for t in tokens:
+        expect = -sum(float(feats[t, f]) * w[f] for f, tt in pairs if tt == t)
+        torch.testing.assert_close(delta[t], expect, rtol=0, atol=1e-5)
+    removed = feats.clone()
+    for f, t in pairs:
+        removed[t, f] = 0
+    with torch.no_grad():
+        torch.testing.assert_close(after - sae.decode(removed), base - sae.decode(feats), rtol=0, atol=1e-4)
+
+
+@needs_data
+def test_ablate_sets_singles_match_ablate_and_batching(inspector, ctx0):
+    L = 8
+    feats = ctx0.features[L]
+    t = _busiest_peak(feats)
+    fs = sorted((feats[t] > 0).nonzero().flatten().tolist(), key=lambda f: -float(feats[t, f]))[:3]
+    pairs = [(f, t) for f in fs]
+    rep = inspector.ablate_set(ctx0, L, pairs, with_singles=True)
+    ref = inspector.ablate(ctx0, L, fs, "local", t, with_summaries=False).results
+    for got, want in zip(rep.results, ref, strict=True):
+        assert got["feature"] == want["feature"]
+        assert got["delta_log_prob"] == pytest.approx(want["delta_log_prob"], abs=1e-5)
+    assert rep.sum_of_singles == pytest.approx(sum(r["delta_total"] for r in rep.results))
+    many = inspector.ablate_sets(ctx0, L, [pairs, pairs[:1], pairs[1:]])
+    assert many[0].joint_delta_total == pytest.approx(rep.joint_delta_total, abs=1e-5)
+    assert many[1].joint_delta_total == pytest.approx(ref[0]["delta_total"], abs=1e-5)
+
+
+@needs_data
+def test_ablate_set_rejects_bad_sets(inspector, ctx0):
+    L = 8
+    feats = ctx0.features[L]
+    f = int(feats[0].argmax())
+    dead = int((feats[0] == 0).nonzero()[0])
+    with pytest.raises(ValueError, match="at least one"):
+        inspector.ablate_set(ctx0, L, [])
+    with pytest.raises(ValueError, match="duplicate"):
+        inspector.ablate_set(ctx0, L, [(f, 0), (f, 0)])
+    with pytest.raises(ValueError, match="not active"):
+        inspector.ablate_set(ctx0, L, [(f, 0), (dead, 0)])
+
+
+# --- V1-4c part B: pure helpers --------------------------------------------------------
+
+def test_audit_target_tokens_maps_i_to_l_in_the_true_region():
+    from inspector.runtime import audit_target_tokens
+    # H2-like swap: VL vs IV; T = LV + the prediction's suffix
+    target, sp, st = audit_target_tokens(_t("VLSTIDK"), _t("IVSTIDK"))
+    assert target == _t("LVSTIDK") and sp == (0, 2) and st == (0, 2)
+    # H6-like: AV vs GI, the truth also differs by I/L outside the region (prediction kept there)
+    target, sp, st = audit_target_tokens(_t("WETALGAVR"), _t("WETAIGGIR"))
+    assert target == _t("WETALGGLR") and sp == (6, 8) and st == (6, 8)
+    # length change: the T span follows the true region's length
+    target, sp, st = audit_target_tokens(_t("AGGHK"), _t("AGNK"))
+    assert target == _t("AGNK") and sp == (2, 4) and st == (2, 3)
+
+
+def test_audit_effect_sign_and_m_intact():
+    from inspector.runtime import audit_effect
+    base_p, base_t = [-0.1, -0.2, -0.05], [-0.1, -3.0, -0.05]
+    assert -audit_effect(base_p, base_t, (1, 2), (1, 2)) == pytest.approx(2.8)       # M(intact)
+    # removal lowers log p(pred region) by 0.5 and raises log p(T region) by 0.25: M drops by 0.75
+    assert audit_effect([0, -0.5, 0], [0, 0.25, 0], (1, 2), (1, 2)) == pytest.approx(0.75)
+    assert audit_effect([0, 0.5, 0], [0, 0, 0], (1, 2), (1, 2)) == pytest.approx(-0.5)
+
+
+def test_control_percentile_and_outcome_rule():
+    from inspector.runtime import audit_outcome, control_percentile
+    controls = [0.1 * i for i in range(20)]                  # 0.0 .. 1.9
+    assert control_percentile(5.0, controls, "+") == 1.0
+    assert control_percentile(0.95, controls, "+") == pytest.approx(10 / 20)
+    assert control_percentile(controls[10], controls, "+") == pytest.approx((10 + 0.5) / 20)   # one tie
+    assert control_percentile(-5.0, [-c for c in controls], "-") == 1.0                        # flipped
+    assert audit_outcome(5.0, controls, "+", n_possible_sets=48) == "supported"
+    assert audit_outcome(1.0, controls, "+", 48) == "weak"
+    assert audit_outcome(controls[-1], controls, "+", 48) == "weak"                             # tie at the top
+    assert audit_outcome(-0.2, controls, "+", 48) == "not supported"
+    assert audit_outcome(-5.0, [-c for c in controls], "-", 48) == "supported"
+    assert audit_outcome(5.0, controls, "-", 48) == "not supported"
+    assert audit_outcome(5.0, controls, "+", n_possible_sets=9) == "undetermined"
+    with pytest.raises(ValueError):
+        control_percentile(1.0, controls, "positive")
+
+
+def test_draw_controls_seeded_no_repeats_and_bounded():
+    from inspector.runtime import draw_controls
+    pools = [[(1, 5), (2, 5), (3, 5)], [(1, 5), (2, 5), (3, 5)], [(9, 6)]]
+    a = draw_controls(pools, 20, np.random.default_rng([0, 7]))
+    b = draw_controls(pools, 20, np.random.default_rng([0, 7]))
+    assert a == b and len(a) == 20
+    assert all(len(set(d)) == len(d) and d[2] == (9, 6) for d in a)
+    assert len({tuple(d) for d in a}) > 1
+    with pytest.raises(RuntimeError, match="attempts"):        # two items, one shared member
+        draw_controls([[(1, 5)], [(1, 5)]], 1, np.random.default_rng(0), max_attempts=50)
+    with pytest.raises(ValueError, match="empty"):
+        draw_controls([[(1, 5)], []], 1, np.random.default_rng(0))
+
+
+def test_peak_matched_pool_and_intensity_ranks():
+    from inspector.runtime import intensity_ranks, peak_matched_pool
+    inten = [5.0, 9.0, 9.0, 1.0, 7.0, 3.0, 8.0]
+    rank = intensity_ranks(inten)
+    assert rank == {1: 1, 2: 2, 6: 3, 4: 4, 0: 5, 5: 6, 3: 7}                # ties by peak index
+    # named peak 4 (rank 4): 6 and 0 at distance 1 (tie -> higher intensity, 6), then 2 and 5, then 1, 3
+    assert peak_matched_pool(4, [0, 1, 2, 3, 5, 6], rank, size=4) == [6, 0, 2, 5]
+    assert peak_matched_pool(4, [0, 4, 5], rank) == [0, 5]                   # fewer than size; self excluded
+
+
+def test_saved_prediction_requires_schema_2(tmp_path):
+    from inspector.runtime import saved_prediction
+    doc = {"schema_version": 2, "prediction": {"tokens": ["A", "K"], "eos_log_prob_tf": -0.5,
+                                               "residues": [{"log_prob_tf": -0.1}, {"log_prob_tf": -0.2}]}}
+    p = tmp_path / "row.json"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    assert saved_prediction(p) == {"tokens": ["A", "K"], "log_prob_tf": [-0.1, -0.2], "eos_log_prob_tf": -0.5}
+    p.write_text(json.dumps({**doc, "schema_version": 3}), encoding="utf-8")
+    with pytest.raises(ValueError, match="schema_version"):
+        saved_prediction(p)
+    p.write_text(json.dumps({**doc, "prediction": None}), encoding="utf-8")
+    with pytest.raises(ValueError, match="no prediction"):
+        saved_prediction(p)
+
+
+def test_saved_v1_4c_explanations_are_schema_2():
+    from inspector.runtime import saved_prediction
+    d = REPO / "sae_pipeline_outputs" / "analysis" / "v1_4c" / "explanations"
+    if not d.is_dir():
+        pytest.skip("no saved V1-4c explanations")
+    paths = sorted(d.glob("row_*.json"))
+    assert len(paths) == 7 and all(saved_prediction(p)["tokens"] for p in paths)

@@ -30,7 +30,8 @@ kept; only the SAE-captured component of the feature is removed. Scopes:
 ``ablation_context`` holds what one spectrum's ablations need (optionally
 teacher-forcing a given target peptide instead of the prediction),
 ``ablate_token`` removes every active feature at one token, one at a time and
-then jointly, and ``ablate`` takes any features in either scope.
+then jointly, ``ablate`` takes any features in either scope, and ``ablate_set``
+/ ``ablate_sets`` remove arbitrary sets of (feature, token) pairs jointly.
 ``explain(latent_ablation=True)`` adds ``ablate_token`` at the latent token for
 every layer.
 
@@ -50,6 +51,8 @@ CLI (from the repo root)::
         --parquet <HF test parquet> --n 200 --seed 0
     PYTHONPATH=src uv run python -m inspector.runtime audit-cases \\
         --parquet <HF test parquet> --n 200 --seed 0    # V1-4c part A, no ablation
+    PYTHONPATH=src uv run python -m inspector.runtime audit-part-b \\
+        --parquet <HF test parquet>                     # V1-4c part B, the registered tests
 
 --checkpoint defaults to checkpoints/instanovo_v1.1.0.ckpt and --outputs-root
 to sae_pipeline_outputs/, both under the repo root.
@@ -115,6 +118,11 @@ ABLATION_NOTE = (
 JOINT_NOTE = (
     "joint = what the SAE-explained content at this token contributes; a joint effect far "
     "from the sum of singles indicates redundancy or interaction"
+)
+SET_NOTE = (
+    "set = the named (feature, token) pairs removed together, each at its own token only "
+    "(local), at one layer; the SAE error is kept everywhere and every other token is "
+    "untouched; a set effect far from the sum of its singles indicates redundancy or interaction"
 )
 
 
@@ -424,6 +432,25 @@ def joint_delta(features: torch.Tensor, w_dec: torch.Tensor, position: int) -> t
     b_dec, the SAE's 'nothing active' state, stays, as in single ablations."""
     active = (features[position] > 0).nonzero().flatten().tolist()
     return ablation_delta(features, w_dec, [(f, [position]) for f in active])
+
+
+def _normalise_pairs(pairs) -> list[tuple[int, int]]:
+    out = [(int(f), int(t)) for f, t in pairs]
+    if not out:
+        raise ValueError("an ablation set needs at least one (feature, token) pair")
+    if len(set(out)) != len(out):
+        raise ValueError(f"duplicate (feature, token) pairs in {out}")
+    return out
+
+
+def set_delta(features: torch.Tensor, w_dec: torch.Tensor, pairs) -> torch.Tensor:
+    """Remove an arbitrary set of (feature, token) pairs together: -a[t, f] * W_dec[f]
+    at each pair's own token only. Every pair must be active at its token; the set
+    must be non-empty and hold no pair twice. All features active at one token
+    give joint_delta at that token."""
+    pairs = _normalise_pairs(pairs)
+    return ablation_delta(features, w_dec,
+                          [(f, ablation_positions(features, f, "local", t)) for f, t in pairs])
 
 
 @contextlib.contextmanager
@@ -992,6 +1019,50 @@ class Inspector:
                  **{k: joint[k] for k in ("delta_log_prob", "delta_eos", "delta_total",
                                           "argmax_changed", "eos_argmax_changed")}}
         return self._report(ctx, layer, "local", results, position, label, joint)
+
+    def ablate_sets(self, ctx: AblationContext, layer: int, sets: list,
+                    with_singles: bool = False, with_summaries: bool = False) -> list[AblationReport]:
+        """Joint local ablation of each set of (feature, token) pairs at one layer
+        (set_delta), all sets in as few batched passes as possible (up to
+        MAX_ABLATION_BATCH per pass, each pass against its own in-batch
+        baseline). A report's `joint` is the set's effect; with_singles also
+        ablates each pair alone, in the same passes, into `results` (input order),
+        so `sum_of_singles` compares with the set. Without it, results is empty
+        and sum_of_singles None."""
+        feats = ctx.features[layer]
+        w_dec = self.saes[layer].W_dec.detach().cpu()
+        norm = [_normalise_pairs(s) for s in sets]
+        deltas = [set_delta(feats, w_dec, s) for s in norm]
+        if with_singles:
+            deltas += [ablation_delta(feats, w_dec, [(f, [t])]) for s in norm for f, t in s]
+        runs = self._run_ablations(ctx, layer, deltas) if deltas else []
+        singles = iter(runs[len(norm):])
+        reports = []
+        for s, (d, c) in zip(norm, runs[:len(norm)], strict=True):
+            r = self._result(ctx, -1, sorted({t for _f, t in s}), 0.0, d, c, None)
+            joint = {"pairs": [[f, t] for f, t in s], "positions": r["positions"], "n_features": len(s),
+                     "activation_sum": float(sum(float(feats[t, f]) for f, t in s)),
+                     **{k: r[k] for k in ("delta_log_prob", "delta_eos", "delta_total",
+                                          "argmax_changed", "eos_argmax_changed")}}
+            results = []
+            if with_singles:
+                for f, t in s:
+                    ds, cs = next(singles)
+                    results.append(self._result(ctx, f, [t], float(feats[t, f]), ds, cs,
+                                                self._feature_summary(layer, f, feats) if with_summaries else None))
+            reports.append(AblationReport(
+                layer=layer, scope="local", position=None, label=f"set of {len(s)} (feature, token) pairs",
+                target=ctx.target, provenance=ablation_provenance(ctx.target["kind"]),
+                scope_note=SET_NOTE, caveat=ABLATION_NOTE, results=results, joint=joint,
+                joint_delta_total=joint["delta_total"],
+                sum_of_singles=float(sum(x["delta_total"] for x in results)) if with_singles else None,
+                joint_note=SET_NOTE))
+        return reports
+
+    def ablate_set(self, ctx: AblationContext, layer: int, pairs,
+                   with_singles: bool = False, with_summaries: bool = False) -> AblationReport:
+        """One set of (feature, token) pairs removed jointly (see ablate_sets)."""
+        return self.ablate_sets(ctx, layer, [pairs], with_singles, with_summaries)[0]
 
     # -- size bound ----------------------------------------------------------
 
@@ -1821,6 +1892,460 @@ def _cmd_audit_evidence_by(args) -> int:
     return 0
 
 
+# --- V1-4c part B: the pre-registered ablation tests ------------------------------------
+
+HYPOTHESES_SHA256 = "2177039b13515fdf46d8f07de6d1c3542d92f7829c8b4ee73cca9120963e84a9"
+SAVED_EXPLANATION_SCHEMA = 2       # analysis/v1_4c/explanations/*.json (read as raw JSON)
+N_CONTROL_DRAWS = 20
+MIN_CONTROL_SETS = 10              # fewer possible distinct control sets -> undetermined
+TIE_TOLERANCE = 1e-6               # |E_control - E| at or below this is a tie (Amendment 2)
+MAX_DRAW_ATTEMPTS = 10_000         # rejection sampling per draw (Amendment 2)
+CONTROL_SEED = 0                   # registered control: default_rng([0, row])
+SECONDARY_SEED = 1                 # Amendment 2 peak-matched control: default_rng([1, row])
+SECONDARY_CONTROL_IDS = ("H7",)
+EXPLORATORY_IDS = ("H7",)
+EXPLORATORY_TOP = 10               # features listed per sign in the exploratory sweep
+UNDETERMINED_BY_CONSTRUCTION = "undetermined by construction (registered)"
+PART_B_PROVENANCE = ("exact ablation, error-preserving (SAE error kept), local at the named tokens, "
+                     "one layer (L8), joint removal of the named set; contexts ctx_p (teacher-forced "
+                     "on the prediction) and ctx_t (teacher-forced on T = the prediction outside the "
+                     "region plus the true region with I mapped to L); n = 1 spectrum per hypothesis, "
+                     "no CI; every test spectrum was SAE training data (Finding 7)")
+
+
+def saved_prediction(path: Path) -> dict:
+    """The prediction of a saved V1-4c explanation, read as raw JSON (schema 2
+    on disk; Explanation.from_json rejects it by design): tokens, per-residue
+    teacher-forced log p and EOS log p."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if data.get("schema_version") != SAVED_EXPLANATION_SCHEMA:
+        raise ValueError(f"{path}: schema_version {data.get('schema_version')!r}, expected "
+                         f"{SAVED_EXPLANATION_SCHEMA}")
+    pred = data.get("prediction")
+    if pred is None:
+        raise ValueError(f"{path}: no prediction")
+    return {"tokens": list(pred["tokens"]), "log_prob_tf": [float(r["log_prob_tf"]) for r in pred["residues"]],
+            "eos_log_prob_tf": float(pred["eos_log_prob_tf"])}
+
+
+def audit_target_tokens(pred: list[str], truth: list[str]) -> tuple[list[str], tuple[int, int], tuple[int, int]]:
+    """Part B's ctx_t target T = pred[:start] + L(true region) + pred[end_pred:]
+    (I mapped to L), with the region spans in the prediction and in T."""
+    start, end_p, end_t = differing_region(pred, truth)
+    region = normalise_peptide(truth[start:end_t])
+    target = list(pred[:start]) + region + list(pred[end_p:])
+    return target, (start, end_p), (start, start + len(region))
+
+
+def region_sum(values: list[float], span: tuple[int, int]) -> float:
+    return float(sum(values[span[0]:span[1]]))
+
+
+def audit_effect(delta_p: list[float], delta_t: list[float], span_p: tuple[int, int],
+                 span_t: tuple[int, int]) -> float:
+    """E = M(intact) - M(removed) from per-residue deltas (residue order) in the
+    two contexts: -(sum of the pred-region deltas in ctx_p - sum of the T-region
+    deltas in ctx_t). E > 0: the removed set pushed the model towards its answer.
+    Given the baselines instead of deltas, -audit_effect is M(intact)."""
+    return -(region_sum(delta_p, span_p) - region_sum(delta_t, span_t))
+
+
+def draw_controls(pools: list[list], n: int, rng: np.random.Generator,
+                  max_attempts: int = MAX_DRAW_ATTEMPTS) -> list[list]:
+    """n control draws, each one member per pool, drawn uniformly from the full
+    pool in pool order; a draw holding a member twice is redrawn whole
+    (rejection sampling, Amendment 2). Raises after max_attempts for one draw,
+    or for an empty pool. Members must be hashable."""
+    if any(len(p) == 0 for p in pools):
+        raise ValueError("a control pool is empty")
+    draws = []
+    for _ in range(n):
+        for _attempt in range(max_attempts):
+            choice = [p[int(rng.integers(len(p)))] for p in pools]
+            if len(set(choice)) == len(choice):
+                draws.append(choice)
+                break
+        else:
+            raise RuntimeError(f"no valid control draw in {max_attempts} attempts")
+    return draws
+
+
+def _signed(sign: str) -> int:
+    if sign not in ("+", "-"):
+        raise ValueError(f"predicted sign must be '+' or '-', got {sign!r}")
+    return 1 if sign == "+" else -1
+
+
+def control_percentile(e: float, controls: list[float], sign: str, tol: float = TIE_TOLERANCE) -> float:
+    """(#controls below the hypothesis's E + 1/2 #ties) / #controls, in the
+    predicted direction (signs flipped for a predicted -)."""
+    s = _signed(sign)
+    below = sum(s * c < s * e and abs(c - e) > tol for c in controls)
+    ties = sum(abs(c - e) <= tol for c in controls)
+    return (below + 0.5 * ties) / len(controls)
+
+
+def audit_outcome(e: float, controls: list[float], sign: str, n_possible_sets: int,
+                  tol: float = TIE_TOLERANCE) -> str:
+    """The pre-registered outcome: undetermined (< MIN_CONTROL_SETS possible
+    distinct control sets), supported (predicted sign and beyond every control
+    in that direction), weak (predicted sign only), not supported (wrong sign)."""
+    if n_possible_sets < MIN_CONTROL_SETS:
+        return "undetermined"
+    s = _signed(sign)
+    if s * e <= 0:
+        return "not supported"
+    if all(s * c < s * e and abs(c - e) > tol for c in controls):
+        return "supported"
+    return "weak"
+
+
+def intensity_ranks(intensities: list[float]) -> dict[int, int]:
+    """Peak index -> intensity rank (1 = most intense; ties by peak index), as in case_view."""
+    return {j: r + 1 for r, j in enumerate(sorted(range(len(intensities)), key=lambda j: -intensities[j]))}
+
+
+def peak_matched_pool(named_peak: int, eligible: list[int], rank: dict[int, int],
+                      size: int = POOL_SIZE) -> list[int]:
+    """Amendment 2: the `size` eligible peaks nearest in intensity rank to the
+    named peak (ties in rank distance to the higher intensity). The caller
+    filters eligibility (non-distinguishing b/y, not named, some active feature)."""
+    cands = [j for j in eligible if j != named_peak]
+    return sorted(cands, key=lambda j: (abs(rank[j] - rank[named_peak]), rank[j]))[:size]
+
+
+def _abs_rank(values: dict, key) -> int:
+    """1 + the number of entries with a strictly larger |value|."""
+    v = abs(values[key])
+    return 1 + sum(abs(x) > v for x in values.values())
+
+
+def _effects_at_token(inspector: Inspector, ctx_p: AblationContext, ctx_t: AblationContext,
+                      layer: int, token: int, span_p, span_t) -> dict:
+    """ablate_token at one token in both contexts: per active feature, its
+    effect on M (E_f), activation and ranks; plus the joint (reference scale)."""
+    rep_p = inspector.ablate_token(ctx_p, layer, token, with_summaries=True)
+    rep_t = inspector.ablate_token(ctx_t, layer, token, with_summaries=False)
+    by_t = {r["feature"]: r for r in rep_t.results}
+    feats = ctx_p.features[layer][token]
+    acts = {r["feature"]: r["activation"] for r in rep_p.results}
+    act_order = sorted(acts, key=lambda f: -acts[f])
+    effects = {r["feature"]: audit_effect(r["delta_log_prob"], by_t[r["feature"]]["delta_log_prob"],
+                                          span_p, span_t) for r in rep_p.results}
+    rows = []
+    for r in rep_p.results:
+        f = r["feature"]
+        rows.append({"feature": f, "activation": acts[f], "activation_rank": act_order.index(f) + 1,
+                     "effect_on_M": effects[f], "abs_effect_rank": _abs_rank(effects, f),
+                     "delta_total_p": r["delta_total"], "delta_total_t": by_t[f]["delta_total"],
+                     "summary": r["summary"]})
+    rows.sort(key=lambda x: x["abs_effect_rank"])
+    joint = None
+    if rep_p.joint is not None:
+        joint = {"n_features": rep_p.joint["n_features"],
+                 "effect_on_M": audit_effect(rep_p.joint["delta_log_prob"], rep_t.joint["delta_log_prob"],
+                                             span_p, span_t),
+                 "delta_total_p": rep_p.joint["delta_total"], "delta_total_t": rep_t.joint["delta_total"],
+                 "sum_of_singles_effect_on_M": float(sum(effects.values())),
+                 "delta_log_prob_p": rep_p.joint["delta_log_prob"], "delta_log_prob_t": rep_t.joint["delta_log_prob"]}
+    if len(rows) != int((feats > 0).sum()):
+        raise RuntimeError(f"token {token}: sweep covers {len(rows)} features, "
+                           f"{int((feats > 0).sum())} are active")
+    return {"token": token, "l0": len(rows), "features": rows, "joint": joint}
+
+
+def _set_effects(reports_p: list[AblationReport], reports_t: list[AblationReport], span_p, span_t) -> list[dict]:
+    out = []
+    for rp, rt in zip(reports_p, reports_t, strict=True):
+        out.append({"pairs": rp.joint["pairs"], "activation_sum": rp.joint["activation_sum"],
+                    "E": audit_effect(rp.joint["delta_log_prob"], rt.joint["delta_log_prob"], span_p, span_t),
+                    "delta_log_prob_p": rp.joint["delta_log_prob"], "delta_eos_p": rp.joint["delta_eos"],
+                    "delta_total_p": rp.joint["delta_total"],
+                    "delta_log_prob_t": rt.joint["delta_log_prob"], "delta_eos_t": rt.joint["delta_eos"],
+                    "delta_total_t": rt.joint["delta_total"]})
+    return out
+
+
+def _control_block(sets_eff: list[dict], e: float, m0: float, named_act: float, sign: str) -> dict:
+    es = [c["E"] for c in sets_eff]
+    return {"draws": [{"pairs": c["pairs"], "E": c["E"], "E_over_M": c["E"] / m0,
+                       "activation_ratio": c["activation_sum"] / named_act} for c in sets_eff],
+            "n_distinct_draws": len({frozenset(map(tuple, c["pairs"])) for c in sets_eff}),
+            "percentile": control_percentile(e, es, sign)}
+
+
+def _part_b_case(inspector: Inspector, parquet_path: Path, out: Path, h: dict, cand: dict,
+                 saved_pools: dict, class_by: str) -> dict:
+    t_start = time.perf_counter()
+    rs = inspector.residue_set
+    row, L, sign = int(h["row"]), int(h["layer"]), h["predicted_sign"]
+    spec = read_raw_spectra(parquet_path, [row])[0]
+    rec = read_raw_records(parquet_path, [row], ["modified_sequence"])[0]
+    pred = rs.tokenize(cand["prediction"])
+    truth = [rs.residue_remapping.get(t, t) for t in rs.tokenize(rec["modified_sequence"])]
+    if "".join(truth) != cand["truth"]:
+        raise RuntimeError(f"row {row}: true peptide differs from candidates.csv")
+
+    saved = saved_prediction(out / "explanations" / f"row_{row}.json")
+    exp = inspector.explain(spec)
+    if exp.prediction is None or exp.prediction["tokens"] != saved["tokens"] or saved["tokens"] != pred:
+        raise RuntimeError(f"row {row}: fresh explain() predicted "
+                           f"{exp.prediction and exp.prediction['peptide']}, saved {''.join(saved['tokens'])}")
+    fresh = [r["log_prob_tf"] for r in exp.prediction["residues"]] + [exp.prediction["eos_log_prob_tf"]]
+    gap = max(abs(a - b) for a, b in zip(fresh, saved["log_prob_tf"] + [saved["eos_log_prob_tf"]], strict=True))
+    if gap > 1e-5:
+        raise RuntimeError(f"row {row}: fresh log p differs from the saved explanation by {gap:.2e}")
+
+    target, span_p, span_t = audit_target_tokens(pred, truth)
+    if (span_p[0] != int(cand["region_start"]) or "".join(pred[span_p[0]:span_p[1]]) != cand["pred_region"]
+            or "".join(truth[span_p[0]:span_p[0] + span_t[1] - span_t[0]]) != cand["true_region"]):
+        raise RuntimeError(f"row {row}: region differs from candidates.csv")
+    if [rs.residue_remapping.get(t, t) for t in rs.tokenize("".join(target))] != target:
+        raise RuntimeError(f"row {row}: target T does not round-trip through the tokenizer")
+    ctx_p = inspector.ablation_context(spec, exp)
+    ctx_t = inspector.ablation_context(spec, exp, target="".join(target))
+    if ctx_t.target["tokens"] != target or not torch.equal(ctx_p.features[L], ctx_t.features[L]):
+        raise RuntimeError(f"row {row}: ctx_t does not hold T or the same features")
+    feats = ctx_p.features[L]
+    base_p, eos_p = decoder_to_residue_order(ctx_p.baseline_log_prob.tolist(), ctx_p.n_residues)
+    base_t, eos_t = decoder_to_residue_order(ctx_t.baseline_log_prob.tolist(), ctx_t.n_residues)
+    m0 = -audit_effect(base_p, base_t, span_p, span_t)
+
+    # Registered control pools, recomputed; must equal descriptive_checks.json's.
+    items = [(int(it["feature"]), int(it["token"])) for it in h["features"]]
+    named_by_token: dict[int, set[int]] = {}
+    for f, t in items:
+        named_by_token.setdefault(t, set()).add(f)
+    pools, pool_info = [], []
+    for (f, t), sv in zip(items, saved_pools["items"], strict=True):
+        acts = {int(g): float(feats[t, g]) for g in (feats[t] > 0).nonzero().flatten().tolist()}
+        pool = control_pool(acts, named_by_token[t], f)
+        if (sv["feature"], sv["token"]) != (f, t) or sv["pool"] != pool:
+            raise RuntimeError(f"{h['id']} F{f}@{t}: pool {pool} differs from descriptive_checks.json {sv['pool']}")
+        pools.append((t, pool))
+        pool_info.append({"feature": f, "token": t, "activation": acts[f], "pool": pool,
+                          "underpowered": len(pool) < POOL_MIN_SIZE})
+    n_sets = n_distinct_control_sets(pools)
+    if n_sets != saved_pools["n_distinct_control_sets"]:
+        raise RuntimeError(f"{h['id']}: {n_sets} control sets, descriptive_checks.json "
+                           f"{saved_pools['n_distinct_control_sets']}")
+    decidable = n_sets >= MIN_CONTROL_SETS
+    draws = (draw_controls([[(g, t) for g in pool] for t, pool in pools], N_CONTROL_DRAWS,
+                           np.random.default_rng([CONTROL_SEED, row])) if decidable else [])
+
+    # The named set, each item alone, and the registered controls: one batch per context.
+    sets = [items] + [[p] for p in items] + draws
+    eff = _set_effects(inspector.ablate_sets(ctx_p, L, sets), inspector.ablate_sets(ctx_t, L, sets), span_p, span_t)
+    hyp, singles, ctrl = eff[0], eff[1:1 + len(items)], eff[1 + len(items):]
+    e = hyp["E"]
+    named_act = hyp["activation_sum"]
+    result = {
+        "id": h["id"], "row": row, "layer": L, "predicted_sign": sign,
+        "class_registered": h["class"], "class_amendment_1": class_by,
+        "prediction": "".join(pred), "truth": "".join(truth), "target_T": "".join(target),
+        "span_pred": list(span_p), "span_T": list(span_t),
+        "pred_region": "".join(pred[span_p[0]:span_p[1]]), "T_region": "".join(target[span_t[0]:span_t[1]]),
+        "M_intact": m0, "region_log_p_pred": region_sum(base_p, span_p), "region_log_p_T": region_sum(base_t, span_t),
+        "eos_log_p_pred": eos_p, "eos_log_p_T": eos_t,
+        "E": e, "E_over_M": e / m0 if m0 != 0 else None, "M_intact_nonpositive": m0 <= 0,
+        "set": hyp,
+        "singles": [{"feature": p[0], "token": p[1], "activation": s["activation_sum"], "E": s["E"],
+                     "E_over_M": s["E"] / m0, "delta_total_p": s["delta_total_p"],
+                     "delta_total_t": s["delta_total_t"]} for p, s in zip(items, singles, strict=True)],
+        "pools": pool_info, "n_possible_control_sets": n_sets,
+        "underpowered_items": [f"F{p['feature']}@{p['token']}" for p in pool_info if p["underpowered"]],
+    }
+    if decidable:
+        result["control"] = _control_block(ctrl, e, m0, named_act, sign)
+        result["outcome"] = audit_outcome(e, [c["E"] for c in ctrl], sign, n_sets)
+    else:
+        result["control"] = None
+        result["outcome"] = UNDETERMINED_BY_CONSTRUCTION
+
+    # Step (c) and the joint reference scale: every active feature at each named token.
+    sweeps: dict[int, dict] = {}
+    for t in dict.fromkeys(t for _f, t in items):
+        sweeps[t] = _effects_at_token(inspector, ctx_p, ctx_t, L, t, span_p, span_t)
+    result["step_c"] = [{"feature": f, "token": t, "l0": sweeps[t]["l0"],
+                         **{k: next(x for x in sweeps[t]["features"] if x["feature"] == f)[k]
+                            for k in ("activation", "activation_rank", "effect_on_M", "abs_effect_rank")}}
+                        for f, t in items]
+    result["joint_reference"] = [{"token": t, **sweeps[t]["joint"]} for t in sweeps]
+
+    if h["id"] in SECONDARY_CONTROL_IDS or h["id"] in EXPLORATORY_IDS:
+        fwd = inspector.forward(spec, "".join(pred))
+        ann_p, _ = inspector._annotate(pred, spec, fwd)
+        ann_t, _ = inspector._annotate(truth, spec, fwd)
+        d = distinguishing_peaks(ann_p, ann_t)
+        if d["true_only"] != [int(x) for x in cand["true_only_peaks"].split()]:
+            raise RuntimeError(f"row {row}: true-only peaks differ from candidates.csv")
+        by_true_only = [j for j in d["true_only"] if ann_t[j]["ion_type"] in BACKBONE_ION_TYPES]
+        if len(by_true_only) != int(cand["n_true_only_by"]):
+            raise RuntimeError(f"row {row}: {len(by_true_only)} true-only b/y peaks, candidates.csv "
+                               f"{cand['n_true_only_by']}")
+        labels = {j: {"pred": peak_label(ann_p[j]), "true": peak_label(ann_t[j])} for j in range(len(ann_p))}
+
+    if h["id"] in SECONDARY_CONTROL_IDS:
+        rank = intensity_ranks([pk["intensity"] for pk in exp.peaks])
+        named_peaks = {t - 1 for _f, t in items}
+        eligible = [j for j in range(len(ann_p))
+                    if ann_p[j]["ion_type"] in BACKBONE_ION_TYPES and ann_t[j]["ion_type"] in BACKBONE_ION_TYPES
+                    and j not in named_peaks and bool((feats[j + 1] > 0).any())]
+        sec_pools = [peak_matched_pool(t - 1, eligible, rank) for _f, t in items]
+        peak_draws = draw_controls(sec_pools, N_CONTROL_DRAWS, np.random.default_rng([SECONDARY_SEED, row]))
+        top = {j: int(feats[j + 1].argmax()) for pool in sec_pools for j in pool}
+        sec_sets = [[(top[j], j + 1) for j in dr] for dr in peak_draws]
+        sec = _set_effects(inspector.ablate_sets(ctx_p, L, [items] + sec_sets),
+                           inspector.ablate_sets(ctx_t, L, [items] + sec_sets), span_p, span_t)
+        block = _control_block(sec[1:], sec[0]["E"], m0, named_act, sign)
+        block.update({
+            "rule": "Amendment 2 (secondary, does not change the outcome)",
+            "E_in_batch": sec[0]["E"], "E_batch_difference": sec[0]["E"] - e,
+            "n_possible_sets": n_distinct_control_sets([(0, p) for p in sec_pools]),
+            "n_eligible_peaks": len(eligible),
+            "pools": [{"feature": f, "token": t, "named_peak": t - 1, "named_intensity_rank": rank[t - 1],
+                       "pool_peaks": p, "pool_intensity_ranks": [rank[j] for j in p],
+                       "pool_labels": [labels[j]["pred"] for j in p]}
+                      for (f, t), p in zip(items, sec_pools, strict=True)],
+            "named_feature_is_top_on_pool_peak": sorted({f"F{top[j]}@{j + 1}" for p in sec_pools for j in p
+                                                         if top[j] in {f for f, _t in items}}),
+        })
+        result["secondary_control"] = block
+
+    if h["id"] in EXPLORATORY_IDS:
+        for j in by_true_only:
+            if j + 1 not in sweeps:
+                sweeps[j + 1] = _effects_at_token(inspector, ctx_p, ctx_t, L, j + 1, span_p, span_t)
+        pairs = [{"token": j + 1, "peak": j, "label_true": labels[j]["true"], **x}
+                 for j in by_true_only for x in sweeps[j + 1]["features"]]
+        pos = sorted(pairs, key=lambda x: -x["effect_on_M"])[:EXPLORATORY_TOP]
+        neg = sorted(pairs, key=lambda x: x["effect_on_M"])[:EXPLORATORY_TOP]
+        result["exploratory"] = {
+            "label": "exploratory (not pre-registered)", "true_only_by_peaks": by_true_only,
+            "peak_labels": {str(j): labels[j]["true"] for j in by_true_only},
+            "n_pairs": len(pairs), "top_positive": pos, "top_negative": neg,
+            "joint_reference": [{"token": j + 1, **sweeps[j + 1]["joint"]} for j in by_true_only],
+        }
+
+    result["sweeps"] = {str(t): s for t, s in sweeps.items()}
+    result["seconds"] = time.perf_counter() - t_start
+    return result
+
+
+def audit_part_b(inspector: Inspector, parquet_path: Path, out_dir: Path) -> dict:
+    """V1-4c part B: the pre-registered tests, run as registered (STATUS, V1-4c
+    part B protocol, Amendments 1 and 2). Stops if hypotheses.json is not the
+    registered file, a fresh explain() does not reproduce a saved prediction,
+    or a recomputed control pool differs from descriptive_checks.json."""
+    import csv
+    out = Path(out_dir)
+    sha = _sha256_prefix(out / "hypotheses.json", 64)
+    if sha != HYPOTHESES_SHA256:
+        raise RuntimeError(f"hypotheses.json sha256 {sha} is not the registered {HYPOTHESES_SHA256}")
+    hyp = json.loads((out / "hypotheses.json").read_text(encoding="utf-8"))
+    checks = json.loads((out / "descriptive_checks.json").read_text(encoding="utf-8"))
+    saved_pools = {p["id"]: p for p in checks["pools"]}
+    with open(out / "candidates.csv", newline="", encoding="utf-8") as f:
+        cands = {int(r["row"]): r for r in csv.DictReader(f)}
+    with open(out / "evidence_classes_by.csv", newline="", encoding="utf-8") as f:
+        class_by = {int(r["row"]): r["evidence_class_by"] for r in csv.DictReader(f)}
+    t0 = time.perf_counter()
+    cases = [_part_b_case(inspector, parquet_path, out, h, cands[int(h["row"])], saved_pools[h["id"]],
+                          class_by[int(h["row"])]) for h in hyp["hypotheses"]]
+    decidable = [c for c in cases if c["control"] is not None]
+    return {
+        "provenance_note": PART_B_PROVENANCE, "hypotheses_sha256": sha,
+        "settings": {"n_control_draws": N_CONTROL_DRAWS, "min_control_sets": MIN_CONTROL_SETS,
+                     "tie_tolerance": TIE_TOLERANCE, "max_draw_attempts": MAX_DRAW_ATTEMPTS,
+                     "control_seed": CONTROL_SEED, "secondary_seed": SECONDARY_SEED,
+                     "pool_size": POOL_SIZE, "pool_min_ratio": POOL_MIN_RATIO, "pool_min_size": POOL_MIN_SIZE,
+                     "exploratory_top": EXPLORATORY_TOP},
+        "n_decidable": len(decidable),
+        "expected_false_supported": len(decidable) / (N_CONTROL_DRAWS + 1),
+        "seconds": time.perf_counter() - t0,
+        "inspector_provenance": inspector.provenance,
+        "cases": cases,
+    }
+
+
+_PART_B_SUMMARY_COLUMNS = ("id", "row", "class_registered", "class_amendment_1", "predicted_sign",
+                           "pred_region", "T_region", "M_intact", "E", "E_over_M", "delta_total_p",
+                           "delta_total_t", "n_possible_control_sets", "n_distinct_draws", "percentile",
+                           "secondary_percentile", "underpowered_items", "outcome")
+_PART_B_CONTROL_COLUMNS = ("id", "row", "control", "draw", "pairs", "E", "E_over_M", "activation_ratio")
+_PART_B_SWEEP_COLUMNS = ("id", "row", "sweep", "token", "peak", "named", "feature", "activation",
+                         "activation_rank", "l0", "effect_on_M", "abs_effect_rank", "delta_total_p",
+                         "delta_total_t", "top_concept", "top_concept_f1_dom", "top_concept_chance_fraction",
+                         "reliable_concept", "reliable_concept_f1_dom", "reliable_concept_chance_fraction",
+                         "causal_delta_ce")
+
+
+def _part_b_tables(rep: dict, reliability: dict) -> tuple[list, list, list]:
+    summary, controls, sweep = [], [], []
+    for c in rep["cases"]:
+        ctrl, sec = c["control"], c.get("secondary_control")
+        summary.append({
+            "id": c["id"], "row": c["row"], "class_registered": c["class_registered"],
+            "class_amendment_1": c["class_amendment_1"], "predicted_sign": c["predicted_sign"],
+            "pred_region": c["pred_region"], "T_region": c["T_region"], "M_intact": c["M_intact"],
+            "E": c["E"], "E_over_M": c["E_over_M"], "delta_total_p": c["set"]["delta_total_p"],
+            "delta_total_t": c["set"]["delta_total_t"], "n_possible_control_sets": c["n_possible_control_sets"],
+            "n_distinct_draws": ctrl["n_distinct_draws"] if ctrl else "",
+            "percentile": ctrl["percentile"] if ctrl else "", "secondary_percentile": sec["percentile"] if sec else "",
+            "underpowered_items": c["underpowered_items"], "outcome": c["outcome"]})
+        for name, block in (("registered", ctrl), ("secondary", sec)):
+            for i, d in enumerate(block["draws"] if block else []):
+                controls.append({"id": c["id"], "row": c["row"], "control": name, "draw": i,
+                                 "pairs": [f"F{f}@{t}" for f, t in d["pairs"]], "E": d["E"],
+                                 "E_over_M": d["E_over_M"], "activation_ratio": d["activation_ratio"]})
+        named = {(f, t) for f, t in c["set"]["pairs"]}
+        named_tokens = {t for _f, t in named}
+        for t_str, s in c["sweeps"].items():
+            t = int(t_str)
+            for x in s["features"]:
+                sm = x["summary"]
+                rc = sm.get("reliable_concept")
+                sweep.append({
+                    "id": c["id"], "row": c["row"], "sweep": "step_c" if t in named_tokens else "exploratory",
+                    "token": t, "peak": t - 1, "named": (x["feature"], t) in named, "feature": x["feature"],
+                    "activation": x["activation"], "activation_rank": x["activation_rank"], "l0": s["l0"],
+                    "effect_on_M": x["effect_on_M"], "abs_effect_rank": x["abs_effect_rank"],
+                    "delta_total_p": x["delta_total_p"], "delta_total_t": x["delta_total_t"],
+                    "top_concept": sm.get("top_concept"), "top_concept_f1_dom": sm.get("top_concept_f1_dom"),
+                    "top_concept_chance_fraction": sm.get("top_concept_chance_fraction"),
+                    "reliable_concept": rc, "reliable_concept_f1_dom": sm.get("reliable_concept_f1_dom"),
+                    "reliable_concept_chance_fraction": reliability[rc]["chance_fraction"] if rc else None,
+                    "causal_delta_ce": sm.get("causal_delta_ce")})
+    return summary, controls, sweep
+
+
+def _cmd_audit_part_b(args, inspector: Inspector) -> int:
+    """V1-4c part B -> part_b.json and three CSVs beside the part A outputs."""
+    out = Path(args.out_dir)
+    rep = audit_part_b(inspector, args.parquet, out)
+    (out / "part_b.json").write_text(json.dumps(_finalise(rep), indent=1), encoding="utf-8")
+    reliability = inspector.dictionaries[8].concept_reliability()
+    summary, controls, sweep = _part_b_tables(rep, reliability)
+    _write_csv(out / "part_b_summary.csv", summary, _PART_B_SUMMARY_COLUMNS)
+    _write_csv(out / "part_b_controls.csv", controls, _PART_B_CONTROL_COLUMNS)
+    _write_csv(out / "part_b_token_sweep.csv", sweep, _PART_B_SWEEP_COLUMNS)
+    print(f"part B: {len(rep['cases'])} hypotheses, {rep['n_decidable']} decidable, "
+          f"{rep['seconds']:.0f} s; outputs in {out}")
+    print("id | row | class (A1) | sign | M intact | E | E/M | pct | sec pct | outcome")
+    for s in summary:
+        em = "" if s["E_over_M"] is None else f"{s['E_over_M']:+.4f}"
+        print(f"{s['id']} | {s['row']} | {s['class_amendment_1']} | {s['predicted_sign']} | "
+              f"{s['M_intact']:+.4f} | {s['E']:+.4f} | {em} | {s['percentile']} | "
+              f"{s['secondary_percentile']} | {s['outcome']}")
+    for c in rep["cases"]:
+        steps = "; ".join(f"F{x['feature']}@{x['token']} |E| rank {x['abs_effect_rank']}/{x['l0']} "
+                          f"(act rank {x['activation_rank']})" for x in c["step_c"])
+        print(f"  {c['id']} step (c): {steps}")
+    for name in ("part_b.json", "part_b_summary.csv", "part_b_controls.csv", "part_b_token_sweep.csv"):
+        print(f"  sha256 {name}: {_sha256_prefix(out / name, 64)}")
+    return 0
+
+
 _PREDICTION_COLUMNS = ("row", "truth", "prediction", "exact", "meets_precursor", "min_abs_ppm",
                        "beam_log_prob", "n_residues", "modified_truth")
 _CANDIDATE_COLUMNS = ("rank", "row", "mean_residue_log_prob", "prediction", "truth", "mismatch_type",
@@ -1904,7 +2429,8 @@ def _cmd_audit_cases(args, inspector: Inspector) -> int:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("command", choices=["time", "compare-preprocessing", "accuracy", "audit-cases",
-                                       "audit-checks", "audit-notation", "audit-evidence-by"])
+                                       "audit-checks", "audit-notation", "audit-evidence-by",
+                                       "audit-part-b"])
     p.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     p.add_argument("--outputs-root", type=Path, default=DEFAULT_OUTPUTS_ROOT)
     p.add_argument("--parquet", type=Path,
@@ -1917,7 +2443,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--ablation", action="store_true",
                    help="time: also time exact ablation (both scopes, per-peak and latent panels)")
     p.add_argument("--out-dir", type=Path, default=DEFAULT_OUTPUTS_ROOT / "analysis" / "v1_4c",
-                   help="audit-cases / -checks / -notation / -evidence-by: V1-4c output directory")
+                   help="audit-cases / -checks / -notation / -evidence-by / -part-b: V1-4c output directory")
     p.add_argument("--n-top", type=int, default=5, help="audit-cases: cases taken by rank")
     p.add_argument("--min-evidence", type=int, default=2,
                    help=f"audit-cases: selected cases that must be '{EVIDENCE_FOR_TRUE}'")
@@ -1930,12 +2456,13 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_audit_evidence_by(args)
     if args.parquet is None:
         p.error(f"{args.command} needs --parquet")
-    if args.command not in ("accuracy", "audit-cases", "audit-checks", "audit-notation") and not args.rows:
+    if args.command not in ("accuracy", "audit-cases", "audit-checks", "audit-notation",
+                            "audit-part-b") and not args.rows:
         p.error(f"{args.command} needs --rows")
     inspector = Inspector(args.checkpoint, args.outputs_root, top_k=args.top_k)
     rc = {"time": _cmd_time, "compare-preprocessing": _cmd_compare, "accuracy": _cmd_accuracy,
           "audit-cases": _cmd_audit_cases, "audit-checks": _cmd_audit_checks,
-          "audit-notation": _cmd_audit_notation}[args.command](args, inspector)
+          "audit-notation": _cmd_audit_notation, "audit-part-b": _cmd_audit_part_b}[args.command](args, inspector)
     return rc or 0
 
 

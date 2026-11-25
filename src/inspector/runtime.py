@@ -1355,6 +1355,33 @@ def evidence_class(n_pred_only: int, n_true_only: int) -> str:
     return EVIDENCE_AMBIGUOUS
 
 
+EVIDENCE_BY_COLUMNS = ("rank", "row", "selected", "n_pred_only", "n_pred_only_by", "n_true_only",
+                       "n_true_only_by", "evidence_class", "evidence_class_by", "changed")
+
+
+def backbone_evidence_classes(candidates: list[dict]) -> list[dict]:
+    """V1-4c amendment 1: the evidence class recomputed on distinguishing b/y
+    peaks only (`n_pred_only_by`, `n_true_only_by`), same rule otherwise.
+    Internal-fragment matches are at chance level and immonium labels are
+    peptide-independent (Finding 9), so only b/y peaks are kept. Uses the
+    stored counts: a peak counts when it is b/y under one peptide and noise or
+    precursor under the other; a peak that is b/y under one and internal or
+    immonium under the other is not counted. Raises if the stored counts do not
+    reproduce the stored class. Rows are candidates.csv rows (strings or numbers)."""
+    out = []
+    for c in candidates:
+        n = {k: int(c[k]) for k in ("n_pred_only", "n_pred_only_by", "n_true_only", "n_true_only_by")}
+        stored = evidence_class(n["n_pred_only"], n["n_true_only"])
+        if stored != c["evidence_class"]:
+            raise ValueError(f"row {c['row']}: stored class {c['evidence_class']!r} is not reproduced "
+                             f"by its counts ({stored!r})")
+        by = evidence_class(n["n_pred_only_by"], n["n_true_only_by"])
+        selected = c["selected"] if isinstance(c["selected"], bool) else str(c["selected"]).lower() == "true"
+        out.append({"rank": int(c["rank"]), "row": int(c["row"]), "selected": selected, **n,
+                    "evidence_class": stored, "evidence_class_by": by, "changed": by != stored})
+    return out
+
+
 def mean_residue_log_prob(ce: list[float], n_residues: int) -> float:
     """Mean log p over the residues from decoder-order CE (residues then EOS); EOS excluded."""
     per_residue, _eos = decoder_to_residue_order([-float(v) for v in ce], n_residues)
@@ -1775,6 +1802,25 @@ def _cmd_audit_notation(args, inspector: Inspector) -> int:
     return 0
 
 
+def _cmd_audit_evidence_by(args) -> int:
+    """V1-4c amendment 1 -> evidence_classes_by.csv beside candidates.csv (read-only on it)."""
+    import csv
+    out = Path(args.out_dir)
+    with open(out / "candidates.csv", newline="", encoding="utf-8") as f:
+        rows = backbone_evidence_classes(list(csv.DictReader(f)))
+    _write_csv(out / "evidence_classes_by.csv", rows, EVIDENCE_BY_COLUMNS)
+    count = {k: {cls: sum(r[k] == cls for r in rows)
+                 for cls in (EVIDENCE_FOR_TRUE, EVIDENCE_AMBIGUOUS, EVIDENCE_FOR_PRED)}
+             for k in ("evidence_class", "evidence_class_by")}
+    print(f"{len(rows)} candidates; classes all fragments {count['evidence_class']}, "
+          f"b/y only {count['evidence_class_by']}; {sum(r['changed'] for r in rows)} change")
+    for r in rows:
+        if r["changed"]:
+            print(f"  rank {r['rank']} row {r['row']}{' (selected)' if r['selected'] else ''}: "
+                  f"{r['evidence_class']} -> {r['evidence_class_by']}")
+    return 0
+
+
 _PREDICTION_COLUMNS = ("row", "truth", "prediction", "exact", "meets_precursor", "min_abs_ppm",
                        "beam_log_prob", "n_residues", "modified_truth")
 _CANDIDATE_COLUMNS = ("rank", "row", "mean_residue_log_prob", "prediction", "truth", "mismatch_type",
@@ -1858,10 +1904,11 @@ def _cmd_audit_cases(args, inspector: Inspector) -> int:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("command", choices=["time", "compare-preprocessing", "accuracy", "audit-cases",
-                                       "audit-checks", "audit-notation"])
+                                       "audit-checks", "audit-notation", "audit-evidence-by"])
     p.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     p.add_argument("--outputs-root", type=Path, default=DEFAULT_OUTPUTS_ROOT)
-    p.add_argument("--parquet", type=Path, required=True, help="raw spectra parquet (InstaNovo columns)")
+    p.add_argument("--parquet", type=Path,
+                   help="raw spectra parquet (InstaNovo columns); every command but audit-evidence-by")
     p.add_argument("--rows", type=int, nargs="+", help="rows to use (accuracy: default a random sample)")
     p.add_argument("--n", type=int, default=200, help="accuracy: sample size")
     p.add_argument("--seed", type=int, default=0, help="accuracy: sampling seed")
@@ -1870,7 +1917,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--ablation", action="store_true",
                    help="time: also time exact ablation (both scopes, per-peak and latent panels)")
     p.add_argument("--out-dir", type=Path, default=DEFAULT_OUTPUTS_ROOT / "analysis" / "v1_4c",
-                   help="audit-cases: output directory")
+                   help="audit-cases / -checks / -notation / -evidence-by: V1-4c output directory")
     p.add_argument("--n-top", type=int, default=5, help="audit-cases: cases taken by rank")
     p.add_argument("--min-evidence", type=int, default=2,
                    help=f"audit-cases: selected cases that must be '{EVIDENCE_FOR_TRUE}'")
@@ -1879,6 +1926,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--decoy-rows", type=int, nargs="*", default=[],
                    help="audit-checks: rows annotated against shuffled-sequence decoys")
     args = p.parse_args(argv)
+    if args.command == "audit-evidence-by":           # reads candidates.csv only; no model
+        return _cmd_audit_evidence_by(args)
+    if args.parquet is None:
+        p.error(f"{args.command} needs --parquet")
     if args.command not in ("accuracy", "audit-cases", "audit-checks", "audit-notation") and not args.rows:
         p.error(f"{args.command} needs --rows")
     inspector = Inspector(args.checkpoint, args.outputs_root, top_k=args.top_k)

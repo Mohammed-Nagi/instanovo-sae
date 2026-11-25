@@ -600,6 +600,42 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a, V1-4b.
         9 audits the labels these hypotheses rest on (immonium and
         internal-fragment labels, covers_*).
 
+      Amendment 1 (2026-11-25, before part B; the hypotheses, the case
+      selection and the part B protocol are unchanged; hypotheses.json sha256
+      still 2177039b…e84a9): evidence classes redefined on distinguishing b/y
+      peaks only, with the same rule (true = ≥ 1 true-only b/y peak; pred =
+      distinguishing b/y peaks only under the prediction; amb = none). Reason:
+      internal-fragment matches are at chance level (chance fraction 0.54) and
+      immonium labels are peptide-independent (Finding 9), so they cannot count
+      as evidence. Computed from the stored counts (`n_pred_only_by`,
+      `n_true_only_by`; `runtime.backbone_evidence_classes`, `python -m
+      inspector.runtime audit-evidence-by`, output
+      `analysis/v1_4c/evidence_classes_by.csv`; candidates.csv untouched, and
+      its stored classes are reproduced from its counts). Limit: those counts
+      take a peak that is b/y under one peptide and noise or precursor under the
+      other; a peak that is b/y under one and internal or immonium under the
+      other is not counted (counting it would need re-annotation, not done).
+      Classes 34 true / 7 amb / 3 pred → 28 / 13 / 3. 8 of 44 change:
+
+      | rank | row | sel | all fragments | b/y only | pred-only (b/y) | true-only (b/y) |
+      |---|---|---|---|---|---|---|
+      | 2 | 51238 | top 5 | pred | amb | 5 (0) | 0 (0) |
+      | 6 | 29977 | added | true | amb | 0 (0) | 1 (0) |
+      | 9 | 46143 |  | true | pred | 3 (3) | 9 (0) |
+      | 14 | 47026 |  | true | pred | 15 (12) | 3 (0) |
+      | 16 | 71941 |  | true | amb | 3 (0) | 1 (0) |
+      | 19 | 90372 |  | pred | amb | 2 (0) | 0 (0) |
+      | 21 | 97297 |  | true | amb | 0 (0) | 3 (0) |
+      | 24 | 33227 |  | true | amb | 2 (0) | 1 (0) |
+
+      Consequences, recorded and not acted on: among the selected cases H2's row
+      (51238) becomes ambiguous (its evidence was internal fragments only) and
+      H6's row (29977) ambiguous (one internal peak). Only row 109208 (H3, a
+      probable ¹³C artefact, Finding 8(a)) stays "evidence for true", so the
+      selection rule's "2 selected cases for true" would not be met under the
+      amended classes; the selection is not redone. H7's row (43804, rank 10)
+      stays "evidence for true" (13 true-only b/y vs 0).
+
       Part B protocol (fixed with the hypotheses):
       - Contexts: ctx_p = `ablation_context(spec, exp)` and
         ctx_t = `ablation_context(spec, exp, target=T)`, with `exp` = a fresh
@@ -956,6 +992,11 @@ stated, with the tests that show it (V1-4a's in `tests/test_inspector_runtime.py
 - V1-3b, `analysis.py`: new `--reliable-associations` mode
   (`reliable_association_list`, `load_dictionary_rows`); existing modes
   unchanged. Shown by `test_reliable_association_list_cut_order_and_summary`.
+- V1-4c amendment 1, `inspector/runtime.py`: new pure
+  `backbone_evidence_classes` and the `audit-evidence-by` subcommand, which
+  reads candidates.csv only and loads no model. `--parquet` is no longer an
+  argparse requirement; every other command still fails without it (now via
+  `p.error`). Shown by `test_backbone_evidence_classes_toy_and_stored_counts`.
 
 ## Backlog (after v1; do not start early)
 

@@ -984,3 +984,31 @@ def test_notation_equivalent_maps_deamidation_and_i_l_only():
     assert not notation_equivalent(["D", "Q", "K"], ["E", "N", "K"])        # same composition, a swap
     assert not notation_equivalent(["N", "K"], ["D", "K"])                   # unmodified N is not D
     assert not notation_equivalent(["M[UNIMOD:35]", "K"], ["M", "K"])
+
+
+def test_backbone_evidence_classes_toy_and_stored_counts():
+    from inspector.runtime import backbone_evidence_classes, EVIDENCE_BY_COLUMNS
+
+    def cand(row, p, pby, t, tby, cls, selected="False"):
+        return {"rank": row, "row": row, "selected": selected, "n_pred_only": p, "n_pred_only_by": pby,
+                "n_true_only": t, "n_true_only_by": tby, "evidence_class": cls}
+
+    rows = backbone_evidence_classes([
+        cand(1, "5", "0", "0", "0", EVIDENCE_FOR_PRED, "True"),   # internal-only evidence -> ambiguous
+        cand(2, 3, 3, 9, 0, EVIDENCE_FOR_TRUE),                    # true side only internal -> pred
+        cand(3, 9, 9, 1, 1, EVIDENCE_FOR_TRUE),                    # one true b/y peak keeps it
+        cand(4, 0, 0, 0, 0, EVIDENCE_AMBIGUOUS)])
+    assert [r["evidence_class_by"] for r in rows] == [EVIDENCE_AMBIGUOUS, EVIDENCE_FOR_PRED,
+                                                       EVIDENCE_FOR_TRUE, EVIDENCE_AMBIGUOUS]
+    assert [r["changed"] for r in rows] == [True, True, False, False]
+    assert rows[0]["selected"] is True and rows[1]["selected"] is False
+    assert tuple(rows[0]) == EVIDENCE_BY_COLUMNS
+    with pytest.raises(ValueError, match="not reproduced"):
+        backbone_evidence_classes([cand(5, 0, 0, 1, 0, EVIDENCE_AMBIGUOUS)])
+
+    stored = REPO / "sae_pipeline_outputs" / "analysis" / "v1_4c" / "candidates.csv"
+    if stored.is_file():
+        import csv
+        with open(stored, newline="", encoding="utf-8") as f:
+            out = backbone_evidence_classes(list(csv.DictReader(f)))
+        assert len(out) == 44 and sum(r["changed"] for r in out) == 8

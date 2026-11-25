@@ -636,6 +636,46 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-3b, V1-4a, V
       amended classes; the selection is not redone. H7's row (43804, rank 10)
       stays "evidence for true" (13 true-only b/y vs 0).
 
+      Amendment 2 (2026-11-25, before any part B ablation on the selected
+      cases; the hypotheses, the registered controls and the outcome rule are
+      unchanged; hypotheses.json sha256 still 2177039b…e84a9):
+      - H7 secondary control, peak-matched (reported beside the registered
+        control; it does not change H7's outcome label). Reason: H7's named
+        features are rank 1 at their tokens (check (d)), so every registered
+        pool member is weaker than the feature it replaces. Pool of a named
+        (feature, token): the 10 non-distinguishing b/y peaks nearest in
+        intensity rank to the named peak, the named tokens excluded.
+        Non-distinguishing b/y = ion type b or y under both the prediction and
+        the true peptide in the existing annotation (`annotate_spectrum`,
+        strict, 20 ppm; neutral losses and charges included, as the named peaks
+        include y13+-H2O). Intensity rank as in the case views (1 = most
+        intense among the processed peaks, ties by peak index); ties in rank
+        distance go to the higher intensity, as in `control_pool`; peaks with
+        no active L8 feature are dropped before the nearest-10 cut. A draw takes
+        one peak per named item from its pool, no peak twice, and uses that
+        peak's top-activation L8 feature at that peak's token (it may be a named
+        feature, at a different token). 20 draws with
+        `np.random.default_rng([1, row])`, each ablated exactly as the
+        hypothesis set (joint, local, L8, both contexts). Reported: every draw's
+        E and E / M(intact), Σ activation(control) / Σ activation(named), the
+        number of distinct draws and the percentile (same formula as the
+        registered control).
+      - Dropped: H8 and a noise-peak check, discussed while planning part B but
+        never registered, are dropped: both relied on is_noise_peak, the
+        complement of the matched-peak labels Finding 9 found contaminated.
+      - Fixed here because the registration left them open (both controls):
+        (i) sampling: each named item's member is drawn uniformly from its full
+        pool, in hypotheses.json item order; a draw that repeats a (feature,
+        token) pair (secondary: a peak) is redrawn whole (rejection sampling,
+        at most 10,000 attempts per draw, else the run raises); the 20 draws
+        are independent, so a set may recur across draws. (ii) "Distinct
+        control draws" in the outcome rule = the number of possible distinct
+        sets (`n_distinct_control_sets`, as check (d) used for "undetermined by
+        construction"); the number of distinct sets among the 20 realised draws
+        is reported beside it. (iii) A percentile tie is |E_control − E| ≤ 1e-6
+        (the batching-noise level); the hypothesis set and its controls are
+        ablated in the same batch, against the same baseline.
+
       Part B protocol (fixed with the hypotheses):
       - Contexts: ctx_p = `ablation_context(spec, exp)` and
         ctx_t = `ablation_context(spec, exp, target=T)`, with `exp` = a fresh

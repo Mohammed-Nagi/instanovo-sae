@@ -385,7 +385,7 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a, V1-4b.
       `analysis/v1_4c/descriptive_checks.json`, sha256
       8f444cfe54d4b0f905e1002d1eccf355d0c828ed5be8d42759dc34e5bbdec94f; code:
       `runtime.audit_descriptive_checks` and the `max_isotope` flag of
-      `annotate.run_spectrum_utils`, not yet committed, see the log):
+      `annotate.run_spectrum_utils`, committed in `f4933d3`):
       (a) The 7 candidates whose label carries a deamidation and whose
           prediction meets the precursor only via isotope offset 1, re-annotated
           under the prediction with max_isotope=1. True-only peaks that become
@@ -434,6 +434,28 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a, V1-4b.
           are therefore undetermined by construction; H1, H2, H5 and H7 can be
           decided. H3's and H7's named features are rank 1 at their tokens by
           construction (top activation), so all their pool members are weaker.
+
+      Review notes (2026-11-25, after pre-registration; the hypotheses above are
+      unchanged; checked against `analysis/v1_4c/explanations/` and
+      `dictionary/layer_8.parquet`):
+      - H1: the top L8 feature on peak 8 (token 9, b2) is F1330 (17.61, top
+        concept cleaves_C_to_Asp, F1dom 0.109). It bears on the region residue
+        (D in the true peptide) and was not named; the named covers_N features
+        (F511 12.38, F9744 6.61, F3490 6.04) fit the hypothesis's story.
+      - H6: F6206 is not specific to peak 18. It also fires, alone or nearly
+        alone, on unrelated peaks in other spectra (row 51238 peak 23: L0 2,
+        F6206 8.55 with F8596 5.05; row 109208 peaks 99, 134, 189: L0 1). In
+        each of the 7 case-view spectra it is the only active L8 feature on
+        6–15 peaks, mostly noise-labelled (29977: 8 including peak 18); firing
+        rate 8.9%.
+      - H4: F1276 also appears in the L8 latent top-k of rows 51238 (1.59),
+        60182 (1.42) and 109208 (1.63), so it is not specific to row 29350.
+      - General: L8 concept labels are mostly m/z bins, with F1dom < 0.3 and no
+        descriptions. m/z bins are the top concept of 59% of the 7,632 L8
+        top-k entries shown in the 7 case views (45% of their 1,031 distinct
+        features; 31% of all 8,732 L8 features); F1dom < 0.3 for 97% of those
+        features (99.6% of L8); no L8 feature has a description (V1-2c).
+      - Finding 8 records which top candidates are not model failures.
 
       Part B protocol (fixed with the hypotheses):
       - Contexts: ctx_p = `ablation_context(spec, exp)` and
@@ -880,6 +902,66 @@ recomputing the split gives val chunks 17, 116, 135, 141, 230, 292, 316, 397,
 448, 462, 489, 495, all below 515. The exposure is unsupervised (activations
 only, no labels or peptides), but no test spectrum is unseen by the SAEs, so
 any result on the test split must state it.
+
+**8. The V1-4c top candidates are mostly not model failures (descriptive,
+found 2026-11-25).** From the V1-4c part A outputs (`analysis/v1_4c/`), no
+ablation.
+(a) The 7 candidates whose label carries a deamidation and whose prediction
+meets the precursor only at isotope offset 1 (ranks 3, 7, 13, 17, 26, 29, 34)
+are probable ¹³C-as-deamidation label artefacts (a known database-search
+issue): 23 of their 35 true-only peaks (17 of 23 true-only b/y) are ¹³C peaks
+of predicted fragments, and b/y favour the prediction in 5 of 7 (V1-4c check
+(a)). They are not proven label errors.
+(b) Notation-equivalent predictions: N[UNIMOD:7] and D, and Q[UNIMOD:7] and E,
+have the same composition. 3 of the 44 candidates are equal to their true
+peptide after N[UNIMOD:7]→D, Q[UNIMOD:7]→E, I→L: ranks 1, 5 and 12
+(`runtime.notation_equivalent`; `python -m inspector.runtime audit-notation`,
+output `analysis/v1_4c/notation_equivalent.json`). Exact-match accuracy counts
+them wrong; InstaNovo's mass-based peptide metric (`Metrics.compute_precision_recall`
+on each pair) counts them right. That metric gives 127 of the 200 predictions
+(V1-4a: 127) against 123 exact: the 3 notation-equivalent pairs plus row 43804
+(rank 10, H7; Q vs K, 0.036 Da, inside the metric's 0.1 Da per-residue
+tolerance), so InstaNovo's own metric counts H7's case as correct.
+(c) The confidence-ranked top 6 hold no clear model failure: two
+notation-equivalent (ranks 1, 5), one probable label artefact (3), two
+unresolvable from the spectrum (4: no distinguishing peak; 6: one true-only
+internal-fragment peak, within check (c)'s chance range of 5–15), and one where
+the evidence favours the prediction (2). H7 (rank 10) is the first candidate
+with b/y evidence clearly for the true peptide (13 true-only b/y vs 0); ranks 7
+and 9 have b/y favouring the prediction (9 vs 1, 3 vs 0) and 8 is ambiguous.
+(d) Corpus level, over the 13 local chunks (13,312 spectra; `python -m analysis
+--root sae_pipeline_outputs --deamidation-precursor`, outputs
+`analysis/label_audit/deamidation_precursor{.csv,_summary.json}`; ppm by
+InstaNovo's definition, 20 ppm). 813 labels carry a deamidation (773 one, 40
+two or more). (i) None of them, and none of the 10,776 unmodified labels, meets
+the precursor only at isotope offset 1, so the labels contain no isotope-offset
+matches at all. (ii) 758 of 813 become offset-1 matches when one deamidation is
+removed; above ~967 Da this follows from the tolerance alone (the ¹³C step
+1.00335 and the deamidation 0.98402 differ by 19.3 mDa) and does not single out
+artefacts. (iii) Instrument accuracy from the unmodified labels (10,768 meeting
+offset 0): median +0.14 ppm, MAD 0.93 ppm (robust σ 1.38 ppm), while the
+19.3 mDa gap is 22.0 / 15.5 / 9.9 / 6.7 ppm at the median mass of the bins
+< 967 / 967–1500 / 1500–2500 / ≥ 2500 Da, so the two explanations are
+resolvable at every mass. Per label, D = |ppm(deamidated, offset 0) − median| −
+|ppm(amidated, offset 1) − median| (D > 0: the ¹³C explanation fits better).
+D in units of the gap is bimodal: 473 labels at −1.25…−0.75, 96 / 43 / 55 in
+between, 146 at +0.75…+1.25. Within 3 robust σ (4.13 ppm) of the median:
+
+| mass (Da) | n | deamidated only | ¹³C only | both | neither |
+|---|---|---|---|---|---|
+| < 967 | 36 | 31 | 0 | 0 | 5 |
+| 967–1500 | 234 | 191 | 22 | 0 | 21 |
+| 1500–2500 | 406 | 246 | 112 | 0 | 48 |
+| ≥ 2500 | 137 | 56 | 48 | 19 | 14 |
+| all | 813 | 524 | 182 | 19 | 88 |
+
+So 182 of 813 deamidated labels (22%; 165 of 773 with one deamidation, 17 of 40
+with two or more) are consistent with a ¹³C misassignment and not with
+deamidation at the instrument's accuracy, and 524 (64%) are consistent with
+deamidation only. The ¹³C-only share rises with mass (0%, 9%, 28%, 35%), as
+expected if the assignment could only be made where the gap fell inside the
+search's precursor tolerance. This says which explanation the precursor mass
+supports, not which label is wrong.
 
 ## Log
 

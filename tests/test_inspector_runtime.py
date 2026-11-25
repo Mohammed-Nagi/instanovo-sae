@@ -966,3 +966,12 @@ def test_run_spectrum_utils_max_isotope_flag():
     assert annotate.run_spectrum_utils(**common)[0]["ion_type"] == "noise"
     hit = annotate.run_spectrum_utils(**common, max_isotope=1)[0]
     assert (hit["ion_type"], hit["ion_index"]) == ("y", 2)
+
+
+def test_notation_equivalent_maps_deamidation_and_i_l_only():
+    from inspector.runtime import notation_equivalent
+    assert notation_equivalent(["V", "N", "N[UNIMOD:7]", "K"], ["V", "N", "D", "K"])
+    assert notation_equivalent(["Q[UNIMOD:7]", "I", "R"], ["E", "L", "R"])
+    assert not notation_equivalent(["D", "Q", "K"], ["E", "N", "K"])        # same composition, a swap
+    assert not notation_equivalent(["N", "K"], ["D", "K"])                   # unmodified N is not D
+    assert not notation_equivalent(["M[UNIMOD:35]", "K"], ["M", "K"])

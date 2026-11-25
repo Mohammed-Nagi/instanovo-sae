@@ -66,6 +66,8 @@ import numpy as np
 # read only in _annotation_to_dict (see module docstring).
 import spectrum_utils.spectrum as sus
 import torch
+# Monoisotopic residue masses: the table spectrum_utils itself uses (label audit only).
+from pyteomics.mass import std_aa_mass as _STD_AA_MASS
 
 from schema import ANNOTATION_SCHEMA_VERSION, EXTRACT_SCHEMA_VERSION
 
@@ -478,6 +480,53 @@ def exact_mass_proforma(proforma: str) -> str:
         return m.group(0)
 
     return _PROFORMA_TAG_RE.sub(repl, proforma)
+
+
+# --- Peptide masses (label audit; not used by the annotation pipeline) --------
+
+PROTON_MASS = 1.007276
+WATER_MASS = 18.010565
+# InstaNovo's CARBON_MASS_DELTA (instanovo.constants), the isotope step its
+# Metrics.matches_precursor uses; spectrum_utils uses 1.003354 for fragments.
+CARBON_MASS_DELTA = 1.00335
+
+_PROFORMA_TOKEN_RE = re.compile(r"\[[^\]]+\]-?|[A-Z](?:\[[^\]]+\])?")
+
+
+def proforma_residue_tokens(proforma: str) -> list[str]:
+    """Split a delta-mass ProForma string into tokens: an optional N-terminal
+    tag ("[+42.01]" or "[+42.01]-") first, then one token per residue with its
+    tag ("N[+0.98]"). Raises on anything else (C-terminal or unlocalised mods,
+    lower case), so "".join(tokens) == proforma always holds."""
+    tokens = _PROFORMA_TOKEN_RE.findall(proforma)
+    if "".join(tokens) != proforma or any(t.startswith("[") for t in tokens[1:]):
+        raise ValueError(f"cannot tokenise ProForma {proforma!r}")
+    return tokens
+
+
+def proforma_neutral_mass(proforma: str) -> float:
+    """Monoisotopic neutral mass of a delta-mass ProForma peptide, with tracked
+    PTM deltas replaced by their exact masses (exact_mass_proforma)."""
+    total = WATER_MASS
+    for tok in proforma_residue_tokens(exact_mass_proforma(proforma)):
+        tag = _PROFORMA_TAG_RE.search(tok)
+        if tag:
+            total += float(tag.group(1))          # raises on a UNIMOD tag, by design
+        if tok[0].isalpha():
+            total += _STD_AA_MASS[tok[0]]
+    return total
+
+
+def proforma_mz(proforma: str, charge: int) -> float:
+    """Precursor m/z of a ProForma peptide at `charge`."""
+    return (proforma_neutral_mass(proforma) + charge * PROTON_MASS) / charge
+
+
+def precursor_ppm(theoretical_mz: float, measured_mz: float, charge: int, isotope: int = 0) -> float:
+    """Precursor mass error in ppm at an isotope offset, InstaNovo's definition
+    (Metrics._calc_mass_error): (theoretical - (measured - isotope * C13 / z)) /
+    measured * 1e6. Offset 1 means the measured m/z is the first 13C peak."""
+    return (theoretical_mz - (measured_mz - isotope * CARBON_MASS_DELTA / charge)) / measured_mz * 1e6
 
 
 # --- spectrum_utils adapter (0.5.x) -------------------------------------------

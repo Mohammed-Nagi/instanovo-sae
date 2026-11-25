@@ -1,8 +1,9 @@
 """analysis.py -- post-hoc analysis over the released evaluate.py reports.
 
 Everything here reads each layer's ``report.json`` (Phase 8 results) and, with
-``--descriptions``, the interpret.py description runs. It needs neither torch nor
-the activation chunks, so it runs on any machine.
+``--descriptions``, the interpret.py description runs. Those modes need neither
+torch nor the activation chunks, so they run on any machine; only
+``--deamidation-precursor`` (below) reads the extract chunks.
 
 Hub inventory
     Phase 8 ablates, for every concept, its top ``ablation_per_feature_top``
@@ -45,11 +46,22 @@ Blinded vs unblinded descriptions (``--descriptions BLIND UNBLINDED``)
     gives each run's shuffled r per layer (median, p95), overall and split by
     whether the donor description came from a feature in the same stratum.
 
+Deamidation vs 13C at the precursor (``--deamidation-precursor``, Finding 8(d))
+    The one mode that reads the local extract chunks (labels only, so it needs
+    torch; imported lazily). For each label carrying a deamidation: its
+    precursor ppm at isotope offsets 0 and 1, and the offset-1 ppm of the same
+    peptide with one deamidation removed (the 13C-misassignment explanation).
+    Centre = median offset-0 ppm of labels with no modification; D = |deamidated
+    - centre| - |13C-of-amidated - centre|; each explanation "fits" within 3
+    robust sigma (1.4826 x MAD). Writes
+    ``analysis/label_audit/deamidation_precursor{.csv,_summary.json}``.
+
 Usage (from the repo root)::
 
     PYTHONPATH=src uv run python -m analysis
     PYTHONPATH=src uv run python -m analysis --root sae_pipeline_outputs --layers 2 4
     PYTHONPATH=src uv run python -m analysis --descriptions blind_v1 unblinded_v2
+    PYTHONPATH=src uv run python -m analysis --root sae_pipeline_outputs --deamidation-precursor
 
 Outputs under ``<root>/analysis/``: ``hubs.csv`` (a ranked list, no flag) and
 ``f1dom_selectivity.csv``; with ``--descriptions``, only
@@ -61,6 +73,7 @@ import argparse
 import csv
 import json
 import math
+import re
 from pathlib import Path
 from statistics import median
 
@@ -319,6 +332,162 @@ def shuffled_null_by_donor(run: dict[int, dict], layer: int, run_name: str) -> d
     }
 
 
+# --- Deamidation vs 13C at the precursor (Finding 8(d)) -----------------------
+
+DEAMIDATION_MASS = 0.984016
+PRECURSOR_TOL_PPM = 20.0                     # InstaNovo's filter_precursor_ppm, as in V1-4a / V1-4c
+DEAMIDATION_MASS_BINS = (967.0, 1500.0, 2500.0)
+DEAMIDATION_COLUMNS = [
+    "chunk", "spectrum", "spectrum_id", "proforma", "charge", "neutral_mass", "n_deamidation",
+    "ppm_label_iso0", "ppm_label_iso1", "ppm_amidated_iso0", "ppm_amidated_iso1",
+    "label_meets_only_iso1", "amidated_meets_iso1", "d_ppm",
+]
+
+
+def remove_one_deamidation(proforma: str) -> str | None:
+    """The ProForma string with its first deamidation tag (+0.98 on N or Q)
+    removed, or None if it has none."""
+    import annotate
+    tokens = annotate.proforma_residue_tokens(proforma)
+    for i, tok in enumerate(tokens):
+        m = re.search(r"\[([^\]]+)\]", tok)
+        if tok[0] in "NQ" and m and abs(float(m.group(1)) - DEAMIDATION_MASS) <= annotate.PTM_MASS_TOL:
+            return "".join(tokens[:i] + [tok[0]] + tokens[i + 1:])
+    return None
+
+
+def precursor_explanations(proforma: str, precursor_mz: float, charge: int,
+                           tol: float = PRECURSOR_TOL_PPM) -> dict:
+    """ppm of a label at isotope offsets 0 and 1, and, if it carries a
+    deamidation, of the same peptide with one deamidation removed (the
+    "amidated" form, whose offset-1 match is the 13C misassignment explanation)."""
+    import annotate
+    mz = annotate.proforma_mz(proforma, charge)
+    out = {"neutral_mass": annotate.proforma_neutral_mass(proforma),
+           "ppm_label_iso0": annotate.precursor_ppm(mz, precursor_mz, charge, 0),
+           "ppm_label_iso1": annotate.precursor_ppm(mz, precursor_mz, charge, 1)}
+    out["label_meets_only_iso1"] = abs(out["ppm_label_iso0"]) > tol and abs(out["ppm_label_iso1"]) <= tol
+    amidated = remove_one_deamidation(proforma)
+    if amidated is not None:
+        amz = annotate.proforma_mz(amidated, charge)
+        out["ppm_amidated_iso0"] = annotate.precursor_ppm(amz, precursor_mz, charge, 0)
+        out["ppm_amidated_iso1"] = annotate.precursor_ppm(amz, precursor_mz, charge, 1)
+        out["amidated_meets_iso1"] = abs(out["ppm_amidated_iso1"]) <= tol
+    return out
+
+
+MAD_TO_SIGMA = 1.4826                        # MAD -> sigma for a normal distribution
+FIT_SIGMAS = 3.0
+D_OVER_GAP_EDGES = (-math.inf, -1.25, -0.75, -0.25, 0.25, 0.75, 1.25, math.inf)
+D_OVER_GAP_LABELS = ("<-1.25", "-1.25..-0.75", "-0.75..-0.25", "-0.25..0.25", "0.25..0.75", "0.75..1.25", ">1.25")
+
+
+def gap_ppm(neutral_mass: float) -> float:
+    """The 13C-minus-deamidation gap (19.3 mDa) in ppm of the peptide's mass."""
+    return (1.00335 - DEAMIDATION_MASS) / neutral_mass * 1e6
+
+
+def explanation_fit(ppm_deamidated_iso0: float, ppm_amidated_iso1: float, centre: float, width: float) -> str:
+    """Which explanation lies within `width` ppm of the instrument's centre:
+    'deamidated_only', '13c_only', 'both' (unresolvable) or 'neither'."""
+    d, c = abs(ppm_deamidated_iso0 - centre) <= width, abs(ppm_amidated_iso1 - centre) <= width
+    return {(True, False): "deamidated_only", (False, True): "13c_only",
+            (True, True): "both", (False, False): "neither"}[(d, c)]
+
+
+def deamidation_d(ppm_deamidated_iso0: float, ppm_amidated_iso1: float, centre: float) -> float:
+    """D = |ppm of the deamidated explanation - centre| - |ppm of the
+    13C-of-amidated explanation - centre|; D > 0 means the 13C explanation sits
+    closer to the instrument's typical error (centre = median ppm of unmodified labels)."""
+    return abs(ppm_deamidated_iso0 - centre) - abs(ppm_amidated_iso1 - centre)
+
+
+def mass_bin(mass: float, cuts: tuple[float, ...] = DEAMIDATION_MASS_BINS) -> str:
+    edges = (0.0, *cuts, math.inf)
+    for lo, hi in zip(edges, edges[1:]):
+        if lo <= mass < hi:
+            return f"<{hi:g}" if lo == 0 else (f">={lo:g}" if hi == math.inf else f"{lo:g}-{hi:g}")
+    raise ValueError(mass)
+
+
+def _quantiles(x) -> dict:
+    x = np.asarray(x, float)
+    if x.size == 0:
+        return {"n": 0}
+    q = np.quantile(x, [0.05, 0.25, 0.5, 0.75, 0.95])
+    return {"n": int(x.size), "q05": q[0], "q25": q[1], "median": q[2], "q75": q[3], "q95": q[4],
+            "frac_positive": float(np.mean(x > 0))}
+
+
+def deamidation_precursor(root: Path, tol: float = PRECURSOR_TOL_PPM) -> tuple[list[dict], dict]:
+    """Finding 8(d): one pass over the local extract chunks (labels only, no
+    annotation). Reference = labels with no modification: median and MAD of
+    their offset-0 ppm, over those meeting the precursor at offset 0."""
+    import torch
+    import annotate
+    manifest = json.loads((root / "extract" / "manifest.json").read_text())
+    rows, ref_ppm, ref_only_iso1, n_ref = [], [], 0, 0
+    n_spectra = 0
+    for ch in manifest["chunks"]:
+        meta = torch.load(root / "extract" / ch["meta"], map_location="cpu", weights_only=False)
+        for s in range(meta["n_spectra"]):
+            n_spectra += 1
+            prof, mods = meta["proforma_strings"][s], meta["modifications"][s]
+            z, pmz = int(meta["precursor_charges"][s]), float(meta["precursor_mzs"][s])
+            n_deam = sum(annotate._mod_to_ptm_name(m, meta["peptides"][s]) == "deamidation" for m in mods)
+            if not mods:
+                e = precursor_explanations(prof, pmz, z, tol)
+                n_ref += 1
+                ref_only_iso1 += e["label_meets_only_iso1"]
+                if abs(e["ppm_label_iso0"]) <= tol:
+                    ref_ppm.append(e["ppm_label_iso0"])
+            elif n_deam:
+                e = precursor_explanations(prof, pmz, z, tol)
+                if "ppm_amidated_iso1" not in e:
+                    raise ValueError(f"deamidation in modifications but not in ProForma: {prof!r}")
+                rows.append({"chunk": ch["idx"], "spectrum": s, "spectrum_id": meta["spectrum_ids"][s],
+                             "proforma": prof, "charge": z, "n_deamidation": n_deam, **e})
+        del meta
+    centre = float(np.median(ref_ppm))
+    mad = float(np.median(np.abs(np.asarray(ref_ppm) - centre)))
+    for r in rows:
+        r["d_ppm"] = deamidation_d(r["ppm_label_iso0"], r["ppm_amidated_iso1"], centre)
+
+    sigma = MAD_TO_SIGMA * mad
+
+    def block(sel):
+        fit = [explanation_fit(r["ppm_label_iso0"], r["ppm_amidated_iso1"], centre, FIT_SIGMAS * sigma)
+               for r in sel]
+        ratio = [r["d_ppm"] / gap_ppm(r["neutral_mass"]) for r in sel]
+        return {"n": len(sel),
+                "fit_within_3_sigma": {k: fit.count(k) for k in ("deamidated_only", "13c_only", "both", "neither")},
+                "d_over_gap_hist": dict(zip(D_OVER_GAP_LABELS, np.histogram(ratio, bins=D_OVER_GAP_EDGES)[0].tolist())),
+                "label_meets_only_iso1": sum(r["label_meets_only_iso1"] for r in sel),
+                "label_meets_iso0": sum(abs(r["ppm_label_iso0"]) <= tol for r in sel),
+                "amidated_meets_iso1": sum(r["amidated_meets_iso1"] for r in sel),
+                "both_within_tol": sum(abs(r["ppm_label_iso0"]) <= tol and r["amidated_meets_iso1"] for r in sel),
+                "d_ppm": _quantiles([r["d_ppm"] for r in sel]),
+                "median_mass": float(np.median([r["neutral_mass"] for r in sel])) if sel else None}
+
+    summary = {"tol_ppm": tol, "n_spectra": n_spectra, "n_chunks": len(manifest["chunks"]),
+               "reference": {"definition": "labels with no modification, meeting the precursor at offset 0",
+                             "n_unmodified": n_ref, "n_used": len(ref_ppm), "median_ppm": centre, "mad_ppm": mad,
+                             "n_unmodified_meeting_only_iso1": ref_only_iso1},
+               "gap_mda": (annotate.CARBON_MASS_DELTA - DEAMIDATION_MASS) * 1e3,
+               "fit_rule": f"|ppm - median| <= {FIT_SIGMAS} x {MAD_TO_SIGMA} x MAD = {FIT_SIGMAS * sigma:.2f} ppm",
+               "all": block(rows)}
+    for k in (1, 2):
+        sel = [r for r in rows if (r["n_deamidation"] == 1) == (k == 1)]
+        summary["one_deamidation" if k == 1 else "two_or_more"] = block(sel)
+    summary["by_mass"] = {}
+    for b in dict.fromkeys(mass_bin(r["neutral_mass"]) for r in sorted(rows, key=lambda r: r["neutral_mass"])):
+        sel = [r for r in rows if mass_bin(r["neutral_mass"]) == b]
+        blk = block(sel)
+        blk["gap_ppm_at_median_mass"] = summary["gap_mda"] * 1e-3 / blk["median_mass"] * 1e6
+        summary["by_mass"][b] = blk
+    return rows, summary
+
+
 def _write_csv(path: Path, columns: list[str], rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as fh:
@@ -334,7 +503,18 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--descriptions", nargs=2, metavar=("BLIND", "UNBLINDED"),
                         help="compare two description run tags instead of the report analyses")
+    parser.add_argument("--deamidation-precursor", action="store_true",
+                        help="Finding 8(d): deamidated labels vs the precursor at isotope offsets 0/1 "
+                             "(reads the extract chunks; needs torch)")
     args = parser.parse_args(argv)
+
+    if args.deamidation_precursor:
+        out_dir = args.root / "analysis" / "label_audit"
+        rows, summary = deamidation_precursor(args.root)
+        _write_csv(out_dir / "deamidation_precursor.csv", DEAMIDATION_COLUMNS, rows)
+        (out_dir / "deamidation_precursor_summary.json").write_text(json.dumps(summary, indent=1))
+        print(json.dumps(summary, indent=1))
+        return
 
     if args.descriptions:
         blind_tag, plain_tag = args.descriptions

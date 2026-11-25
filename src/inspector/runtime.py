@@ -1732,6 +1732,64 @@ def _cmd_audit_checks(args, inspector: Inspector) -> int:
     return 0
 
 
+# Modified residues whose elemental composition equals another residue's:
+# deamidated N is D, deamidated Q is E (same formula, same mass).
+NOTATION_EQUIVALENT = {"N[UNIMOD:7]": "D", "Q[UNIMOD:7]": "E"}
+
+
+def notation_equivalent(a: list[str], b: list[str]) -> bool:
+    """Whether two token lists are the same molecule written differently: equal
+    after N[UNIMOD:7] -> D, Q[UNIMOD:7] -> E and I -> L. Swaps of residues with
+    the same combined composition (e.g. DQ vs EN) are not notation-equivalent."""
+    def canon(tokens):
+        return normalise_peptide([NOTATION_EQUIVALENT.get(t, t) for t in tokens])
+    return canon(a) == canon(b)
+
+
+def audit_notation(inspector: Inspector, predictions_csv: Path, candidates_csv: Path) -> dict:
+    """Finding 8(b): for every prediction of the V1-4c run, whether it is exact
+    (I = L), notation-equivalent to the true peptide, and counted correct by
+    InstaNovo's mass-based peptide metric (Metrics.compute_precision_recall on
+    the single pair). No model call beyond loading the residue set."""
+    import csv
+    rs = inspector.residue_set
+    metrics = instanovo_io.instanovo_metrics(rs)
+    ranks = {int(r["row"]): int(r["rank"]) for r in csv.DictReader(open(candidates_csv, encoding="utf-8"))}
+    rows = []
+    for p in csv.DictReader(open(predictions_csv, encoding="utf-8")):
+        truth, pred = rs.tokenize(p["truth"]), rs.tokenize(p["prediction"])
+        exact = bool(pred) and normalise_peptide(pred) == normalise_peptide(truth)
+        if exact != (p["exact"] == "True"):
+            raise RuntimeError(f"row {p['row']}: exact {exact} disagrees with predictions.csv")
+        _ap, _ar, pep_recall, _pp = metrics.compute_precision_recall([truth], [pred])
+        rows.append({"row": int(p["row"]), "candidate_rank": ranks.get(int(p["row"])),
+                     "truth": p["truth"], "prediction": p["prediction"], "exact": exact,
+                     "meets_precursor": p["meets_precursor"] == "True",
+                     "notation_equivalent": bool(pred) and notation_equivalent(pred, truth),
+                     "instanovo_mass_match": pep_recall == 1.0})
+    mass_not_exact = [r for r in rows if r["instanovo_mass_match"] and not r["exact"]]
+    return {"n": len(rows), "n_exact": sum(r["exact"] for r in rows),
+            "n_instanovo_mass_match": sum(r["instanovo_mass_match"] for r in rows),
+            "n_notation_equivalent_not_exact": sum(r["notation_equivalent"] and not r["exact"] for r in rows),
+            "notation_equivalent_candidates": sorted(r["candidate_rank"] for r in rows
+                                                     if r["notation_equivalent"] and r["candidate_rank"]),
+            "mass_match_not_exact": mass_not_exact, "rows": rows}
+
+
+def _cmd_audit_notation(args, inspector: Inspector) -> int:
+    """Finding 8(b) -> notation_equivalent.json beside the V1-4c outputs."""
+    out = Path(args.out_dir)
+    rep = audit_notation(inspector, out / "predictions.csv", out / "candidates.csv")
+    (out / "notation_equivalent.json").write_text(json.dumps(rep, indent=1), encoding="utf-8")
+    print(f"{rep['n']} predictions: exact {rep['n_exact']}, InstaNovo mass match "
+          f"{rep['n_instanovo_mass_match']}, notation-equivalent but not exact "
+          f"{rep['n_notation_equivalent_not_exact']} (candidate ranks {rep['notation_equivalent_candidates']})")
+    for r in rep["mass_match_not_exact"]:
+        print(f"  mass match, not exact: row {r['row']} (rank {r['candidate_rank']}), notation-equivalent "
+              f"{r['notation_equivalent']}: {r['prediction']} / {r['truth']}")
+    return 0
+
+
 _PREDICTION_COLUMNS = ("row", "truth", "prediction", "exact", "meets_precursor", "min_abs_ppm",
                        "beam_log_prob", "n_residues", "modified_truth")
 _CANDIDATE_COLUMNS = ("rank", "row", "mean_residue_log_prob", "prediction", "truth", "mismatch_type",
@@ -1815,7 +1873,7 @@ def _cmd_audit_cases(args, inspector: Inspector) -> int:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("command", choices=["time", "compare-preprocessing", "accuracy", "audit-cases",
-                                       "audit-checks"])
+                                       "audit-checks", "audit-notation"])
     p.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     p.add_argument("--outputs-root", type=Path, default=DEFAULT_OUTPUTS_ROOT)
     p.add_argument("--parquet", type=Path, required=True, help="raw spectra parquet (InstaNovo columns)")
@@ -1836,11 +1894,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--decoy-rows", type=int, nargs="*", default=[],
                    help="audit-checks: rows annotated against shuffled-sequence decoys")
     args = p.parse_args(argv)
-    if args.command not in ("accuracy", "audit-cases", "audit-checks") and not args.rows:
+    if args.command not in ("accuracy", "audit-cases", "audit-checks", "audit-notation") and not args.rows:
         p.error(f"{args.command} needs --rows")
     inspector = Inspector(args.checkpoint, args.outputs_root, top_k=args.top_k)
     rc = {"time": _cmd_time, "compare-preprocessing": _cmd_compare, "accuracy": _cmd_accuracy,
-          "audit-cases": _cmd_audit_cases, "audit-checks": _cmd_audit_checks}[args.command](args, inspector)
+          "audit-cases": _cmd_audit_cases, "audit-checks": _cmd_audit_checks,
+          "audit-notation": _cmd_audit_notation}[args.command](args, inspector)
     return rc or 0
 
 

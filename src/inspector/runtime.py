@@ -1034,7 +1034,9 @@ class Inspector:
                    "in_dictionary": False, "has_description": False,
                    "has_significant_association": False, "description_blinded": False,
                    "description_beats_baseline": False, "fires_on_latent": False,
-                   "top_concept": "x" * longest_concept, "n_tokens_active": 999}
+                   "top_concept_meets_display_rule": False,
+                   "top_concept": "x" * longest_concept, "reliable_concept": "x" * longest_concept,
+                   "n_tokens_active": 999}
         summary_size = size(summary) + 8                  # + '"12345": '
         result = {"feature": 99999, "positions": [999], "activation": w,
                   "delta_log_prob": [w] * self.max_length, "delta_eos": w, "delta_total": w,

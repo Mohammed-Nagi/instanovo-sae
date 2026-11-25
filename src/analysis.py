@@ -71,7 +71,19 @@ Label-quality audit (``--label-audit``, Finding 9)
     isotope-1 and a-ion transitions, co-matching classes, and b/y coverage, with
     percentile-bootstrap 95% CIs over spectra. Writes ``analysis/label_audit/``:
     reproduction.json, sample.csv, per_class.csv, determined.csv, isotope.csv,
-    precedence.csv, coverage.csv, a_ions.csv, concepts.csv, summary.json.
+    precedence.csv, coverage.csv, a_ions.csv, concepts.csv, summary.json, and
+    concept_reliability.csv (V1-3b: per concept its dependence on the peptide,
+    chance fraction with CI, positives the two labelling bugs add or hide, and
+    whether it meets the display rule ``DISPLAY_RULE``).
+
+Reliable-association list (``--reliable-associations``, V1-3b / Finding 10)
+    Reads the four dictionaries (no chunks) and lists the features whose best
+    association with a concept meeting the display rule has F1dom >= 0.1, a
+    listing cut for later use (demo set, feature cards), not a reliability
+    claim. Writes ``analysis/reliable_associations.csv`` and
+    ``reliable_associations_summary.json`` (per layer: live features, features
+    with any reliable association, the median of their best reliable F1dom, and
+    how many reach 0.1 and 0.3).
 
 Usage (from the repo root)::
 
@@ -80,6 +92,7 @@ Usage (from the repo root)::
     PYTHONPATH=src uv run python -m analysis --descriptions blind_v1 unblinded_v2
     PYTHONPATH=src uv run python -m analysis --root sae_pipeline_outputs --deamidation-precursor
     PYTHONPATH=src uv run python -m analysis --root sae_pipeline_outputs --label-audit
+    PYTHONPATH=src uv run python -m analysis --root sae_pipeline_outputs --reliable-associations
 
 Outputs under ``<root>/analysis/``: ``hubs.csv`` (a ranked list, no flag) and
 ``f1dom_selectivity.csv``; with ``--descriptions``, only
@@ -98,7 +111,7 @@ from statistics import median
 import numpy as np
 from scipy.stats import spearmanr
 
-from schema import EVAL_SCHEMA_VERSION, check_run_tag
+from schema import DICTIONARY_SCHEMA_VERSION, EVAL_SCHEMA_VERSION, check_run_tag
 
 LAYERS = (2, 4, 6, 8)
 DEFAULT_ROOT = Path("sae_pipeline_outputs")
@@ -1106,6 +1119,65 @@ def label_audit(root: Path, n: int = AUDIT_N, seed: int = DEFAULT_SEED, n_decoys
     return summary
 
 
+# --- Reliable-association list (V1-3b, Finding 10) --------------------------------
+
+RELIABLE_LIST_MIN_F1DOM = 0.1
+RELIABLE_LIST_CUT = (
+    "listing cut F1dom >= 0.1 on the best reliable association, chosen by the user (V1-3b) to collect the "
+    "few features with a non-negligible association to a concept meeting the display rule, for later use "
+    "(demo set, feature cards); not a reliability claim -- the F1dom, precision, recall and chance fraction "
+    "are listed")
+FINDING_10_LEVELS = (0.1, 0.3)
+RELIABLE_LIST_COLUMNS = [
+    "layer", "feature_idx", "firing_rate", "n_reliable_associations",
+    *[f"reliable_{name}_{k}" for k in (1, 2, 3)
+      for name in ("concept", "f1_dom", "precision", "recall", "chance_fraction")],
+    "concept_1", "f1_dom_1", "chance_fraction_1", "phase8_delta_ce", "causal_provenance",
+    "description_blinded", "description_r", "description_beats_baseline", "description",
+]
+
+
+def _is_number(value) -> bool:
+    return value is not None and not (isinstance(value, float) and math.isnan(value))
+
+
+def reliable_association_list(rows_by_layer: dict[int, list[dict]],
+                              min_f1dom: float = RELIABLE_LIST_MIN_F1DOM) -> tuple[list[dict], dict]:
+    """Rows (RELIABLE_LIST_COLUMNS) of the features whose reliable_f1_dom_1 is
+    >= min_f1dom, by layer and then F1dom descending (ties by feature), and a
+    per-layer summary over all live features. ``rows_by_layer`` holds each
+    layer's dictionary rows as dicts."""
+    out: list[dict] = []
+    summary = {"min_reliable_f1_dom": min_f1dom, "cut": RELIABLE_LIST_CUT, "by_layer": {}}
+    for layer in sorted(rows_by_layer):
+        rows = rows_by_layer[layer]
+        best = [float(r["reliable_f1_dom_1"]) for r in rows if _is_number(r.get("reliable_f1_dom_1"))]
+        listed = sorted((r for r in rows if _is_number(r.get("reliable_f1_dom_1"))
+                         and r["reliable_f1_dom_1"] >= min_f1dom),
+                        key=lambda r: (-r["reliable_f1_dom_1"], r["feature_idx"]))
+        summary["by_layer"][str(layer)] = {
+            "n_live_features": len(rows), "n_with_reliable_association": len(best),
+            "median_best_reliable_f1_dom": float(np.median(best)) if best else math.nan,
+            **{f"n_best_reliable_f1_dom_ge_{level:g}": sum(b >= level for b in best)
+               for level in FINDING_10_LEVELS},
+            "n_listed": len(listed),
+        }
+        out += [{c: (layer if c == "layer" else r.get(c)) for c in RELIABLE_LIST_COLUMNS} for r in listed]
+    return out, summary
+
+
+def load_dictionary_rows(root: Path, layer: int) -> list[dict]:
+    """One layer's dictionary rows (``dictionary/layer_{L}.parquet``), schema-checked."""
+    import pyarrow.parquet as pq
+    path = root / "dictionary" / f"layer_{layer}.parquet"
+    table = pq.read_table(path)
+    meta = {k.decode(): v.decode() for k, v in (table.schema.metadata or {}).items()}
+    if meta.get("schema_version") != str(DICTIONARY_SCHEMA_VERSION) or meta.get("layer") != str(layer):
+        raise ValueError(f"{path}: dictionary schema {meta.get('schema_version')!r} / layer "
+                         f"{meta.get('layer')!r}, expected {DICTIONARY_SCHEMA_VERSION} / {layer}; rebuild it")
+    return table.to_pylist()
+
+
 def _write_csv(path: Path, columns: list[str], rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as fh:
@@ -1127,7 +1199,19 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--label-audit", action="store_true",
                         help="Finding 9: label-quality audit over a seeded sample of local spectra "
                              "(reads the extract chunks and labels; needs torch)")
+    parser.add_argument("--reliable-associations", action="store_true",
+                        help="V1-3b / Finding 10: list features whose best reliable concept association "
+                             "has F1dom >= 0.1 (reads the dictionaries)")
     args = parser.parse_args(argv)
+
+    if args.reliable_associations:
+        rows, summary = reliable_association_list(
+            {layer: load_dictionary_rows(args.root, layer) for layer in args.layers})
+        out_dir = args.root / "analysis"
+        _write_csv(out_dir / "reliable_associations.csv", RELIABLE_LIST_COLUMNS, rows)
+        (out_dir / "reliable_associations_summary.json").write_text(json.dumps(summary, indent=1))
+        print(json.dumps(summary, indent=1))
+        return
 
     if args.label_audit:
         summary = label_audit(args.root, seed=args.seed)

@@ -41,7 +41,10 @@ EVAL_SCHEMA_VERSION = 1
 
 # build_dictionary.py: dictionary/layer_{L}.parquet, the contract between the
 # pipeline and the inspector tool. Recorded in the parquet's schema metadata.
-DICTIONARY_SCHEMA_VERSION = 1
+# v2 (V1-3b): each top concept carries its reliability (chance_fraction_k,
+# meets_display_rule_k), reliable_* associations are added, and the metadata
+# holds the concept reliability records, the display rule and both sources.
+DICTIONARY_SCHEMA_VERSION = 2
 
 # inspector/runtime.py: the Explanation JSON returned by explain(), consumed by
 # the dashboard. Explanation.from_json rejects any other version.
@@ -49,7 +52,9 @@ DICTIONARY_SCHEMA_VERSION = 1
 # plus spectrum fields) instead of the full dictionary row; provenance carries
 # each dictionary's sha256 so full rows are read from the matching file; the
 # `attribution` key is replaced by `ablation` (exact ablation at the latent token).
-EXPLAIN_SCHEMA_VERSION = 2
+# v3 (V1-3b): summaries add top_concept_chance_fraction,
+# top_concept_meets_display_rule, reliable_concept and reliable_concept_f1_dom.
+EXPLAIN_SCHEMA_VERSION = 3
 
 # interpret.py: description runs live in interpret/layer_{L}/<run_tag>/. The
 # archive directory beside them keeps superseded runs as provenance; no stage

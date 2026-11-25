@@ -212,11 +212,16 @@ def _write_summary_dict(root: Path, provenances: list[str]) -> Path:
     table = pa.table({
         "layer": pa.array([2] * n, pa.int32()), "feature_idx": pa.array(list(range(7, 7 + n)), pa.int32()),
         "firing_rate": [0.01] * n, "concept_1": ["is_y_ion"] * n, "f1_dom_1": [0.5] * n,
+        "chance_fraction_1": [0.109] * n, "meets_display_rule_1": [True] * n,
+        "reliable_concept_1": ["is_y_ion"] * n, "reliable_f1_dom_1": [0.5] * n,
         "has_significant_association": [True] * n, "phase8_delta_ce": [None] * n,
         "description_blinded": [True] * n, "description_r": [float("nan")] * n,
         "description_beats_baseline": [None] * n, "latent_token_fraction": [None] * n,
         "description": ["fires on y ions"] + [None] * (n - 1), "causal_provenance": provenances,
-    }).replace_schema_metadata({"schema_version": str(DICTIONARY_SCHEMA_VERSION), "layer": "2"})
+    }).replace_schema_metadata({"schema_version": str(DICTIONARY_SCHEMA_VERSION), "layer": "2",
+                                "concept_reliability": json.dumps([
+                                    {"concept": "is_y_ion", "display_name": "is_y_ion", "chance_fraction": 0.109},
+                                    {"concept": "is_I_ion", "display_name": "immonium m/z window"}])})
     path = root / "dictionary" / "layer_2.parquet"
     pq.write_table(table, path)
     return path
@@ -229,6 +234,10 @@ def test_dictionary_summary_hash_and_causal_provenance(tmp_path):
     s = d.summary(7)
     assert tuple(s) == SUMMARY_KEYS
     assert s["in_dictionary"] and s["has_description"] and s["top_concept"] == "is_y_ion"
+    assert s["top_concept_chance_fraction"] == 0.109 and s["top_concept_meets_display_rule"] is True
+    assert s["reliable_concept"] == "is_y_ion" and s["reliable_concept_f1_dom"] == 0.5
+    assert d.concept_reliability()["is_y_ion"]["chance_fraction"] == 0.109
+    assert d.display_name("is_I_ion") == "immonium m/z window" and d.display_name(None) is None
     assert s["causal_delta_ce"] is None and s["description_r"] is None       # untested / NaN -> None
     assert not d.summary(8)["has_description"]
     absent = d.summary(99)
@@ -512,7 +521,7 @@ def test_schema_round_trips_and_is_bounded(inspector, chunk0):
           f"bound {inspector.json_size_bound:,}")
 
     data = json.loads(text)
-    assert data["schema_version"] == EXPLAIN_SCHEMA_VERSION == 2 and data["ablation"] is None
+    assert data["schema_version"] == EXPLAIN_SCHEMA_VERSION == 3 and data["ablation"] is None
     assert set(data["layers"]) == {str(L) for L in LAYERS}
     assert all(len(t["top"]) <= inspector.top_k for b in data["layers"].values() for t in b["tokens"])
     assert data["provenance"]["preprocessing"]["use_spectrum_utils"] is True
@@ -524,7 +533,7 @@ def test_schema_round_trips_and_is_bounded(inspector, chunk0):
             assert summary["n_tokens_active"] >= 1 and summary["max_activation"] > 0
 
     schema_1 = {k: v for k, v in data.items() if k != "ablation"} | {"attribution": None, "schema_version": 1}
-    for bad in ({**data, "schema_version": EXPLAIN_SCHEMA_VERSION + 1},
+    for bad in ({**data, "schema_version": EXPLAIN_SCHEMA_VERSION + 1}, {**data, "schema_version": 2},
                 {k: v for k, v in data.items() if k != "features"}, schema_1):
         with pytest.raises(ValueError):
             Explanation.from_dict(bad)

@@ -13,6 +13,13 @@ Columns (``<k>`` = 1..3)
     association  n_significant_concepts, has_significant_association,
                  concept_<k>, f1_dom_<k>, precision_<k>, recall_<k>, lift_<k>
                  (the three BH-significant concepts with the highest F1dom > 0),
+                 chance_fraction_<k>, meets_display_rule_<k> (that concept's
+                 reliability record),
+                 n_reliable_associations, reliable_concept_<k>,
+                 reliable_f1_dom_<k>, reliable_precision_<k>, reliable_recall_<k>,
+                 reliable_lift_<k>, reliable_chance_fraction_<k> (the same
+                 ranking restricted to concepts meeting the display rule; null
+                 reliable_concept_1 = no reliable association recorded),
                  latent_token_fraction (precision of the ``is_latent_token`` pair
                  when that pair is BH-significant, else null),
                  unexplained_mass_fraction (null when the CSV has none)
@@ -25,6 +32,20 @@ Columns (``<k>`` = 1..3)
                  unblinded_description_run_tag, unblinded_description_provenance
 
 What the columns do and do not claim
+    * Associations are Phase 4's: every BH-significant (feature, concept) pair
+      over the whole cluster corpus, computed from the annotator's labels, which
+      Finding 9 found partly wrong (two labelling bugs) and partly chance. Each
+      concept's reliability record comes from the label audit
+      (``analysis/label_audit/concept_reliability.csv``, 200 local spectra):
+      chance fraction with CI, positives a bug adds or hides, dependence on the
+      peptide, a display name for the re-documented m/z-window concepts
+      (is_I_ion, is_first_ion). The parquet metadata carries all records
+      (``concept_reliability``, JSON), the display rule with its reason
+      (``display_rule``) and both sources. The display rule (chance fraction
+      <= 0.2, no bug-added positives, peptide-dependent) only decides which
+      concepts may be shown as reliable associations; it is not a test, and the
+      chance fraction is always shown beside a concept. A reliable association
+      is usually weak (F1dom, precision and recall sit beside it; Finding 10).
     * precision = n_co / firing_count. recall = n_co / concept_count. The concept
       counts are not stored anywhere, so they are recovered exactly from the
       stored F1: F1 = 2 n_co / (firing_count + concept_count). Every pair of a
@@ -69,6 +90,8 @@ the write is atomic, so rerunning it is idempotent.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -81,6 +104,7 @@ import pyarrow.parquet as pq
 
 from analysis import (
     DEFAULT_ROOT,
+    DISPLAY_RULE,
     DEFAULT_SEED,
     LAYERS,
     load_report,
@@ -103,6 +127,10 @@ UNTESTED = "untested"
 # the 2,048 in chunks 0-1 carry a modification (132/1,024 and 76/1,024).
 PHASE8_TARGET_CAVEAT = "targets ignore modifications for ~10% of spectra (Finding 5)"
 
+_RELIABILITY_COLUMNS = ["concept", "display_name", "dependence", "positives", "determined_fraction",
+                        "chance_fraction", "ci_low", "ci_high", "internal_end_positives",
+                        "immonium_bug_positives", "immonium_bug_missed", "bug_share",
+                        "meets_display_rule", "reasons", "note"]
 _ASSOC_COLUMNS = ["feature_idx", "concept", "f1", "f1_dom", "lift", "n_co", "p_value_bh_significant"]
 _DESCRIPTION_COLUMNS = {"feature_idx", "stratum", "pearson_r", "n_predicted", "summary"}
 
@@ -117,6 +145,11 @@ def description_path(root: Path, layer: int, run_tag: str) -> Path:
 
 def dictionary_path(root: Path, layer: int) -> Path:
     return root / "dictionary" / f"layer_{layer}.parquet"
+
+
+def reliability_path(root: Path) -> Path:
+    """The label audit's concept reliability table (analysis.py --label-audit)."""
+    return root / "analysis" / "label_audit" / "concept_reliability.csv"
 
 
 def _causal_provenance(n_spectra: int) -> str:
@@ -166,9 +199,14 @@ def concept_counts(assoc: pd.DataFrame, firing_count: np.ndarray, layer: int) ->
 
 
 def top_concepts(assoc: pd.DataFrame, features: np.ndarray, firing_count: np.ndarray,
-                 counts: dict[str, int]) -> dict[str, pd.Series]:
-    """concept_k / f1_dom_k / precision_k / recall_k / lift_k columns, aligned to ``features``."""
-    sig = assoc[assoc["significant"] & (assoc["f1_dom"] > 0)].copy()
+                 counts: dict[str, int], concepts: set[str] | None = None,
+                 prefix: str = "") -> dict[str, pd.Series]:
+    """<prefix>concept_k / f1_dom_k / precision_k / recall_k / lift_k columns,
+    aligned to ``features``; ``concepts`` restricts the ranking to those concepts."""
+    sig = assoc[assoc["significant"] & (assoc["f1_dom"] > 0)]
+    if concepts is not None:
+        sig = sig[sig["concept"].isin(concepts)]
+    sig = sig.copy()
     sig = sig.sort_values(["feature_idx", "f1_dom", "concept"], ascending=[True, False, True],
                           kind="stable")
     sig["position"] = sig.groupby("feature_idx").cumcount()
@@ -177,10 +215,72 @@ def top_concepts(assoc: pd.DataFrame, features: np.ndarray, firing_count: np.nda
     out: dict[str, pd.Series] = {}
     for k in range(TOP_CONCEPTS):
         rank = sig[sig["position"] == k].set_index("feature_idx").reindex(features)
-        out[f"concept_{k + 1}"] = rank["concept"]
+        out[f"{prefix}concept_{k + 1}"] = rank["concept"]
         for name in ("f1_dom", "precision", "recall", "lift"):
-            out[f"{name}_{k + 1}"] = rank[name]
+            out[f"{prefix}{name}_{k + 1}"] = rank[name]
     return out
+
+
+def load_reliability(path: Path, assoc_concepts: set[str], layer: int) -> pd.DataFrame:
+    """The concept reliability table, indexed by concept. Every concept in the
+    associations must have a record; loud on anything that does not fit."""
+    if not path.is_file():
+        raise FileNotFoundError(f"concept reliability table not found: {path}; write it with "
+                                f"`python -m analysis --label-audit`")
+    frame = pd.read_csv(path)
+    missing = set(_RELIABILITY_COLUMNS) - set(frame.columns)
+    if missing:
+        raise ValueError(f"{path}: missing columns {sorted(missing)}")
+    if not frame["concept"].is_unique:
+        raise ValueError(f"{path}: duplicate concept rows")
+    absent = sorted(assoc_concepts - set(frame["concept"]))
+    if absent:
+        raise ValueError(f"layer {layer}: concepts without a reliability record in {path}: {absent}")
+    flags = frame["meets_display_rule"].astype(str).str.lower()
+    if not flags.isin(["true", "false"]).all():
+        raise ValueError(f"{path}: meets_display_rule must be True/False")
+    frame["meets_display_rule"] = flags.eq("true")
+    for col in ("reasons", "note"):
+        frame[col] = frame[col].fillna("").astype(str)
+    return frame[_RELIABILITY_COLUMNS].set_index("concept")
+
+
+def reliability_columns(top: dict[str, pd.Series], assoc: pd.DataFrame, features: np.ndarray,
+                        firing_count: np.ndarray, counts: dict[str, int],
+                        reliability: pd.DataFrame) -> dict[str, pd.Series]:
+    """chance_fraction_k / meets_display_rule_k beside the top 3, and the
+    reliable_* ranking over the concepts that meet the display rule."""
+    chance = reliability["chance_fraction"]
+    meets = reliability["meets_display_rule"]
+    reliable = set(meets.index[meets])
+    out: dict[str, pd.Series] = {}
+    for k in range(1, TOP_CONCEPTS + 1):
+        concept = top[f"concept_{k}"]
+        out[f"chance_fraction_{k}"] = concept.map(chance)
+        out[f"meets_display_rule_{k}"] = concept.map(meets).astype(object).where(concept.notna(), None)
+    sig = assoc[assoc["significant"] & (assoc["f1_dom"] > 0) & assoc["concept"].isin(reliable)]
+    out["n_reliable_associations"] = sig.groupby("feature_idx").size().reindex(features, fill_value=0)
+    rel = top_concepts(assoc, features, firing_count, counts, concepts=reliable, prefix="reliable_")
+    out.update(rel)
+    for k in range(1, TOP_CONCEPTS + 1):
+        out[f"reliable_chance_fraction_{k}"] = rel[f"reliable_concept_{k}"].map(chance)
+    return out
+
+
+def reliability_records(reliability: pd.DataFrame) -> list[dict]:
+    """The reliability table as JSON-ready records (NaN -> None), for the metadata."""
+    frame = reliability.reset_index()
+    records = []
+    for rec in frame.to_dict("records"):
+        clean = {}
+        for key, value in rec.items():
+            if isinstance(value, (np.integer, np.floating, np.bool_)):
+                value = value.item()
+            if isinstance(value, float) and np.isnan(value):
+                value = None
+            clean[key] = value
+        records.append(clean)
+    return records
 
 
 def latent_token_fraction(assoc: pd.DataFrame, features: np.ndarray,
@@ -296,9 +396,15 @@ _SCHEMA = pa.schema([
     ("layer", pa.int32()), ("feature_idx", pa.int32()), ("firing_count", pa.int64()),
     ("firing_rate", pa.float64()), ("n_significant_concepts", pa.int32()),
     ("has_significant_association", pa.bool_()),
-    *[(name, pa.string() if name.startswith("concept_") else pa.float64())
-      for k in range(1, TOP_CONCEPTS + 1)
-      for name in (f"concept_{k}", f"f1_dom_{k}", f"precision_{k}", f"recall_{k}", f"lift_{k}")],
+    *[field for k in range(1, TOP_CONCEPTS + 1) for field in (
+        (f"concept_{k}", pa.string()), (f"f1_dom_{k}", pa.float64()), (f"precision_{k}", pa.float64()),
+        (f"recall_{k}", pa.float64()), (f"lift_{k}", pa.float64()),
+        (f"chance_fraction_{k}", pa.float64()), (f"meets_display_rule_{k}", pa.bool_()))],
+    ("n_reliable_associations", pa.int32()),
+    *[field for k in range(1, TOP_CONCEPTS + 1) for field in (
+        (f"reliable_concept_{k}", pa.string()), (f"reliable_f1_dom_{k}", pa.float64()),
+        (f"reliable_precision_{k}", pa.float64()), (f"reliable_recall_{k}", pa.float64()),
+        (f"reliable_lift_{k}", pa.float64()), (f"reliable_chance_fraction_{k}", pa.float64()))],
     ("latent_token_fraction", pa.float64()), ("unexplained_mass_fraction", pa.float64()),
     ("causal_measured", pa.bool_()), ("phase8_delta_ce", pa.float64()),
     ("phase8_n_spectra", pa.int64()), ("causal_provenance", pa.string()),
@@ -320,8 +426,10 @@ def _array(values, dtype: pa.DataType) -> pa.Array:
 
 def build_layer(root: Path, layer: int, seed: int = DEFAULT_SEED,
                 unblinded_run: str | None = None,
-                blinded_run: str | None = None) -> pa.Table:
-    """Build one layer's dictionary table (see the module docstring)."""
+                blinded_run: str | None = None,
+                concept_reliability: Path | None = None) -> pa.Table:
+    """Build one layer's dictionary table (see the module docstring).
+    ``concept_reliability`` defaults to ``reliability_path(root)``."""
     ev = eval_dir(root, layer, seed)
     report = load_report(ev / "report.json")
     stats = pd.read_csv(ev / "per_feature_stats.csv")
@@ -339,6 +447,9 @@ def build_layer(root: Path, layer: int, seed: int = DEFAULT_SEED,
 
     counts = concept_counts(assoc, firing_count, layer)
     top = top_concepts(assoc, features, firing_count, counts)
+    rel_path = Path(concept_reliability) if concept_reliability is not None else reliability_path(root)
+    reliability = load_reliability(rel_path, set(assoc["concept"]), layer)
+    rel_cols = reliability_columns(top, assoc, features, firing_count, counts, reliability)
     latent = latent_token_fraction(assoc, features, firing_count)
     causal = causal_columns(report, layer, features)
 
@@ -368,7 +479,7 @@ def build_layer(root: Path, layer: int, seed: int = DEFAULT_SEED,
         "firing_count": live["firing_count"], "firing_rate": live["firing_rate"],
         "n_significant_concepts": live["n_significant_concepts"],
         "has_significant_association": live["n_significant_concepts"] > 0,
-        **top,
+        **top, **rel_cols,
         "latent_token_fraction": latent,
         "unexplained_mass_fraction": live["unexplained_mass_fraction"],
         **causal, **desc,
@@ -380,8 +491,30 @@ def build_layer(root: Path, layer: int, seed: int = DEFAULT_SEED,
         "n_tokens": str(report["phase_1_2"]["n_tokens"]), "n_live_features": str(n),
         "report": report_path(Path(), layer, seed).as_posix(),
         "unblinded_run": unblinded_run or "", "blinded_run": blinded_run or "",
+        "association_source": (
+            f"Phase 4 feature_label_associations.csv: every BH-significant (feature, concept) pair at "
+            f"q = {report.get('config', {}).get('fdr_q', 'unrecorded')} over "
+            f"{int(report['phase_1_2']['n_tokens']):,} tokens (every chunk of the cluster run, "
+            f"including the test split, Finding 7), from the annotator's labels (Finding 9)"),
+        "concept_reliability_source": (
+            f"{_display_path(rel_path, root)} sha256 {_sha256_16(rel_path)}: label audit of a seeded "
+            f"sample of local spectra (Finding 9; STATUS V1-3b)"),
+        "display_rule": DISPLAY_RULE,
+        "concept_reliability": json.dumps(reliability_records(reliability), allow_nan=False),
     }
     return table.replace_schema_metadata(metadata)
+
+
+def _sha256_16(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
+
+
+def _display_path(path: Path, root: Path) -> str:
+    """``path`` relative to the output root when it lies under it (no personal paths)."""
+    try:
+        return Path(path).resolve().relative_to(Path(root).resolve()).as_posix()
+    except ValueError:
+        return Path(path).name
 
 
 def write_atomic(table: pa.Table, path: Path) -> None:
@@ -410,16 +543,22 @@ def main(argv: list[str] | None = None) -> None:
                              "default none")
     parser.add_argument("--blinded-run", type=_run_tag, default=None,
                         help="description run tag written blind; takes precedence; default none")
+    parser.add_argument("--concept-reliability", type=Path, default=None,
+                        help="concept reliability table (default <root>/analysis/label_audit/"
+                             "concept_reliability.csv, written by analysis.py --label-audit)")
     args = parser.parse_args(argv)
 
     for layer in args.layers:
-        table = build_layer(args.root, layer, args.seed, args.unblinded_run, args.blinded_run)
+        table = build_layer(args.root, layer, args.seed, args.unblinded_run, args.blinded_run,
+                            args.concept_reliability)
         out = dictionary_path(args.root, layer)
         write_atomic(table, out)
         measured = int(pc.sum(table["causal_measured"]).as_py())
         described = table.num_rows - table["description"].null_count
+        reliable = table.num_rows - table["reliable_concept_1"].null_count
         print(f"layer {layer}: {table.num_rows} live features, "
-              f"{measured} with measured Phase 8 delta-CE, {described} described -> {out}")
+              f"{measured} with measured Phase 8 delta-CE, {described} described, "
+              f"{reliable} with a reliable association -> {out}")
 
 
 if __name__ == "__main__":

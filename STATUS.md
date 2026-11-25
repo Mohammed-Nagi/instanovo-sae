@@ -205,6 +205,35 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-4a, V1-4b.
       misassignment better (Finding 8(d)). Chance fractions exclude
       composition-determined ions, so is_first_ion's 0.830 is its small b1
       remainder.
+      Part B, dictionary (schema 2; `build_dictionary` reads the reliability
+      table, required, default `analysis/label_audit/concept_reliability.csv`,
+      `--concept-reliability` to override). Existing columns unchanged; beside
+      each top concept `chance_fraction_k` and `meets_display_rule_k`; new
+      `n_reliable_associations` and `reliable_concept_k` / `reliable_f1_dom_k` /
+      `reliable_precision_k` / `reliable_recall_k` / `reliable_lift_k` /
+      `reliable_chance_fraction_k` (k = 1–3: the same ranking as the top 3,
+      restricted to the 8 concepts meeting the rule; null `reliable_concept_1`
+      = "no reliable association recorded"). Metadata: `concept_reliability`
+      (the 50 records as JSON, with display names), `display_rule`,
+      `concept_reliability_source` (path, sha256) and `association_source`.
+      `inspector.dictionary`: summaries add `top_concept_chance_fraction`,
+      `top_concept_meets_display_rule`, `reliable_concept` and
+      `reliable_concept_f1_dom` (Explanation schema 3); `concept_reliability()`
+      and `display_name()` read the metadata. Rebuilt all four layers
+      (`--layers 2 4 6 --blinded-run blind_v1`, then `--layers 8`): every
+      pre-existing column identical to the schema-1 files; metadata differs only
+      in `schema_version` plus the new keys. Live features with a reliable
+      association 4,078 / 4,278 / 4,455 / 5,491 of 6,962 / 7,474 / 7,811 / 8,732
+      at L2/4/6/8; top-3 entries meeting the rule 2,239 / 2,543 / 2,986 / 4,347.
+      These associations are weak (Finding 10). `python -m analysis --root
+      sae_pipeline_outputs --reliable-associations` lists the features whose best
+      reliable F1dom is ≥ 0.1 (a listing cut set for later use, demo set and
+      feature cards; not a reliability claim): `analysis/reliable_associations.csv`
+      (44 / 47 / 62 / 97 rows; reliable concepts, causal and description
+      fields) and `reliable_associations_summary.json`. Of the 250 listed, 145
+      have a Phase 8 ΔCE and 45 a description; the six ≥ 0.3 are is_y_ion
+      except L8 F5107 (cleaves_N_to_Pro), and include the Finding 2 hubs L4
+      F11376 and L6 F9282 / F10689.
 - [x] **V1-4a Runtime forward pass** (`2a3166c`) — `src/inspector/runtime.py`,
       `dictionary.py`. Input: a raw spectrum (m/z array, intensity array,
       precursor m/z, charge), preprocessed by InstaNovo's own pipeline via
@@ -910,6 +939,23 @@ stated, with the tests that show it (V1-4a's in `tests/test_inspector_runtime.py
   column is unchanged (rerun compared byte for byte). Shown by
   `test_immonium_fix_counts_toy`, `test_concept_reliability_display_rule`,
   `test_concept_reliability_requires_every_concept` and the existing audit tests.
+- V1-3b, `build_dictionary.py`: dictionary schema 2 (reliability columns and
+  metadata added; existing columns unchanged, shown on the rebuilt local files
+  and by the existing dictionary tests). The concept reliability table is a new
+  required input (the build fails without it, or if an associated concept has
+  no record). `top_concepts` gets an optional concept filter and column prefix
+  (defaults unchanged). Schema-1 dictionaries are rejected by the tool until
+  rebuilt. Shown by the new `test_build_dictionary.py` reliability tests.
+- V1-3b, `inspector/dictionary.py` and `runtime.py`: Explanation schema 3 (four
+  summary keys added, `json_size_bound` covers them); schema 2 is rejected. The
+  saved V1-4c `analysis/v1_4c/explanations/*.json` stay schema 2 on disk;
+  nothing reads them through `from_json`, and part B must read their prediction
+  as raw JSON. `feature_row` on them now fails by design (dictionary hash
+  changed). Shown by `test_dictionary_summary_hash_and_causal_provenance` and
+  the explain() schema test.
+- V1-3b, `analysis.py`: new `--reliable-associations` mode
+  (`reliable_association_list`, `load_dictionary_rows`); existing modes
+  unchanged. Shown by `test_reliable_association_list_cut_order_and_summary`.
 
 ## Backlog (after v1; do not start early)
 

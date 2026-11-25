@@ -16,6 +16,7 @@ explanation's ``sha256_16`` against this file's (``runtime.feature_row``).
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 from pathlib import Path
 
@@ -23,13 +24,18 @@ import pyarrow.parquet as pq
 
 from schema import DICTIONARY_SCHEMA_VERSION
 
-# Summary key -> dictionary column. Association with its effect size, causal
-# coverage (null = untested, never "not important"), description coverage and
-# score: the evidence indicators a panel shows without the full row.
+# Summary key -> dictionary column. Association with its effect size and the
+# concept's chance fraction (V1-3b), the best association passing the display
+# rule, causal coverage (null = untested, never "not important"), description
+# coverage and score: the evidence indicators a panel shows without the full row.
 SUMMARY_FIELDS = {
     "firing_rate": "firing_rate",
     "top_concept": "concept_1",
     "top_concept_f1_dom": "f1_dom_1",
+    "top_concept_chance_fraction": "chance_fraction_1",
+    "top_concept_meets_display_rule": "meets_display_rule_1",
+    "reliable_concept": "reliable_concept_1",
+    "reliable_concept_f1_dom": "reliable_f1_dom_1",
     "has_significant_association": "has_significant_association",
     "causal_delta_ce": "phase8_delta_ce",
     "description_blinded": "description_blinded",
@@ -119,6 +125,21 @@ class FeatureDictionary:
         except KeyError as exc:
             raise KeyError(f"layer {self.layer} dictionary has no column {exc}") from None
         return {"in_dictionary": True, "has_description": row.get("description") is not None, **mapped}
+
+    def concept_reliability(self) -> dict[str, dict]:
+        """The concept reliability records from the metadata (V1-3b), keyed by
+        concept: display name, chance fraction with CI, bug counts, dependence,
+        whether the concept meets the display rule, reasons and notes."""
+        text = self.metadata.get("concept_reliability")
+        if text is None:
+            raise KeyError(f"layer {self.layer} dictionary metadata has no concept_reliability")
+        return {rec["concept"]: rec for rec in json.loads(text)}
+
+    def display_name(self, concept: str | None) -> str | None:
+        """The name the tool shows for a concept (re-documented ones differ from the key)."""
+        if concept is None:
+            return None
+        return self.concept_reliability()[concept]["display_name"]
 
     def causal_provenance(self) -> str | None:
         """The provenance string shared by every causally measured feature, or

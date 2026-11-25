@@ -301,3 +301,29 @@ def test_description_runs_are_never_read_from_the_archive(tmp_path, tag):
     with pytest.raises(ValueError, match="archive"):
         analysis.description_run_path(tmp_path, 2, tag)
     assert analysis.description_run_path(tmp_path, 2, "blind_v1").parent.name == "blind_v1"
+
+
+# --- Reliable-association list (V1-3b, Finding 10) ----------------------------------
+
+def test_reliable_association_list_cut_order_and_summary():
+    import math
+    import analysis
+
+    def row(f, best, concept="is_y_ion"):
+        return {"feature_idx": f, "firing_rate": 0.01, "n_reliable_associations": 0 if best is None else 1,
+                "reliable_concept_1": None if best is None else concept, "reliable_f1_dom_1": best,
+                "concept_1": "mz_low", "description": None}
+
+    rows = {8: [row(1, 0.1), row(2, 0.35), row(3, 0.0999), row(4, None), row(5, 0.35)],
+            2: [row(9, float("nan")), row(10, 0.01)]}
+    out, summary = analysis.reliable_association_list(rows)
+    assert [(r["layer"], r["feature_idx"]) for r in out] == [(8, 2), (8, 5), (8, 1)]   # inclusive cut
+    assert list(out[0]) == analysis.RELIABLE_LIST_COLUMNS and out[0]["reliable_concept_2"] is None
+    s8, s2 = summary["by_layer"]["8"], summary["by_layer"]["2"]
+    assert s8["n_live_features"] == 5 and s8["n_with_reliable_association"] == 4
+    assert s8["median_best_reliable_f1_dom"] == pytest.approx((0.1 + 0.35) / 2)
+    assert s8["n_best_reliable_f1_dom_ge_0.1"] == 3 and s8["n_best_reliable_f1_dom_ge_0.3"] == 2
+    assert s2["n_listed"] == 0 and s2["n_with_reliable_association"] == 1
+    assert summary["min_reliable_f1_dom"] == 0.1 and "not a reliability claim" in summary["cut"]
+    assert math.isnan(analysis.reliable_association_list({4: [row(1, None)]})[1]["by_layer"]["4"][
+        "median_best_reliable_f1_dom"])

@@ -9,6 +9,8 @@ every derived number can be checked by hand:
     concept token counts: A = 100, B = 50, is_latent_token = 30
     (feature, concept, n_co): (0,A,8) (0,B,2) (2,latent,15) (2,A,10) (2,B,5)
                               (3,B,5) (5,latent,1; not BH-significant)
+    concept reliability: A meets the display rule (chance 0.1), B does not
+    (chance 0.3), is_latent_token is structural (no chance fraction)
 """
 from __future__ import annotations
 
@@ -65,6 +67,19 @@ def _report() -> dict:
     }
 
 
+def _reliability_row(concept: str, chance: float, meets: bool, reasons: str = "") -> dict:
+    return {"concept": concept, "display_name": concept, "label_classes": "b", "dependence": "peptide-dependent",
+            "positives": 100, "determined_fraction": 0.0, "chance_fraction": chance, "ci_low": chance - 0.05,
+            "ci_high": chance + 0.05, "internal_end_positives": 0, "immonium_bug_positives": 0,
+            "immonium_bug_missed": 0, "bug_share": 0.0, "meets_display_rule": meets, "reasons": reasons,
+            "note": ""}
+
+
+RELIABILITY = [_reliability_row("A", 0.1, True), _reliability_row("B", 0.3, False, "chance fraction 0.30 > 0.2"),
+               dict(_reliability_row("is_latent_token", float("nan"), False, "structural (latent token)"),
+                    dependence="structural (latent token)", determined_fraction=float("nan"))]
+
+
 def _descriptions(rows: list[tuple[int, str, float]], blind: bool = False) -> pd.DataFrame:
     # interpret.py writes the `blind` column for every run (build_dictionary requires it).
     return pd.DataFrame({
@@ -88,6 +103,9 @@ def tree(tmp_path) -> Path:
         "n_significant_concepts": [int(n_sig.get(i, 0)) for i in range(6)],
         "unexplained_mass_fraction": [0.5, "", "", 0.9, "", 0.2], "unexplained_enrichment": "",
     }).to_csv(ev / "per_feature_stats.csv", index=False)
+    audit = tmp_path / "analysis" / "label_audit"
+    audit.mkdir(parents=True)
+    pd.DataFrame(RELIABILITY).to_csv(audit / "concept_reliability.csv", index=False)
     for tag, rows in {"unblinded_v1": [(0, "u0", 0.5), (2, "u2", 0.4)],
                       "blinded_v1": [(2, "b2", 0.3)]}.items():
         run = tmp_path / "interpret" / "layer_2" / tag
@@ -176,6 +194,77 @@ def test_significant_pair_count_disagreement_fails_loudly(tree):
                  lambda f: f.__setitem__("n_significant_concepts", 7))
     with pytest.raises(ValueError, match="n_significant_concepts"):
         _build(tree)
+
+
+# --- concept reliability (V1-3b) -----------------------------------------------------
+
+
+def test_top_concepts_carry_their_reliability(tree):
+    d = _build(tree)
+    assert d.loc[0, "chance_fraction_1"] == pytest.approx(0.1) and d.loc[0, "meets_display_rule_1"] == True
+    assert d.loc[0, "chance_fraction_2"] == pytest.approx(0.3) and d.loc[0, "meets_display_rule_2"] == False
+    assert pd.isna(d.loc[2, "chance_fraction_2"]) and d.loc[2, "meets_display_rule_2"] == False  # latent
+    assert pd.isna(d.loc[0, "meets_display_rule_3"])                   # no third concept
+    assert pd.isna(d.loc[5, "meets_display_rule_1"])                   # no significant association
+
+
+def test_reliable_associations_use_only_display_rule_concepts(tree):
+    d = _build(tree)
+    assert list(d["n_reliable_associations"]) == [1, 1, 0, 0]
+    assert d.loc[0, "reliable_concept_1"] == "A" and d.loc[0, "reliable_f1_dom_1"] == 0.5
+    assert d.loc[0, "reliable_precision_1"] == pytest.approx(8 / 10)
+    assert d.loc[0, "reliable_recall_1"] == pytest.approx(8 / 100)
+    assert d.loc[0, "reliable_lift_1"] == 3.0
+    assert d.loc[0, "reliable_chance_fraction_1"] == pytest.approx(0.1)
+    assert pd.isna(d.loc[0, "reliable_concept_2"])
+    # feature 2: A (0.6) is reliable; the latent concept ranked second is not
+    assert d.loc[2, "reliable_concept_1"] == "A" and pd.isna(d.loc[2, "reliable_concept_2"])
+    # feature 3's only association (B) fails the rule: no reliable association recorded
+    assert d.loc[3, "concept_1"] == "B" and pd.isna(d.loc[3, "reliable_concept_1"])
+    assert pd.isna(d.loc[3, "reliable_f1_dom_1"])
+
+
+def test_reliable_ranking_follows_f1dom(tree):
+    path = tree / "analysis" / "label_audit" / "concept_reliability.csv"
+    _rewrite_csv(path, lambda f: f.__setitem__("meets_display_rule", True))
+    d = _build(tree)
+    assert (d.loc[0, "reliable_concept_1"], d.loc[0, "reliable_concept_2"]) == ("A", "B")
+    assert (d.loc[2, "reliable_concept_1"], d.loc[2, "reliable_concept_2"]) == ("A", "is_latent_token")
+    assert d.loc[3, "reliable_concept_1"] == "B" and list(d["n_reliable_associations"]) == [2, 2, 1, 0]
+
+
+def test_metadata_carries_the_reliability_records_and_rule(tree):
+    import analysis
+    table = bd.build_layer(tree, 2, unblinded_run=None)
+    meta = {k.decode(): v.decode() for k, v in table.schema.metadata.items()}
+    records = {r["concept"]: r for r in json.loads(meta["concept_reliability"])}
+    assert set(records) == {"A", "B", "is_latent_token"}
+    assert records["A"]["meets_display_rule"] is True and records["A"]["chance_fraction"] == pytest.approx(0.1)
+    assert records["is_latent_token"]["chance_fraction"] is None
+    assert records["B"]["reasons"] == "chance fraction 0.30 > 0.2"
+    assert meta["display_rule"] == analysis.DISPLAY_RULE
+    assert meta["concept_reliability_source"].startswith("analysis/label_audit/concept_reliability.csv sha256 ")
+    assert "q = " in meta["association_source"] and "1,000 tokens" in meta["association_source"]
+
+
+def test_missing_reliability_table_raises(tree):
+    (tree / "analysis" / "label_audit" / "concept_reliability.csv").unlink()
+    with pytest.raises(FileNotFoundError, match="concept reliability"):
+        _build(tree)
+
+
+def test_concept_without_a_reliability_record_raises(tree):
+    path = tree / "analysis" / "label_audit" / "concept_reliability.csv"
+    pd.DataFrame(RELIABILITY[:1] + RELIABILITY[2:]).to_csv(path, index=False)
+    with pytest.raises(ValueError, match="without a reliability record.*'B'"):
+        _build(tree)
+
+
+def test_reliability_table_path_can_be_given(tree, tmp_path_factory):
+    other = tmp_path_factory.mktemp("rel") / "table.csv"
+    pd.DataFrame([dict(r, meets_display_rule=False) for r in RELIABILITY]).to_csv(other, index=False)
+    d = bd.build_layer(tree, 2, concept_reliability=other).to_pandas()
+    assert d["reliable_concept_1"].isna().all() and (d["n_reliable_associations"] == 0).all()
 
 
 # --- causal columns ----------------------------------------------------------------

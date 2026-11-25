@@ -25,6 +25,7 @@ import socket
 import types
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -918,3 +919,50 @@ def test_schema2_round_trip_bounded_with_latent_ablation(inspector, explained_la
 def test_explain_with_latent_ablation_makes_no_network_calls(explained_latent):
     _spec, exp = explained_latent        # built under no_network()
     assert set(exp.ablation["layers"]) == {str(L) for L in LAYERS}
+
+
+# --- V1-4c descriptive checks, toy inputs ---------------------------------------------
+
+def test_control_pool_nearest_rank_with_activation_floor():
+    from inspector.runtime import control_pool
+    acts = {1: 10.0, 2: 9.0, 3: 8.0, 4: 6.0, 5: 4.9, 6: 1.0}
+    # named 3 (8.0): floor 4.0 drops 6; 5 qualifies (4.9); nearest ranks 2, 4 (distance 1, 2 wins the tie), then 1, 5
+    assert control_pool(acts, {3}, 3) == [2, 4, 1, 5]
+    assert control_pool(acts, {3}, 3, size=2) == [2, 4]
+    # a rank-1 named feature only has weaker members; floor 0.5 x 10 = 5 keeps 2, 3, 4
+    assert control_pool(acts, {1}, 1) == [2, 3, 4]
+    # other named features at the token are excluded
+    assert control_pool(acts, {1, 2}, 1) == [3, 4]
+
+
+def test_n_distinct_control_sets():
+    from inspector.runtime import n_distinct_control_sets
+    # three items at one token sharing a 4-feature pool: C(4, 3) = 4 sets
+    assert n_distinct_control_sets([(0, [1, 2, 3, 4])] * 3) == 4
+    # two tokens: the same feature id at different tokens is a different pair
+    assert n_distinct_control_sets([(5, [1, 2]), (6, [1, 2])]) == 4
+    assert n_distinct_control_sets([(5, [1, 2, 3])] * 2, cap=2) == 2
+
+
+def test_peptide_decoys_keep_composition_and_termini():
+    from inspector.runtime import peptide_decoys
+    rng = np.random.default_rng(0)
+    pep = ["[UNIMOD:1]", "P", "E", "Q[UNIMOD:7]", "T", "I", "D", "K"]
+    ds = peptide_decoys(pep, 5, rng, exclude=[pep])
+    assert len({tuple(d) for d in ds}) == 5
+    for d in ds:
+        assert d[0] == "[UNIMOD:1]" and d[-1] == "K" and sorted(d) == sorted(pep) and d != pep
+    with pytest.raises(RuntimeError):
+        peptide_decoys(["A", "G", "K"], 5, rng, exclude=[])
+
+
+def test_run_spectrum_utils_max_isotope_flag():
+    # y2 of PEPTIDEK = E + K + H2O + proton; only its 13C peak is present
+    y2 = 129.042593 + 128.094963 + 18.010565 + 1.007276
+    mz = torch.tensor([y2 + 1.003355], dtype=torch.float64)
+    common = dict(proforma="PEPTIDEK", mz_array=mz, intensity_array=torch.tensor([1.0]),
+                  precursor_mz=465.7378, precursor_charge=2, ion_types="by",
+                  fragment_tol_mass=20.0, fragment_tol_mode="ppm", enable_internal=False, strict=True)
+    assert annotate.run_spectrum_utils(**common)[0]["ion_type"] == "noise"
+    hit = annotate.run_spectrum_utils(**common, max_isotope=1)[0]
+    assert (hit["ion_type"], hit["ion_index"]) == ("y", 2)

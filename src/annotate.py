@@ -579,8 +579,12 @@ def run_spectrum_utils(
     fragment_tol_mode: str,
     enable_internal: bool,
     strict: bool = False,
+    max_isotope: int = 0,
 ) -> list[dict]:
     """Annotate one spectrum and return a flat label dict per peak.
+
+    max_isotope (default 0, the pipeline's setting) is passed to spectrum_utils;
+    1 also matches the first 13C isotope peak of each fragment (V1-4c check).
 
     strict=False (the batch annotator) turns a spectrum_utils failure into an
     all-noise result with a warning, so one bad peptide cannot stop a run.
@@ -609,7 +613,7 @@ def run_spectrum_utils(
             fragment_tol_mass,
             fragment_tol_mode,
             ion_types=annotation_ion_types,
-            max_isotope=0,                               # monoisotopic fragments only
+            max_isotope=max_isotope,                     # 0 = monoisotopic only (pipeline default)
             neutral_losses=NEUTRAL_LOSSES,
         )
     except Exception as exc:

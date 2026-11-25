@@ -1539,6 +1539,199 @@ def case_view(inspector: Inspector, exp: Explanation, cand: dict) -> str:
     return "\n".join(out) + "\n"
 
 
+# --- V1-4c descriptive checks (no ablation) ----------------------------------------
+
+POOL_SIZE = 10               # control pool: nearest-rank non-named active features
+POOL_MIN_RATIO = 0.5         # pool members need activation >= 0.5 x the named one (judgement call)
+POOL_MIN_SIZE = 3            # fewer qualifying members -> the item's control is underpowered
+
+
+def control_pool(row_acts: dict[int, float], named: set[int], feature: int,
+                 size: int = POOL_SIZE, min_ratio: float = POOL_MIN_RATIO) -> list[int]:
+    """Activation-matched control pool for one named (feature, token): the
+    `size` non-named active features at the token nearest in activation rank to
+    `feature`, among those with activation >= min_ratio x its activation (ties
+    in rank distance go to the higher activation)."""
+    order = sorted(row_acts, key=lambda f: -row_acts[f])
+    rank = {f: i for i, f in enumerate(order)}
+    floor = min_ratio * row_acts[feature]
+    cands = [f for f in order if f not in named and row_acts[f] >= floor]
+    return sorted(cands, key=lambda f: (abs(rank[f] - rank[feature]), rank[f]))[:size]
+
+
+def n_distinct_control_sets(pools: list[tuple[int, list[int]]], cap: int = 10_000) -> int:
+    """Distinct control sets: one member per named item from its pool, no
+    (feature, token) pair twice. pools = [(token, pool)]. Counted up to `cap`."""
+    seen: set[frozenset] = set()
+
+    def walk(i, chosen):
+        if len(seen) >= cap:
+            return
+        if i == len(pools):
+            seen.add(frozenset(chosen))
+            return
+        tok, pool = pools[i]
+        for f in pool:
+            if (f, tok) not in chosen:
+                walk(i + 1, chosen | {(f, tok)})
+
+    walk(0, frozenset())
+    return len(seen)
+
+
+def peptide_decoys(tokens: list[str], n: int, rng: np.random.Generator,
+                   exclude: list[list[str]], max_tries: int = 1000) -> list[list[str]]:
+    """n distinct same-composition decoys: the C-terminal residue (and an
+    N-terminal modification token) kept in place, the rest shuffled, each
+    residue keeping its modification; decoys equal (I = L) to any of `exclude`
+    are skipped."""
+    lead = tokens[:1] if not tokens[0][0].isalpha() else []
+    core, tail = tokens[len(lead):-1], tokens[-1:]
+    banned = {tuple(normalise_peptide(e)) for e in exclude}
+    out, seen = [], set()
+    for _ in range(max_tries):
+        d = lead + [core[i] for i in rng.permutation(len(core))] + tail
+        key = tuple(normalise_peptide(d))
+        if key in banned or key in seen:
+            continue
+        seen.add(key)
+        out.append(d)
+        if len(out) == n:
+            return out
+    raise RuntimeError(f"only {len(out)} distinct decoys of {tokens} after {max_tries} tries")
+
+
+def _is_fragment(ann: dict) -> bool:
+    return ann["ion_type"] in FRAGMENT_ION_TYPES
+
+
+def audit_descriptive_checks(inspector: Inspector, parquet_path: Path, candidates_csv: Path,
+                             hypotheses: dict, isotope_rows: list[int], decoy_rows: list[int],
+                             n_decoys: int = 20, seed: int = 0) -> dict:
+    """V1-4c checks before part B, none of which ablates:
+    isotope: each row re-annotated under the prediction with max_isotope=1;
+      true-only peaks (fragment under the true peptide, not under the
+      prediction at max_isotope 0) that become a fragment of the prediction
+      (necessarily an isotope-1 match), plus pred-only vs true-only b/y counts
+      and the precursor ppm at isotope offsets 0 and 1.
+    decoys: peaks labelled internal (and any fragment) under n same-composition
+      decoys of the prediction, against the prediction and the true peptide.
+    pools: per hypothesis item, L0 at the token, the named feature's activation
+      rank, the control pool (control_pool) and whether it is underpowered;
+      per hypothesis, the number of distinct control sets."""
+    import csv
+    rs = inspector.residue_set
+    metrics = instanovo_io.instanovo_metrics(rs)
+    cands = {int(r["row"]): r for r in csv.DictReader(open(candidates_csv, encoding="utf-8"))}
+    cfg = inspector.annotation_config
+
+    def load(row):
+        rec = read_raw_records(parquet_path, [row], _SPECTRUM_COLUMNS + ["modified_sequence"])[0]
+        spec = Spectrum(rec["mz_array"], rec["intensity_array"], rec["precursor_mz"],
+                        rec["precursor_charge"], spectrum_id=f"{Path(parquet_path).stem}:{row}")
+        pred = rs.tokenize(cands[row]["prediction"])
+        truth = [rs.residue_remapping.get(t, t) for t in rs.tokenize(rec["modified_sequence"])]
+        if "".join(truth) != cands[row]["truth"]:
+            raise RuntimeError(f"row {row}: true peptide differs from candidates.csv")
+        return rec, spec, pred, truth, inspector.forward(spec, "".join(pred))
+
+    isotope = []
+    for row in isotope_rows:
+        rec, spec, pred, truth, fwd = load(row)
+        ann_p, _ = inspector._annotate(pred, spec, fwd)
+        ann_t, _ = inspector._annotate(truth, spec, fwd)
+        _bare, proforma, _mods = peptide_for_annotation(pred, rs)
+        ann_p1 = annotate.run_spectrum_utils(
+            proforma=proforma, mz_array=fwd.peaks_mz, intensity_array=fwd.peaks_intensity,
+            precursor_mz=spec.precursor_mz, precursor_charge=spec.precursor_charge,
+            ion_types=cfg.ion_types, fragment_tol_mass=cfg.fragment_tol_mass,
+            fragment_tol_mode=cfg.fragment_tol_mode, enable_internal=cfg.enable_internal,
+            strict=True, max_isotope=1)
+        d = distinguishing_peaks(ann_p, ann_t)
+        became = [j for j in d["true_only"] if _is_fragment(ann_p1[j])]
+        _ok, ppm = metrics.matches_precursor(pred, rec["precursor_mz"], rec["precursor_charge"])
+        isotope.append({
+            "row": row, "rank": int(cands[row]["rank"]), "prediction": "".join(pred), "truth": "".join(truth),
+            "precursor_ppm_isotope_0": float(ppm[0]), "precursor_ppm_isotope_1": float(ppm[1]),
+            "n_pred_only": d["n_pred_only"], "n_pred_only_by": d["n_pred_only_by"],
+            "n_true_only": d["n_true_only"], "n_true_only_by": d["n_true_only_by"],
+            "true_only_become_pred_isotope": len(became),
+            "true_only_become_pred_isotope_by": sum(ann_t[j]["ion_type"] in BACKBONE_ION_TYPES for j in became),
+            "became": [{"peak": j, "mz": float(fwd.peaks_mz[j]), "true_label": peak_label(ann_t[j]),
+                        "pred_isotope_label": peak_label(ann_p1[j])} for j in became],
+        })
+
+    decoys = []
+    for row in decoy_rows:
+        rec, spec, pred, truth, fwd = load(row)
+        rng = np.random.default_rng([seed, row])
+        real = {}
+        for name, toks in (("prediction", pred), ("truth", truth)):
+            ann, _ = inspector._annotate(toks, spec, fwd)
+            real[name] = {"internal": sum(a["ion_type"] == "internal" for a in ann),
+                          "fragment": sum(_is_fragment(a) for a in ann)}
+        per = []
+        for dtok in peptide_decoys(pred, n_decoys, rng, exclude=[pred, truth]):
+            ann, _ = inspector._annotate(dtok, spec, fwd)
+            per.append({"decoy": "".join(dtok), "internal": sum(a["ion_type"] == "internal" for a in ann),
+                        "fragment": sum(_is_fragment(a) for a in ann)})
+        internal = [p["internal"] for p in per]
+        frag = [p["fragment"] for p in per]
+        decoys.append({"row": row, "n_peaks": len(fwd.peaks_mz), "real": real, "n_decoys": len(per),
+                       "decoy_internal_mean": float(np.mean(internal)), "decoy_internal_min": min(internal),
+                       "decoy_internal_max": max(internal), "decoy_fragment_mean": float(np.mean(frag)),
+                       "decoy_fragment_min": min(frag), "decoy_fragment_max": max(frag), "decoys": per})
+
+    pools = []
+    for h in hypotheses["hypotheses"]:
+        rec, spec, pred, truth, fwd = load(h["row"])
+        L = h["layer"]
+        with torch.inference_mode():
+            feats = inspector.saes[L].forward_inference(fwd.activations[L].to(inspector.device))["features"].cpu()
+        named_by_token: dict[int, set[int]] = {}
+        for it in h["features"]:
+            named_by_token.setdefault(it["token"], set()).add(it["feature"])
+        items, token_pools = [], []
+        for it in h["features"]:
+            row_t = feats[it["token"]]
+            acts = {int(f): float(row_t[f]) for f in (row_t > 0).nonzero().flatten().tolist()}
+            pool = control_pool(acts, named_by_token[it["token"]], it["feature"])
+            order = sorted(acts, key=lambda f: -acts[f])
+            items.append({"feature": it["feature"], "token": it["token"], "l0": len(acts),
+                          "activation": acts[it["feature"]], "rank": order.index(it["feature"]) + 1,
+                          "pool": pool, "pool_activations": [acts[f] for f in pool],
+                          "underpowered": len(pool) < POOL_MIN_SIZE})
+            token_pools.append((it["token"], pool))
+        pools.append({"id": h["id"], "row": h["row"], "layer": L, "items": items,
+                      "n_distinct_control_sets": n_distinct_control_sets(token_pools)})
+    return {"isotope": isotope, "decoys": decoys, "pools": pools,
+            "settings": {"n_decoys": n_decoys, "seed": seed, "pool_size": POOL_SIZE,
+                         "pool_min_ratio": POOL_MIN_RATIO, "pool_min_size": POOL_MIN_SIZE}}
+
+
+def _cmd_audit_checks(args, inspector: Inspector) -> int:
+    """V1-4c descriptive checks (audit_descriptive_checks) -> descriptive_checks.json."""
+    out = Path(args.out_dir)
+    hyp = json.loads((out / "hypotheses.json").read_text(encoding="utf-8"))
+    rep = audit_descriptive_checks(inspector, args.parquet, out / "candidates.csv", hyp,
+                                   isotope_rows=args.isotope_rows, decoy_rows=args.decoy_rows)
+    (out / "descriptive_checks.json").write_text(json.dumps(rep, indent=1), encoding="utf-8")
+    for r in rep["isotope"]:
+        print(f"isotope row {r['row']} (rank {r['rank']}): ppm iso0 {r['precursor_ppm_isotope_0']:+.1f}, "
+              f"iso1 {r['precursor_ppm_isotope_1']:+.1f}; pred-only {r['n_pred_only']} (b/y {r['n_pred_only_by']}), "
+              f"true-only {r['n_true_only']} (b/y {r['n_true_only_by']}); true-only -> pred isotope "
+              f"{r['true_only_become_pred_isotope']} (b/y {r['true_only_become_pred_isotope_by']})")
+    for d in rep["decoys"]:
+        print(f"decoys row {d['row']} ({d['n_peaks']} peaks): real internal {d['real']}, decoy internal "
+              f"mean {d['decoy_internal_mean']:.1f} [{d['decoy_internal_min']}, {d['decoy_internal_max']}], "
+              f"decoy fragment mean {d['decoy_fragment_mean']:.1f} [{d['decoy_fragment_min']}, {d['decoy_fragment_max']}]")
+    for p in rep["pools"]:
+        items = "; ".join(f"F{i['feature']}@{i['token']} L0 {i['l0']} rank {i['rank']} act {i['activation']:.2f} "
+                          f"pool {len(i['pool'])}{' UNDERPOWERED' if i['underpowered'] else ''}" for i in p["items"])
+        print(f"pools {p['id']} row {p['row']}: distinct sets {p['n_distinct_control_sets']}; {items}")
+    return 0
+
+
 _PREDICTION_COLUMNS = ("row", "truth", "prediction", "exact", "meets_precursor", "min_abs_ppm",
                        "beam_log_prob", "n_residues", "modified_truth")
 _CANDIDATE_COLUMNS = ("rank", "row", "mean_residue_log_prob", "prediction", "truth", "mismatch_type",
@@ -1621,7 +1814,8 @@ def _cmd_audit_cases(args, inspector: Inspector) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("command", choices=["time", "compare-preprocessing", "accuracy", "audit-cases"])
+    p.add_argument("command", choices=["time", "compare-preprocessing", "accuracy", "audit-cases",
+                                       "audit-checks"])
     p.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     p.add_argument("--outputs-root", type=Path, default=DEFAULT_OUTPUTS_ROOT)
     p.add_argument("--parquet", type=Path, required=True, help="raw spectra parquet (InstaNovo columns)")
@@ -1637,12 +1831,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--n-top", type=int, default=5, help="audit-cases: cases taken by rank")
     p.add_argument("--min-evidence", type=int, default=2,
                    help=f"audit-cases: selected cases that must be '{EVIDENCE_FOR_TRUE}'")
+    p.add_argument("--isotope-rows", type=int, nargs="*", default=[],
+                   help="audit-checks: rows re-annotated with max_isotope=1 under the prediction")
+    p.add_argument("--decoy-rows", type=int, nargs="*", default=[],
+                   help="audit-checks: rows annotated against shuffled-sequence decoys")
     args = p.parse_args(argv)
-    if args.command not in ("accuracy", "audit-cases") and not args.rows:
+    if args.command not in ("accuracy", "audit-cases", "audit-checks") and not args.rows:
         p.error(f"{args.command} needs --rows")
     inspector = Inspector(args.checkpoint, args.outputs_root, top_k=args.top_k)
     rc = {"time": _cmd_time, "compare-preprocessing": _cmd_compare, "accuracy": _cmd_accuracy,
-          "audit-cases": _cmd_audit_cases}[args.command](args, inspector)
+          "audit-cases": _cmd_audit_cases, "audit-checks": _cmd_audit_checks}[args.command](args, inspector)
     return rc or 0
 
 

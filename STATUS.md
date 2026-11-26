@@ -1011,32 +1011,272 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-3b, V1-4a, V
         N[UNIMOD:7]) with a clear measured effect, not as a model error.
       - Not suited: H2 and H3 (possible label errors, ¹³C artefact), H4 and H6
         (undetermined, no spectrum evidence).
-- [ ] **V1-5 Data for the tool** — feature examples; demo set from the HF test
-      split. Feature examples are the primary evidence of what a feature does
-      (Finding 10: concept associations are negligible for nearly all
-      features). For each feature: its top-activating peaks with their spectrum
-      context (neighbouring peaks with m/z and intensity, the precursor, and
-      the spectrum's prediction), drawn from the local chunks, with provenance
-      (chunk, spectrum id, layer, activation, SAE checkpoint, and the note
-      that every test-split spectrum was SAE training data, Finding 7). Start
-      the demo set from `analysis/reliable_associations.csv` (the features
-      whose best reliable concept association has F1dom ≥ 0.1).
-      Verified by Finding 7 from code and logs: chunk 520's spectrum
-      IDs start at row 532,480, and the SAE validation chunks are 17, 116, 135,
-      141, 230, 292, 316, 397, 448, 462, 489, 495. Offline exhaustive exact
-      ablation for the demo set, both scopes (local over every active
-      (token, feature) pair, global over every active feature, all four
-      layers); report the runtime. Planning estimate from V1-4b's preview:
-      1,073–5,316 active pairs and 500–1,250 active features per layer, so
-      ~3–40 min (local) and ~1.5–9 min (global) per spectrum; the output
-      location is to be agreed (no new output roots without asking). It also
-      shows how often a weakly active feature has a large effect (V1.1-1's
-      F647). Calibrate the per-spectrum SAE-fit indicator: the
-      per-spectrum centred FVE is not comparable to the corpus FVE in the
-      eval reports, so compute its distribution per layer over local
-      spectra and show a spectrum's value as a percentile of that reference
-      (store the reference where the tool may read it, e.g. dictionary
-      metadata).
+- [ ] **V1-5 Data for the tool** — pre-registration and spec (2026-11-26;
+      approved plan, nothing implemented or run yet). Two separate parts:
+      (1) data for a small demo in V1-6: explanations, feature examples for the
+      features active in the demo set, and a calibrated per-spectrum SAE-fit
+      indicator. The demo set gets no precomputed ablation; the dashboard
+      computes ablations live (V1-4b: 1–6.5 s per click). (2) A measurement of
+      activation as a screen for causal effect, on a seeded random sample with
+      exhaustive local ablation; the demo set is not used for it. No API, GPU or
+      cluster. Feature examples are the primary evidence of what a feature does
+      (Finding 10). Every test-split spectrum was SAE training data (Finding 7;
+      verified from code and logs: chunk 520's spectrum IDs start at row
+      532,480, and the SAE validation chunks are 17, 116, 135, 141, 230, 292,
+      316, 397, 448, 462, 489, 495); every output carries that note. HF test
+      row r = merged row 527,974 + r, so chunk = (527,974 + r) // 1024; the
+      local test chunks are 520 (rows 4506–5529) and 572 (rows 57754–58777).
+      Nothing after this commit may change the demo rule, the random-sample
+      rule or the screen definitions; any change is logged as a deviation with
+      its reason.
+
+      Decisions:
+      - D1, demo set, 10 HF test rows:
+        - Group A (V1-4c cases): H7 row 43804 (136 peaks), the one
+          b/y-resolvable error. H1 row 19475 (71 peaks), labelled
+          notation-equivalent; the controls showed its effect belongs to the
+          peak. H5 row 60182 (168 peaks), labelled "notation choice: D vs
+          N[UNIMOD:7], same molecule; InstaNovo's metric counts it correct".
+        - Group B (correct predictions): the V1-4a seed-0 rows that are exact,
+          meet the precursor and lie in chunks 520/572 (4552, 5398, 5406,
+          58409, 58427), top 3 by beam log p: 5398, 5406, 58409 (35, 135, 141
+          peaks).
+        - Group C (reliable associations), one per layer: the feature in
+          `analysis/reliable_associations.csv` with the highest best reliable
+          F1dom (L2 F7522, L4 F11376, L6 F9282, L8 F5107; the L2 and L4 picks
+          are Finding 2 hubs). Take the chunk 520/572 spectrum where that
+          feature's peak-token activation is highest. If that spectrum is
+          already chosen or its beam does not complete, take the next one.
+      - D2, examples: K = 20 per feature, at most one per spectrum. A
+        feature's examples are its top 20 spectra, ranked by the spectrum's
+        maximum activation; each is shown at its argmax token. They are drawn
+        from all local chunks (13 for L2/L4, 12 for L6/L8; chunk 1 has no
+        L6/L8), for the union of features active at any token of the demo
+        spectra only.
+      - D3, example context: the label peptide and its annotation, marked
+        "database-search label, not InstaNovo's prediction; benchmark labels
+        can be wrong (Finding 8)". A resumable `--with-predictions` flag adds
+        beam predictions; the examples pass prints the referenced-spectrum
+        count and its beam cost (2.2–4.2 s each) so that can be decided later.
+      - D4, outputs (no new output root): `analysis/v1_5/` (demo set,
+        explanations, screen sample, ablations, screen results);
+        `dictionary/examples/layer_{L}.parquet` + `dictionary/examples/
+        spectra.parquet`; `dictionary/fit_reference.{json,csv}`. The fit
+        reference is a separate file, not dictionary metadata. Embedding it
+        would bump the dictionary schema, and the Inspector refuses
+        old-schema dictionaries, which would force a second streaming pass.
+
+      Random-sample rule (screen sample):
+      - Population: the 2,048 HF test rows in chunks 520/572.
+      - Order: `np.random.default_rng(0).permutation` of that list, ascending
+        row order before permuting. Wrong and correct predictions alike; no
+        conditioning on correctness, size or content, no hand selection.
+      - Walk the order. Rows whose beam does not complete are skipped and
+        counted.
+      - The sample is the longest prefix whose predicted local-ablation cost is
+        ≤ 9 h.
+      - Frozen cost model, used for the cut and never recalibrated, so the
+        sample is deterministic:
+        - Cost per spectrum = Σ over layers 2/4/6/8 of (active pairs + tokens
+          with L0 > 0) × c(n), with pairs exact from explain() and n = number
+          of processed peaks.
+        - c(n) = 0.006 + 0.00068·n s per ablated row, batched 32 + 1. It is
+          fitted to V1-4b's per-peak clicks (~0.03 s per feature at 35 peaks,
+          0.10–0.12 s at 152).
+      - Measured timing (a one-batch calibration) is reported only.
+      - Overlap with demo group B/C rows is allowed and reported.
+      - Expected size: the model gives ~22 min per spectrum at these chunks'
+        means (108 and 137 peaks per spectrum; ~30.4 active pairs per token in
+        the V1-4c explanations), so roughly 20–25 spectra. The rule, not this
+        expectation, fixes the size.
+
+      Screen definitions:
+      - Unit: a peak token (tokens 1..n) of one screen-sample spectrum at one
+        layer. The latent token is ablated too, but excluded from (a)–(c) and
+        reported descriptively.
+      - Effect e = `delta_total` (Δ total log p of the prediction, residues +
+        EOS) of the local, exact, error-preserving single-feature ablation,
+        teacher-forced on the prediction. Activation = the feature's SAE
+        activation at that token.
+      - (a) Spearman ρ(activation, |e|) over the peak's active features
+        (average ranks for ties), peaks with L0 ≥ 3. Layer statistic: the mean
+        of per-peak ρ (median also reported).
+      - (b) Screening recall = |T3 ∩ A8| / 3. T3 = the peak's top 3 by |e|;
+        A8 = its top 8 by activation (explain()'s `top_k`); ties are broken by
+        feature id. Only peaks with L0 > 8 (otherwise trivially 1; the number
+        excluded is reported). Layer statistic: the mean over peaks. Reported
+        beside it, both threshold-free: the chance level mean(8 / L0), and
+        mass recall Σ_{T3∩A8} |e| / Σ_{T3} |e|.
+      - (c) Variance split of |e|, per spectrum s and layer, around the
+        spectrum's own mean: SS_between = Σ_p n_p (ē_p − ē_s)², SS_within =
+        Σ_p Σ_f (|e| − ē_p)². Layer statistic: Σ_s SS_between / Σ_s SS_total.
+        The exchangeable-null reference Σ_s (P_s − 1) / Σ_s (N_s − 1) is
+        reported beside it (P_s peaks, N_s pairs). Secondary: the same on
+        log10(|e| + 1e-6), since |e| is heavy-tailed; 1e-6 is the
+        batching-noise level (`TIE_TOLERANCE`).
+      - CIs: bootstrap over spectra (the resampling unit; peaks within a
+        spectrum are correlated). 10,000 resamples, `np.random.default_rng(0)`,
+        percentile 95%. Each statistic is a ratio of per-spectrum sums, so
+        resampling is cheap.
+      - Alongside, labelled exploratory and recomputed by code from
+        `analysis/v1_4c/part_b_token_sweep.csv`: V1-4c's first look (8 of H7's
+        20 largest effects outside the top 8 by activation; the 3 largest rank
+        4–6, inside it). A different metric (effect on M across two contexts),
+        13 peaks, L8 only, one spectrum: not comparable to (b).
+      - Also reported, descriptively: the sample's exact-match count against
+        the label.
+      - Caveats stated with the results: all sample spectra were SAE training
+        data (Finding 7); single-feature effects understate redundant features
+        (V1-4b); n ≈ 20–25 spectra from two chunks.
+
+      Steps and outputs (runtime estimates):
+      1. Demo set: `python -m analysis --demo-set`, pipeline side, ~5 min.
+         - Reads `analysis/v1_4c/predictions.csv`,
+           `analysis/reliable_associations.csv`, and chunks 520/572 via
+           `evaluate.ChunkStream(chunk_indices=[520, 572],
+           feature_subset=[f])`, one layer at a time.
+         - Checks each spectrum_id against its HF row.
+         - Output `analysis/v1_5/demo_set.json` (rule, rows, group, label,
+           reason).
+      2. Explain and screen-sample estimate (~2–3 min), then **stop and show
+         the estimate before step 4**.
+         - `python -m inspector.runtime demo-explain`: a fresh explain() per
+           demo row; H1/H5/H7 must reproduce the saved V1-4c prediction and
+           log p. Writes `analysis/v1_5/explanations/` and
+           `analysis/v1_5/demo_features.json` (per layer, the union of
+           features active at any token, not only the top 8).
+         - `python -m inspector.runtime screen-sample`: applies the
+           random-sample rule. Writes `analysis/v1_5/screen/screen_sample.json`
+           (rows; per row peaks, pairs and predicted cost; skipped rows;
+           overlap with the demo set; total predicted hours; the measured
+           one-batch timing) and `analysis/v1_5/screen/explanations/`.
+      3. Feature examples and fit reference, one streaming pass:
+         `python -m build_dictionary --examples --example-features
+         analysis/v1_5/demo_features.json`. ~20–45 min (≈ 57 TFLOP per layer
+         on CPU; the first chunk is timed and extrapolated); re-annotation
+         ≤ 7 min; RAM < 2 GB. Per layer and chunk:
+         - `ChunkStream.iter_activations()` + `iter_metadata_annotations()`.
+         - `sae.forward_inference` in batches of whole spectra (~4k tokens),
+           columns sliced to the demo features inside the batch. Never a full
+           [n_tokens, 12288] matrix.
+         - Per-spectrum centred FVE: SSE, Σx² and Σ_t x accumulated per
+           spectrum across batches in float64, with the `runtime.fve`
+           definition (a test asserts equality; the pipeline does not import
+           the tool).
+         - Per-spectrum max and argmax token per demo feature ([1024, F] per
+           chunk), merged into `evaluate.TopKAccumulator`. It is extended with
+           an optional `aux` provenance tensor; default None = unchanged.
+         - Re-annotation of the referenced spectra against the label
+           (`annotate.annotate_spectrum`, strict).
+
+         Provenance per example: chunk, spectrum id, token, activation, layer,
+         SAE checkpoint sha256_16, "activations from stored bf16 extraction",
+         the Finding 7 note, the D3 label note, and the Finding 9 caveats for
+         the annotation. Fit reference: 1,001 quantiles per layer of the
+         per-spectrum centred FVE, plus n spectra (13,312 / 13,312 / 12,288 /
+         12,288), chunks, the bf16 note, and "reference spectra were SAE
+         training data (Finding 7); an unseen spectrum may sit lower". Can run
+         before or after step 4.
+      4. Exhaustive local ablation on the screen sample, overnight, after the
+         step-2 estimate is approved: `python -m inspector.runtime
+         screen-ablate`.
+         - Per row: a fresh explain() (must match step 2), `ablation_context`
+           on the prediction, then per layer `ablate_token` at every token
+           with L0 > 0: every active pair plus the per-token joint. No global
+           scope.
+         - Each (row, layer) is written atomically as a parquet file in
+           `analysis/v1_5/screen/ablation/`; existing files are skipped
+           (resume).
+         - Refuses if the estimate exceeds `--budget-hours` 9 unless
+           `--force`. ≤ 9 h by construction (±30% model error; resumable if it
+           overruns); RAM < 2 GB.
+         - Provenance: exact, error-preserving, local, prediction target,
+           n = 1 spectrum per row, no CI.
+      5. Screen statistics: `python -m analysis --activation-screen`, < 1 min.
+         Writes `analysis/v1_5/screen/activation_screen.json` (layer summaries
+         with CIs, the V1-4c exploratory numbers) and
+         `activation_screen_peaks.csv` (per peak).
+
+      Storage estimate:
+
+      | output | size |
+      |---|---|
+      | screen ablations (~20–25 spectra × ~15k pairs, per-residue deltas, joints) | 30–40 MB |
+      | explanations (10 demo + ~25 screen) | ~20 MB |
+      | dictionary/examples (K = 20) | ≤ 39 MB |
+      | dictionary/fit_reference | ~1 MB |
+      | screen results | < 1 MB |
+
+      Sizing notes. Examples: 12–20k (layer, feature) pairs × 20 rows,
+      7–12 MB. The spectrum context table is deduplicated (processed peaks
+      with labels, precursor, label peptide), ≤ 13,312 spectra × ~2 KB.
+
+      Files edited (no new modules or top-level dirs):
+      - `src/analysis.py`: `--demo-set`, `--activation-screen` (pure stats
+        functions + CLI).
+      - `src/inspector/runtime.py`: `demo-explain`, `screen-sample`,
+        `screen-ablate`; helpers `active_features`, `ablation_cost`,
+        `random_sample` (pure), `exhaustive_local` (on `ablate_token`, which
+        stays unchanged).
+      - `src/build_dictionary.py`: `--examples` pass (torch imported lazily);
+        the normal build is unchanged.
+      - `src/evaluate.py`: `TopKAccumulator(aux=None)`, additive.
+      - `src/inspector/dictionary.py`: `FitReference` (`percentile(layer,
+        fve)`, loud error if the file is missing) and a `FeatureExamples`
+        loader with a schema check, for V1-6. explain() is unchanged
+        (Explanation schema stays 3).
+      - `src/schema.py`: `EXAMPLES_SCHEMA_VERSION`,
+        `FIT_REFERENCE_SCHEMA_VERSION`, `SCREEN_ABLATION_SCHEMA_VERSION` = 1.
+      - `STATUS.md` (results, Behaviour changes, Log) and `CLAUDE.md` (data
+        layout).
+
+      Tests:
+      - `test_build_dictionary.py`, on a toy chunk with a tiny SAE:
+        - Streamed FVE equals `runtime.fve` per spectrum, for any batch size,
+          with spectra straddling batches.
+        - Examples equal a brute-force top-K, one per spectrum, with the right
+          argmax tokens.
+        - Quantiles and the metadata schema.
+      - `test_chunk_stream.py`: `TopKAccumulator` aux provenance; the default
+        output is identical.
+      - `test_analysis.py`:
+        - The demo rule on toys (ranking, collision goes to the next
+          spectrum).
+        - Screen statistics on hand-computed toys: ρ, recall with the L0 ≤ 8
+          exclusion, mass recall, chance level, variance split, null
+          reference.
+        - Bootstrap determinism.
+      - `test_inspector_runtime.py`:
+        - `random_sample`: deterministic, the prefix stops at the budget,
+          no-beam rows are skipped and counted.
+        - `exhaustive_local` on the test spectrum for one layer equals
+          `ablate_token`.
+        - Resume skips files already written; the budget check refuses.
+        - Demo features = the union of active features.
+        - `FitReference.percentile`: bounds, monotone, missing file raises.
+
+      Verification:
+      1. Group B/C demo rows reproduce the stored activations (V1-4a
+         tolerance); H1/H5/H7 reproduce the V1-4c predictions.
+      2. explain()'s fve_centred vs the reference value for the same local
+         spectra: max |Δ| reported (bf16 vs float32).
+      3. Three random pairs recomputed with `ablate` match the stored rows to
+         1e-6.
+      4. Measured vs predicted runtime; on-disk sizes vs the storage table.
+      5. The V1-4c exploratory numbers are reproduced (8 of 20, ranks 4–6).
+      6. The full test suite passes.
+
+      Commits:
+      1. `V1-5 pre-registration` (this entry).
+      2. `V1-5 code: feature examples and fit reference`.
+      3. `V1-5 code: demo set, screen sample, exhaustive local ablation,
+         activation screen`.
+      4. `V1-5 results`: rows, runtime, storage, output sha256, the screen
+         table with CIs and the V1-4c exploratory numbers alongside;
+         CLAUDE.md layout; Log line.
+
+      Sequence: commit 1 → code (commits 2–3) → steps 1–2 → stop for the
+      step-2 estimate → step 4 overnight → steps 3 and 5 → commit 4.
 - [ ] **V1-6 Dashboard** — `src/inspector/app.py`, Streamlit.
       Spectrum plot with peaks coloured by annotation, layer selector, per-peak
       feature panel, feature card. The card leads with the feature's examples
@@ -1341,6 +1581,10 @@ Tool:
 - Warm up beam search at Inspector load: the first call costs ~12 s extra (V1-4a)
 - Re-decode under ablation (beam search with the ablation hook, ~2–4 s): V1-4b reports Δ log p of the original residues and teacher-forced argmax flips, not a new prediction
 - Faster per-peak clicks on large spectra (4–6.5 s at ~150 peaks, V1-4b): rerun only from layer L onward with the layer input cached, or a compact summary encoding for the JSON size
+- Precomputed demo-set ablations (V1-5 computes demo ablations live in the dashboard; precompute only for a static public demo)
+- Exhaustive ablation against the true target (V1-5 uses the prediction only)
+- Corpus-maximum reference for feature-example activations (Phase 3 `top_activating_tokens.csv`, 625 chunks) beside the local top 20
+- Quantile-sampled feature examples (not only the top 20), and examples for all features (V1-5: demo-set features only)
 - Corpus builder: run InstaNovo + the SAEs on an arbitrary spectra file (mgf/mzML/parquet) to produce feature examples, so the dictionary can be rebuilt on other datasets without the extraction pipeline
 
 Pipeline:
@@ -1748,3 +1992,4 @@ secondary evidence, shown with their F1dom and chance fraction.
 - 2026-11-25 — V1-3b done: concept reliability table (`1ffa8ea`; the label audit also counts what an immonium filter would change, `concepts.csv` gains two columns, the rest byte-identical) and dictionary schema 2 with reliability beside every association and `reliable_*` associations (`31338d9`; all four layers rebuilt, existing columns identical; Explanation schema 3). Only 8 of 50 concepts meet the display rule; Finding 9's "reliable" covers_R, covers_C and ion_contains_cam_cys carry 4.1–4.3% bug-added positives, and the immonium bug also hides one y positive each from is_y_ion and position_Cterm, so the rule counts bug-added positives only (hidden ones are reported). Finding 10: reliable associations are negligible for nearly all features (median best F1dom 0.0012–0.0015); `analysis/reliable_associations.csv` lists the 250 at ≥ 0.1; V1-5 and V1-6 specs now lead with examples and measured effects. V1-4c amendment 1 (`0a87fee`): evidence classes on b/y peaks only, 8 of 44 candidates change, hypotheses unchanged. Finding 8(b) addendum (Q/K merged by the mass metric); backlog: full label rebuild, F1dom decoy null, merged residue pairs; paper note on concept-level results. No API, GPU or cluster. 203 tests pass.
 - 2026-11-25 — V1-4c part B done. Amendment 2 committed before any ablation on the selected cases (`16ec5a2`): H7's peak-matched secondary control, the sampling rule (rejection, at most 10,000 attempts), "distinct control draws" = possible sets, ties at 1e-6; H8 and the noise-peak check dropped. Code (`800558a`): `ablate_set` / `ablate_sets` (joint ablation of arbitrary (feature, token) sets), the part B helpers and `audit-part-b`; 215 tests pass (12 new). Run 272 s, every reproduction check held. Outcomes: H5 supported (a notation choice, D vs N[UNIMOD:7]), H1, H2 and H7 not supported, H3, H4 and H6 undetermined by construction; ~0.19 false "supported" expected across the 4 decidable tests. Step (c), the H7 exploratory sweep and the V1-5 demo picks (H7, H1, H5 with labels) recorded under V1-4c. No API, GPU or cluster.
 - 2026-11-25 — V1-4c exploratory H7 sweep recorded in full under V1-4c (two top-10 tables, per-peak joints, interpretation, activation as a screen: 8 of the 20 largest effects lie outside the top 8 by activation, limits). Backlog: pre-registered H7 peak-shift test (y10–y15 shifted by ±0.036 Da, no SAE), high priority after V1-6. No code or runs.
+- 2026-11-26 — V1-5 pre-registration and spec committed under V1-5 (no code, no runs): decisions D1–D4 (10-row demo set incl. H5 labelled a notation choice; K = 20 examples, one per spectrum; label-peptide context; outputs in `analysis/v1_5/` and `dictionary/`), the seeded random-sample rule for the screen (chunks 520/572, `default_rng(0)`, longest prefix ≤ 9 h under a frozen cost model), screen definitions (a)–(c) with bootstrap over spectra, steps 1–5, files, tests, commits. Demo ablations are live in the dashboard; no global exhaustive scope. Four backlog items added.

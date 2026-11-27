@@ -327,3 +327,139 @@ def test_reliable_association_list_cut_order_and_summary():
     assert summary["min_reliable_f1_dom"] == 0.1 and "not a reliability claim" in summary["cut"]
     assert math.isnan(analysis.reliable_association_list({4: [row(1, None)]})[1]["by_layer"]["4"][
         "median_best_reliable_f1_dom"])
+
+
+# --- V1-5: demo rule and activation screen -------------------------------------------------
+
+import math  # noqa: E402
+
+import numpy as np  # noqa: E402
+
+from analysis import (  # noqa: E402
+    HF_TEST_OFFSET,
+    demo_group_b,
+    demo_group_c_feature,
+    group_peaks,
+    hf_test_location,
+    peak_recall,
+    peak_rho,
+    pick_demo_spectrum,
+    rank_spectra_by_peak_max,
+    screen_layer_summary,
+    screen_spectrum_sums,
+    v1_4c_exploratory,
+    variance_split,
+)
+
+
+def _pred(row, exact, meets, lp):
+    return {"row": str(row), "exact": str(exact), "meets_precursor": str(meets), "beam_log_prob": str(lp)}
+
+
+def test_hf_test_location_matches_the_recorded_local_chunks():
+    assert hf_test_location(4506) == (520, 0) and hf_test_location(5529) == (520, 1023)
+    assert hf_test_location(57754) == (572, 0) and hf_test_location(58777) == (572, 1023)
+
+
+def test_demo_group_b_ranking():
+    preds = [_pred(4552, True, True, -0.74), _pred(5398, True, True, -0.03), _pred(5406, True, True, -0.13),
+             _pred(58409, True, True, -0.50), _pred(58427, True, True, -1.35),
+             _pred(5000, False, True, -0.01), _pred(5001, True, False, -0.01),   # wrong / not meeting
+             _pred(304, True, True, -0.001)]                                     # outside chunks 520/572
+    assert demo_group_b(preds) == [5398, 5406, 58409]
+
+
+def test_demo_group_c_feature_takes_the_best_reliable_f1dom():
+    rows = [{"layer": "2", "feature_idx": "7", "reliable_f1_dom_1": "0.2"},
+            {"layer": "2", "feature_idx": "3", "reliable_f1_dom_1": "0.4"},
+            {"layer": "2", "feature_idx": "9", "reliable_f1_dom_1": "0.4"},
+            {"layer": "4", "feature_idx": "1", "reliable_f1_dom_1": "0.9"}]
+    assert demo_group_c_feature(rows, 2) == (3, 0.4)            # tie -> lower feature id
+    with pytest.raises(ValueError):
+        demo_group_c_feature(rows, 6)
+
+
+def test_rank_by_peak_max_ignores_the_latent_token():
+    col = [9.0, 1.0, 2.0, 0.0, 5.0, 0.0, 0.0]
+    t2s = [0, 0, 0, 1, 1, 2, 2]
+    pos = [0, 1, 2, 0, 1, 0, 1]
+    ranked = rank_spectra_by_peak_max(col, t2s, pos, ["100", "101", "102"])
+    assert ranked == [(101, 5.0), (100, 2.0)]                    # spectrum 102 never fires on a peak
+
+
+def test_pick_demo_spectrum_collision_and_beam_go_to_the_next():
+    ranked = [(HF_TEST_OFFSET + r, a) for r, a in ((10, 9.0), (11, 8.0), (12, 7.0))]
+    pick, passed = pick_demo_spectrum(ranked, {10}, lambda r: r != 11)
+    assert pick == {"row": 12, "rank": 3, "activation": 7.0}
+    assert [(p["row"], p["reason"]) for p in passed] == [(10, "already chosen"), (11, "beam did not complete")]
+    with pytest.raises(RuntimeError):
+        pick_demo_spectrum(ranked, {10, 11, 12}, lambda r: True)
+
+
+def test_peak_rho_average_ranks_and_constant():
+    assert peak_rho([1, 2, 3], [10, 20, 30]) == pytest.approx(1.0)
+    assert peak_rho([1, 2, 3], [1, 1, 2]) == pytest.approx(0.8660254, rel=1e-6)   # tied |e| -> average ranks
+    assert math.isnan(peak_rho([1, 2, 3], [5, 5, 5]))
+
+
+def test_peak_recall_exclusion_ties_mass_and_chance():
+    assert peak_recall(list(range(8)), [1.0] * 8, [1.0] * 8) is None             # L0 <= 8
+    feats = list(range(10))
+    act = [10, 9, 8, 7, 6, 5, 4, 3, 2, 1]                                        # A8 = features 0..7
+    e = [0, 0, 0, 0, 0, 0, 0, 5, 4, 3]                                           # T3 = 7, 8, 9
+    r = peak_recall(feats, act, e)
+    assert r["recall"] == pytest.approx(1 / 3) and r["mass_recall"] == pytest.approx(5 / 12)
+    assert r["chance"] == pytest.approx(0.8)
+    # ties in activation broken by feature id: features 8 and 9 tie with 7 at the cut
+    r2 = peak_recall(feats, [1] * 10, [0, 0, 0, 0, 0, 0, 0, 0, 2, 1])
+    assert r2["recall"] == pytest.approx(1 / 3)                                  # T3 = 8, 9, 0; A8 = 0..7
+
+
+def test_variance_split_hand_computed():
+    v = variance_split([np.array([1.0, 3.0]), np.array([5.0])])
+    # spectrum mean 3; peak means 2 and 5: between = 2*1 + 1*4 = 6; within = 2; total = 8
+    assert (v["between"], v["within"], v["total"], v["P"], v["N"]) == (6.0, 2.0, 8.0, 2, 3)
+
+
+def _toy_peaks(seed):
+    rng = np.random.default_rng(seed)
+    out = []
+    for t in range(1, 6):
+        n = int(rng.integers(1, 12))
+        out.append({"token": t, "features": list(range(n)), "activation": rng.random(n).tolist(),
+                    "delta_total": (rng.standard_normal(n) * 0.1).tolist()})
+    return out
+
+
+def test_screen_summary_is_a_ratio_of_spectrum_sums_and_deterministic():
+    per = [screen_spectrum_sums(_toy_peaks(s)) for s in range(6)]
+    a = screen_layer_summary(per, n_boot=500)
+    b = screen_layer_summary(per, n_boot=500)
+    assert a == b
+    rhos = [p["rho"] for d in per for p in d["peaks"] if p["l0"] >= 3 and not math.isnan(p["rho"])]
+    assert a["a_mean_rho"]["estimate"] == pytest.approx(np.mean(rhos))
+    assert a["a_mean_rho"]["ci_low"] <= a["a_mean_rho"]["estimate"] <= a["a_mean_rho"]["ci_high"]
+    p_sum = sum(d["sums"]["p_minus_1"] for d in per)
+    n_sum = sum(d["sums"]["n_minus_1"] for d in per)
+    assert a["c_null_reference"]["estimate"] == pytest.approx(p_sum / n_sum)
+    n_le8 = sum(1 for d in per for p in d["peaks"] if p["l0"] <= 8)
+    assert a["b_n_excluded_l0_le_8"] == n_le8
+
+
+def test_group_peaks_separates_latent_and_joint():
+    table = [{"token": 0, "kind": "single", "feature": 4, "activation": 1.0, "delta_total": 0.1},
+             {"token": 0, "kind": "joint", "feature": -1, "activation": 1.0, "delta_total": 0.1},
+             {"token": 2, "kind": "single", "feature": 1, "activation": 2.0, "delta_total": -0.3},
+             {"token": 2, "kind": "single", "feature": 3, "activation": 1.0, "delta_total": 0.2}]
+    peaks, latent = group_peaks(table)
+    assert [p["token"] for p in peaks] == [2] and peaks[0]["features"] == [1, 3]
+    assert latent["features"] == [4]
+
+
+SWEEP = REPO / "sae_pipeline_outputs" / "analysis" / "v1_4c" / "part_b_token_sweep.csv"
+
+
+@pytest.mark.skipif(not SWEEP.is_file(), reason="local V1-4c outputs not present")
+def test_v1_4c_exploratory_numbers_reproduce():
+    ex = v1_4c_exploratory(SWEEP)
+    assert ex["n_outside_top8"] == 8 and ex["activation_ranks_top3"] == [4, 5, 6] and ex["n_tokens"] == 13

@@ -85,7 +85,23 @@ Reliable-association list (``--reliable-associations``, V1-3b / Finding 10)
     with any reliable association, the median of their best reliable F1dom, and
     how many reach 0.1 and 0.3).
 
+V1-5 demo set (``--demo-set``) and activation screen (``--activation-screen``)
+    ``--demo-set`` applies the registered rule D1 (STATUS V1-5): V1-4c cases
+    H7/H1/H5 with labels, the top 3 correct V1-4a rows in chunks 520/572 by beam
+    log p, and per layer the spectrum where the feature with the highest
+    reliable F1dom fires hardest on a peak (beam completion checked with
+    instanovo_io); every row is checked against its HF row and, when local, the
+    chunk metadata. Stops if a derived pick differs from the registered one.
+    Writes ``analysis/v1_5/demo_set.json``. ``--activation-screen`` reads the
+    screen ablations (``inspector.runtime screen-ablate``) and computes the
+    registered statistics (a)-(c) per layer with bootstrap CIs over spectra,
+    plus V1-4c's exploratory numbers recomputed; writes
+    ``analysis/v1_5/screen/activation_screen.json`` and ``activation_screen_peaks.csv``.
+
 Usage (from the repo root)::
+
+    PYTHONPATH=src uv run python -m analysis --demo-set --parquet <HF test parquet>
+    PYTHONPATH=src uv run python -m analysis --activation-screen
 
     PYTHONPATH=src uv run python -m analysis
     PYTHONPATH=src uv run python -m analysis --root sae_pipeline_outputs --layers 2 4
@@ -1186,6 +1202,424 @@ def _write_csv(path: Path, columns: list[str], rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
+# --- V1-5: demo set (--demo-set) ---------------------------------------------------------
+
+HF_TEST_OFFSET = 527_974            # merged row of HF test row 0 (train 499,402 + validation 28,572)
+CHUNK_SIZE = 1024
+LOCAL_TEST_CHUNKS = (520, 572)
+DEMO_GROUP_A = (
+    {"id": "H7", "row": 43804,
+     "label": "InstaNovo error resolvable from the spectrum: b/y peaks support the true peptide",
+     "reason": "V1-4c H7, the one b/y-resolvable error: mixed-sign features on the true-only y peaks, a set "
+               "effect dominated by one item, joint vs single differences"},
+    {"id": "H1", "row": 19475,
+     "label": "notation-equivalent to the label (N[UNIMOD:7] vs D, same molecule); not a model error",
+     "reason": "V1-4c H1: a large single effect that the controls showed belongs to the peak, not to the "
+               "named features"},
+    {"id": "H5", "row": 60182,
+     "label": "notation choice: D vs N[UNIMOD:7], same molecule; InstaNovo's metric counts it correct",
+     "reason": "V1-4c H5: a clear measured effect on a notation choice, not a model error"},
+)
+DEMO_GROUP_B_REGISTERED = (5398, 5406, 58409)
+DEMO_GROUP_C_REGISTERED = {2: 7522, 4: 11376, 6: 9282, 8: 5107}
+DEMO_RULE = (
+    "D1 (STATUS V1-5): group A = V1-4c H7, H1, H5 with labels; group B = V1-4a seed-0 rows (v1_4c/"
+    "predictions.csv) that are exact, meet the precursor and lie in chunks 520/572, top 3 by beam log p; "
+    "group C = per layer the feature in reliable_associations.csv with the highest best reliable F1dom, "
+    "and the chunk 520/572 spectrum where its peak-token activation is highest; if that spectrum is "
+    "already chosen or its beam does not complete, the next one.")
+
+
+def hf_test_location(row: int) -> tuple[int, int]:
+    """(chunk, index within the chunk) of an HF test row in the merged corpus."""
+    merged = HF_TEST_OFFSET + int(row)
+    return merged // CHUNK_SIZE, merged % CHUNK_SIZE
+
+
+def _truthy(v) -> bool:
+    return str(v).strip().lower() == "true"
+
+
+def demo_group_b(predictions: list[dict], n: int = 3, chunks=LOCAL_TEST_CHUNKS) -> list[int]:
+    """Exact, precursor-meeting rows in the given chunks, top n by beam log p (ties by row)."""
+    ok = [p for p in predictions if _truthy(p["exact"]) and _truthy(p["meets_precursor"])
+          and hf_test_location(int(p["row"]))[0] in chunks]
+    ok.sort(key=lambda p: (-float(p["beam_log_prob"]), int(p["row"])))
+    return [int(p["row"]) for p in ok[:n]]
+
+
+def demo_group_c_feature(rows: list[dict], layer: int) -> tuple[int, float]:
+    """The layer's feature with the highest best reliable F1dom (ties by feature id)."""
+    cand = [(float(r["reliable_f1_dom_1"]), -int(r["feature_idx"])) for r in rows
+            if int(r["layer"]) == layer and _is_number(r.get("reliable_f1_dom_1"))]
+    if not cand:
+        raise ValueError(f"no reliable association for layer {layer}")
+    f1, neg = max(cand)
+    return -neg, f1
+
+
+def rank_spectra_by_peak_max(feature_col, token_to_spectrum, token_to_position, spectrum_ids) -> list[tuple[int, float]]:
+    """(merged spectrum id, max activation over its peak tokens), strongest first,
+    ties by spectrum id; spectra where the feature never fires on a peak are left out."""
+    col = np.asarray(feature_col, dtype=np.float64)
+    t2s, pos = np.asarray(token_to_spectrum), np.asarray(token_to_position)
+    peak = pos >= 1
+    best = np.full(len(spectrum_ids), -np.inf)
+    np.maximum.at(best, t2s[peak], col[peak])
+    out = [(int(spectrum_ids[s]), float(best[s])) for s in range(len(spectrum_ids)) if best[s] > 0]
+    out.sort(key=lambda x: (-x[1], x[0]))
+    return out
+
+
+def pick_demo_spectrum(ranked: list[tuple[int, float]], taken: set[int], beam_completes) -> tuple[dict, list[dict]]:
+    """The first ranked HF test row not taken whose beam completes; the rows
+    passed over, with the reason."""
+    passed = []
+    for rank, (merged, act) in enumerate(ranked, 1):
+        row = merged - HF_TEST_OFFSET
+        if row in taken:
+            passed.append({"row": row, "rank": rank, "activation": act, "reason": "already chosen"})
+            continue
+        if not beam_completes(row):
+            passed.append({"row": row, "rank": rank, "activation": act, "reason": "beam did not complete"})
+            continue
+        return {"row": row, "rank": rank, "activation": act}, passed
+    raise RuntimeError("no eligible spectrum")
+
+
+def read_parquet_rows(path: Path, rows: list[int], columns: list[str]) -> dict[int, dict]:
+    """The given rows of a parquet, reading each row group once."""
+    import pyarrow.parquet as pq
+    pf = pq.ParquetFile(path)
+    starts = np.cumsum([0] + [pf.metadata.row_group(i).num_rows for i in range(pf.metadata.num_row_groups)])
+    out = {}
+    for g in range(pf.metadata.num_row_groups):
+        members = [r for r in rows if starts[g] <= r < starts[g + 1]]
+        if members:
+            table = pf.read_row_group(g, columns=columns)
+            for r in members:
+                out[r] = table.slice(int(r - starts[g]), 1).to_pylist()[0]
+    missing = set(rows) - set(out)
+    if missing:
+        raise IndexError(f"rows {sorted(missing)[:5]} outside {path}")
+    return out
+
+
+class _BeamModel:
+    """InstaNovo through instanovo_io, decoding as explain() does (5 beams, the
+    config's max_length, spectrum_utils preprocessing)."""
+
+    def __init__(self, checkpoint: Path):
+        import instanovo_io
+        self.io = instanovo_io
+        self.model, self.config, self.residue_set = instanovo_io.load_instanovo(checkpoint, device="cpu", by_id=False)
+        self.processor = instanovo_io.make_processor(self.residue_set, annotated=False)
+
+    def predict(self, rec: dict) -> list[str]:
+        batch = self.io.preprocess_spectrum(self.processor, rec["mz_array"], rec["intensity_array"],
+                                            rec["precursor_mz"], rec["precursor_charge"])
+        out = self.io.beam_search(self.model, batch, "cpu", 5, int(self.config["max_length"]))
+        return list(out["predictions"][0])
+
+    def instanovo_notation(self, modified_sequence: str) -> str:
+        rs = self.residue_set
+        return "".join(rs.residue_remapping.get(t, t) for t in rs.tokenize(modified_sequence))
+
+
+def demo_set(root: Path, parquet: Path, checkpoint: Path, log=print) -> dict:
+    """Apply D1 and write analysis/v1_5/demo_set.json. Stops if a derived pick
+    differs from the registered one (a deviation is logged, never absorbed)."""
+    import time
+    import torch
+    from evaluate import ChunkStream
+    from train import load_sae_from_checkpoint
+
+    t_start = time.perf_counter()
+    with open(root / "analysis" / "v1_4c" / "predictions.csv", newline="", encoding="utf-8") as fh:
+        predictions = {int(r["row"]): r for r in csv.DictReader(fh)}
+    with open(root / "analysis" / "reliable_associations.csv", newline="", encoding="utf-8") as fh:
+        reliable = list(csv.DictReader(fh))
+    group_b = demo_group_b(list(predictions.values()))
+    if tuple(group_b) != DEMO_GROUP_B_REGISTERED:
+        raise RuntimeError(f"group B derives {group_b}, registered {DEMO_GROUP_B_REGISTERED}: deviation")
+    model = _BeamModel(checkpoint)
+    hf_cols = ["mz_array", "intensity_array", "precursor_mz", "precursor_charge", "sequence", "modified_sequence"]
+    beam_cache: dict[int, list[str]] = {}
+
+    def beam(row: int) -> list[str]:
+        if row not in beam_cache:
+            beam_cache[row] = model.predict(read_parquet_rows(parquet, [row], hf_cols)[row])
+        return beam_cache[row]
+
+    rows = [{"group": "A", **a} for a in DEMO_GROUP_A]
+    rows += [{"group": "B", "id": f"B{i + 1}", "row": r, "label": "correct prediction (exact match to the label)",
+              "reason": f"rank {i + 1} by beam log p ({float(predictions[r]['beam_log_prob']):.4f}) among exact, "
+                        f"precursor-meeting V1-4a rows in chunks 520/572"} for i, r in enumerate(group_b)]
+    taken = {int(r["row"]) for r in rows}
+    group_c_log = {}
+    for layer in LAYERS:
+        f, f1 = demo_group_c_feature(reliable, layer)
+        if f != DEMO_GROUP_C_REGISTERED[layer]:
+            raise RuntimeError(f"layer {layer}: group C derives F{f}, registered F{DEMO_GROUP_C_REGISTERED[layer]}")
+        concept = next(r["reliable_concept_1"] for r in reliable if int(r["layer"]) == layer and int(r["feature_idx"]) == f)
+        sae = load_sae_from_checkpoint(root / "sae" / f"layer_{layer}" / f"seed_{DEFAULT_SEED}" / "checkpoint.pt",
+                                       device="cpu")
+        stream = ChunkStream(extract_dir=root / "extract", annotation_dir=root / "annotation", target_layer=layer,
+                             sae=sae, device="cpu", batch_size=4096, dtype=torch.float32,
+                             chunk_indices=list(LOCAL_TEST_CHUNKS), feature_subset=[f])
+        ranked = []
+        for chunk in stream:
+            ranked += rank_spectra_by_peak_max(chunk.features[:, 0], chunk.token_to_spectrum,
+                                               chunk.token_to_position, chunk.spectrum_ids)
+        ranked.sort(key=lambda x: (-x[1], x[0]))
+        pick, passed = pick_demo_spectrum(ranked, taken, lambda r: bool(beam(r)))
+        taken.add(pick["row"])
+        group_c_log[str(layer)] = {"feature": f, "reliable_f1_dom": f1, "reliable_concept": concept,
+                                   "n_ranked": len(ranked), "top5": ranked[:5], "passed_over": passed}
+        rows.append({"group": "C", "id": f"C-L{layer}", "row": pick["row"], "layer": layer, "feature": f,
+                     "label": f"top peak-token activation of L{layer} F{f} (reliable association {concept}, "
+                              f"F1dom {f1:.3f})",
+                     "reason": f"rank {pick['rank']} by F{f}'s peak-token activation ({pick['activation']:.4g}) in "
+                               f"chunks 520/572" + (f"; passed over {len(passed)}" if passed else "")})
+        log(f"layer {layer}: F{f} ({concept}, F1dom {f1:.3f}) -> row {pick['row']} (rank {pick['rank']}, "
+            f"activation {pick['activation']:.4g}); passed over {passed}")
+        del sae, stream
+
+    # Checks against the HF rows: every local row against the chunk metadata, every
+    # row in predictions.csv against its recorded label.
+    recs = read_parquet_rows(parquet, [int(r["row"]) for r in rows], hf_cols)
+    metas = {}
+    for r in rows:
+        row, rec = int(r["row"]), recs[int(r["row"])]
+        chunk, s = hf_test_location(row)
+        r.update({"chunk": chunk, "spectrum_index": s, "spectrum_id": str(HF_TEST_OFFSET + row),
+                  "local_chunk": chunk in LOCAL_TEST_CHUNKS,
+                  "label_peptide": model.instanovo_notation(rec["modified_sequence"])})
+        if row in predictions and predictions[row]["truth"] != r["label_peptide"]:
+            raise RuntimeError(f"row {row}: HF label {r['label_peptide']} != predictions.csv {predictions[row]['truth']}")
+        if r["local_chunk"]:
+            if chunk not in metas:
+                metas[chunk] = torch.load(root / "extract" / "chunks" / f"meta_{chunk:05d}.pt", map_location="cpu",
+                                          weights_only=False)
+            m = metas[chunk]
+            if (m["spectrum_ids"][s] != r["spectrum_id"] or m["peptides"][s] != rec["sequence"]
+                    or int(m["precursor_charges"][s]) != rec["precursor_charge"]
+                    or abs(float(m["precursor_mzs"][s]) - rec["precursor_mz"]) > 1e-3):
+                raise RuntimeError(f"row {row}: chunk {chunk} index {s} does not hold this HF row")
+        r["checked_against"] = ("chunk metadata (spectrum id, peptide, precursor m/z, charge)" if r["local_chunk"]
+                                else "") + (" and " if r["local_chunk"] and row in predictions else "") + \
+                               ("v1_4c/predictions.csv label" if row in predictions else "")
+    out = {"rule": DEMO_RULE, "hf_test_offset": HF_TEST_OFFSET, "rows": rows, "group_c": group_c_log,
+           "finding_7_note": "every local test spectrum was SAE training data (Finding 7)",
+           "seconds": time.perf_counter() - t_start}
+    path = root / "analysis" / "v1_5" / "demo_set.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(out, indent=1, allow_nan=False), encoding="utf-8")
+    tmp.replace(path)
+    return out
+
+
+# --- V1-5: activation as a screen for causal effect (--activation-screen) ----------------
+
+SCREEN_TOP_ACT = 8                  # explain()'s top_k
+SCREEN_TOP_EFFECT = 3
+SCREEN_MIN_L0_RHO = 3
+SCREEN_LOG_EPS = 1e-6               # batching-noise level (runtime.TIE_TOLERANCE)
+SCREEN_N_BOOT = 10_000
+SCREEN_CAVEATS = (
+    "all sample spectra were SAE training data (Finding 7); single-feature effects understate redundant "
+    "features (V1-4b); n spectra from two chunks; effects are exact, error-preserving, local ablations "
+    "teacher-forced on the prediction, n = 1 spectrum per row")
+
+
+def _top(features: np.ndarray, values: np.ndarray, k: int) -> list[int]:
+    order = sorted(range(len(features)), key=lambda i: (-values[i], int(features[i])))
+    return [int(features[i]) for i in order[:k]]
+
+
+def peak_rho(act, abs_e) -> float:
+    """Spearman rho (average ranks for ties); NaN when either side is constant."""
+    act, abs_e = np.asarray(act, float), np.asarray(abs_e, float)
+    if len(act) < 2 or np.all(act == act[0]) or np.all(abs_e == abs_e[0]):
+        return math.nan
+    return float(spearmanr(act, abs_e).statistic)
+
+
+def peak_recall(features, act, abs_e, k_act: int = SCREEN_TOP_ACT, k_eff: int = SCREEN_TOP_EFFECT) -> dict | None:
+    """Screening recall |T3 & A8| / 3, mass recall and chance 8 / L0 for one peak;
+    None when L0 <= k_act (trivially 1). Ties broken by feature id."""
+    features, act, abs_e = np.asarray(features), np.asarray(act, float), np.asarray(abs_e, float)
+    if len(features) <= k_act:
+        return None
+    a8 = set(_top(features, act, k_act))
+    t3 = _top(features, abs_e, k_eff)
+    e_of = dict(zip(features.tolist(), abs_e.tolist()))
+    hit = [f for f in t3 if f in a8]
+    den = sum(e_of[f] for f in t3)
+    return {"recall": len(hit) / k_eff, "mass_recall": sum(e_of[f] for f in hit) / den if den > 0 else math.nan,
+            "chance": k_act / len(features)}
+
+
+def variance_split(peaks: list[np.ndarray]) -> dict:
+    """Per-spectrum split of |e| around the spectrum mean: SS_between, SS_within,
+    peaks P and pairs N (for the exchangeable-null reference)."""
+    allv = np.concatenate(peaks)
+    mean_s = allv.mean()
+    between = float(sum(len(p) * (p.mean() - mean_s) ** 2 for p in peaks))
+    within = float(sum(((p - p.mean()) ** 2).sum() for p in peaks))
+    return {"between": between, "within": within, "total": between + within, "P": len(peaks), "N": int(allv.size)}
+
+
+def screen_spectrum_sums(peaks: list[dict]) -> dict:
+    """Per-spectrum numerators and denominators of the layer statistics from its
+    peaks ({features, activation, delta_total} per peak token)."""
+    s = {k: 0.0 for k in ("rho_sum", "n_rho", "n_rho_nan", "recall_sum", "mass_sum", "n_mass", "chance_sum",
+                          "n_recall", "n_le8", "between", "total", "between_log", "total_log", "p_minus_1",
+                          "n_minus_1")}
+    rows, abs_lists, log_lists = [], [], []
+    for p in peaks:
+        f, a, e = np.asarray(p["features"]), np.asarray(p["activation"], float), np.abs(np.asarray(p["delta_total"], float))
+        rho = peak_rho(a, e) if len(f) >= SCREEN_MIN_L0_RHO else math.nan
+        if len(f) >= SCREEN_MIN_L0_RHO:
+            if math.isnan(rho):
+                s["n_rho_nan"] += 1
+            else:
+                s["rho_sum"] += rho
+                s["n_rho"] += 1
+        rec = peak_recall(f, a, e)
+        if rec is None:
+            s["n_le8"] += 1
+        else:
+            s["recall_sum"] += rec["recall"]
+            s["chance_sum"] += rec["chance"]
+            s["n_recall"] += 1
+            if not math.isnan(rec["mass_recall"]):
+                s["mass_sum"] += rec["mass_recall"]
+                s["n_mass"] += 1
+        abs_lists.append(e)
+        log_lists.append(np.log10(e + SCREEN_LOG_EPS))
+        rows.append({"token": p["token"], "l0": len(f), "rho": rho,
+                     **({"recall": rec["recall"], "mass_recall": rec["mass_recall"], "chance": rec["chance"]}
+                        if rec else {"recall": None, "mass_recall": None, "chance": None}),
+                     "mean_abs_e": float(e.mean()), "max_abs_e": float(e.max())})
+    if abs_lists:
+        v, vl = variance_split(abs_lists), variance_split(log_lists)
+        s.update(between=v["between"], total=v["total"], between_log=vl["between"], total_log=vl["total"],
+                 p_minus_1=v["P"] - 1, n_minus_1=v["N"] - 1)
+    return {"sums": s, "peaks": rows}
+
+
+def screen_layer_summary(per_spectrum: list[dict], n_boot: int = SCREEN_N_BOOT, seed: int = DEFAULT_SEED) -> dict:
+    """Layer statistics as ratios of per-spectrum sums with percentile bootstrap
+    95% CIs over spectra (default_rng(seed), n_boot resamples)."""
+    sums = [d["sums"] for d in per_spectrum]
+
+    def col(k):
+        return np.array([x[k] for x in sums], float)
+    idx = bootstrap_indices(len(sums), n_boot, seed)
+
+    def stat(num, den):
+        est, lo, hi = ratio_ci(col(num), col(den), idx)
+        return {"estimate": est, "ci_low": lo, "ci_high": hi}
+    rhos = [p["rho"] for d in per_spectrum for p in d["peaks"] if p["rho"] is not None and not math.isnan(p["rho"])]
+    return {
+        "n_spectra": len(sums),
+        "a_mean_rho": stat("rho_sum", "n_rho"), "a_median_rho": float(np.median(rhos)) if rhos else math.nan,
+        "a_n_peaks": int(col("n_rho").sum()), "a_n_constant_excluded": int(col("n_rho_nan").sum()),
+        "b_recall": stat("recall_sum", "n_recall"), "b_chance": stat("chance_sum", "n_recall"),
+        "b_mass_recall": stat("mass_sum", "n_mass"), "b_n_peaks": int(col("n_recall").sum()),
+        "b_n_excluded_l0_le_8": int(col("n_le8").sum()),
+        "c_between_share": stat("between", "total"), "c_null_reference": stat("p_minus_1", "n_minus_1"),
+        "c_between_share_log": stat("between_log", "total_log"),
+    }
+
+
+def v1_4c_exploratory(sweep_csv: Path, case: str = "H7", n_top: int = 20) -> dict:
+    """V1-4c's first look, recomputed: among the case's n_top largest |effect on M|
+    over every swept (feature, token), how many lie outside the top 8 by activation
+    at their token, and the activation ranks of the 3 largest. Exploratory; a
+    different metric from (b)."""
+    with open(sweep_csv, newline="", encoding="utf-8") as fh:
+        rows = [r for r in csv.DictReader(fh) if r["id"] == case]
+    top = sorted(rows, key=lambda r: -abs(float(r["effect_on_M"])))[:n_top]
+    return {"case": case, "n_swept": len(rows), "n_tokens": len({r["token"] for r in rows}), "n_top": n_top,
+            "n_outside_top8": sum(int(r["activation_rank"]) > SCREEN_TOP_ACT for r in top),
+            "activation_ranks_top3": [int(r["activation_rank"]) for r in top[:3]],
+            "note": ("exploratory: effect on M (log-odds of the prediction vs the truth in the differing region) "
+                     "across two contexts, 13 peaks, L8, one spectrum; not comparable to (b)")}
+
+
+def _read_screen_table(path: Path) -> list[dict]:
+    import pyarrow.parquet as pq
+    from schema import SCREEN_ABLATION_SCHEMA_VERSION
+    table = pq.read_table(path)
+    meta = {k.decode(): v.decode() for k, v in (table.schema.metadata or {}).items()}
+    if meta.get("schema_version") != str(SCREEN_ABLATION_SCHEMA_VERSION):
+        raise ValueError(f"{path}: screen ablation schema {meta.get('schema_version')!r}, expected "
+                         f"{SCREEN_ABLATION_SCHEMA_VERSION}")
+    return table.select(["token", "kind", "feature", "activation", "delta_total"]).to_pylist()
+
+
+def group_peaks(table: list[dict]) -> tuple[list[dict], dict | None]:
+    """Single ablations grouped per token: (peak tokens, the latent token or None)."""
+    by_tok: dict[int, dict] = {}
+    for r in table:
+        if r["kind"] != "single":
+            continue
+        d = by_tok.setdefault(int(r["token"]), {"token": int(r["token"]), "features": [], "activation": [],
+                                                "delta_total": []})
+        d["features"].append(r["feature"])
+        d["activation"].append(r["activation"])
+        d["delta_total"].append(r["delta_total"])
+    return [by_tok[t] for t in sorted(by_tok) if t >= 1], by_tok.get(0)
+
+
+def activation_screen(root: Path, layers=LAYERS, n_boot: int = SCREEN_N_BOOT) -> tuple[dict, list[dict]]:
+    v15 = root / "analysis" / "v1_5"
+    sample = json.loads((v15 / "screen" / "screen_sample.json").read_text(encoding="utf-8"))
+    rows = [int(r) for r in sample["sample_rows"]]
+    missing = [(r, L) for r in rows for L in layers
+               if not (v15 / "screen" / "ablation" / f"row_{r}_L{L}.parquet").is_file()]
+    if missing:
+        raise FileNotFoundError(f"{len(missing)} (row, layer) ablation files missing, e.g. {missing[:5]}; "
+                                f"finish screen-ablate first")
+    summaries, peak_rows = {}, []
+    for L in layers:
+        per_spectrum, latent = [], []
+        for r in rows:
+            peaks, lat = group_peaks(_read_screen_table(v15 / "screen" / "ablation" / f"row_{r}_L{L}.parquet"))
+            d = screen_spectrum_sums(peaks)
+            per_spectrum.append(d)
+            for p in d["peaks"]:
+                peak_rows.append({"row": r, "layer": L, "token": p["token"], "peak": p["token"] - 1, "l0": p["l0"],
+                                  "rho": p["rho"], "recall": p["recall"], "mass_recall": p["mass_recall"],
+                                  "chance": p["chance"], "mean_abs_e": p["mean_abs_e"], "max_abs_e": p["max_abs_e"]})
+            if lat is not None:
+                lp = screen_spectrum_sums([lat])["peaks"][0]
+                latent.append({"row": r, **{k: lp[k] for k in ("l0", "rho", "recall", "mass_recall", "chance",
+                                                                "mean_abs_e", "max_abs_e")}})
+        summaries[str(L)] = {**screen_layer_summary(per_spectrum, n_boot), "latent_token_descriptive": latent}
+    out = {"definitions": "STATUS V1-5 screen definitions (a)-(c); bootstrap over spectra, "
+                          f"{n_boot} resamples, default_rng({DEFAULT_SEED}), percentile 95%",
+           "mass_recall_aggregation": "per-peak ratio, mean over peaks (peaks whose top-3 |e| sum to 0 excluded)",
+           "n_spectra": len(rows), "rows": rows, "n_exact": sample["n_exact"],
+           "screen_sample_sha256_16": hashlib_sha16(v15 / "screen" / "screen_sample.json"),
+           "layers": summaries,
+           "v1_4c_exploratory": v1_4c_exploratory(root / "analysis" / "v1_4c" / "part_b_token_sweep.csv"),
+           "caveats": SCREEN_CAVEATS}
+    return out, peak_rows
+
+
+def hashlib_sha16(path: Path) -> str:
+    import hashlib
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
+
+
+SCREEN_PEAK_COLUMNS = ["row", "layer", "token", "peak", "l0", "rho", "recall", "mass_recall", "chance",
+                       "mean_abs_e", "max_abs_e"]
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="pipeline output root")
@@ -1202,7 +1636,39 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--reliable-associations", action="store_true",
                         help="V1-3b / Finding 10: list features whose best reliable concept association "
                              "has F1dom >= 0.1 (reads the dictionaries)")
+    parser.add_argument("--demo-set", action="store_true",
+                        help="V1-5 step 1: the registered demo set -> analysis/v1_5/demo_set.json (reads chunks "
+                             "520/572 and runs beam search; needs --parquet)")
+    parser.add_argument("--activation-screen", action="store_true",
+                        help="V1-5 step 5: activation as a screen for causal effect, from the screen ablations")
+    parser.add_argument("--parquet", type=Path, default=None, help="--demo-set: the HF nine-species test parquet")
+    parser.add_argument("--checkpoint", type=Path, default=Path("checkpoints") / "instanovo_v1.1.0.ckpt",
+                        help="--demo-set: InstaNovo checkpoint")
     args = parser.parse_args(argv)
+
+    if args.demo_set:
+        if args.parquet is None:
+            parser.error("--demo-set needs --parquet")
+        out = demo_set(args.root, args.parquet, args.checkpoint)
+        for r in out["rows"]:
+            print(f"{r['group']} {r['id']:>6} row {r['row']:>6} chunk {r['chunk']} | {r['label']}")
+        print(f"wrote {args.root / 'analysis' / 'v1_5' / 'demo_set.json'} ({out['seconds']:.0f} s)")
+        return
+
+    if args.activation_screen:
+        out, peak_rows = activation_screen(args.root, tuple(args.layers))
+        out_dir = args.root / "analysis" / "v1_5" / "screen"
+        (out_dir / "activation_screen.json").write_text(json.dumps(out, indent=1, allow_nan=True), encoding="utf-8")
+        _write_csv(out_dir / "activation_screen_peaks.csv", SCREEN_PEAK_COLUMNS, peak_rows)
+        for L, v in out["layers"].items():
+            def f(x):
+                return f"{x['estimate']:.3f} [{x['ci_low']:.3f}, {x['ci_high']:.3f}]"
+            print(f"L{L}: rho {f(v['a_mean_rho'])} (median {v['a_median_rho']:.3f}, {v['a_n_peaks']} peaks); "
+                  f"recall {f(v['b_recall'])} vs chance {f(v['b_chance'])}, mass {f(v['b_mass_recall'])} "
+                  f"({v['b_n_peaks']} peaks, {v['b_n_excluded_l0_le_8']} with L0 <= 8 excluded); between-peak "
+                  f"share {f(v['c_between_share'])} vs null {f(v['c_null_reference'])}, log {f(v['c_between_share_log'])}")
+        print(f"V1-4c exploratory: {out['v1_4c_exploratory']}")
+        return
 
     if args.reliable_associations:
         rows, summary = reliable_association_list(

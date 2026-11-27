@@ -1234,3 +1234,149 @@ def test_fit_reference_rejects_bad_files(tmp_path):
         FitReference({"schema_version": 99, "probabilities": [0, 1], "note": "", "layers": {}})
     with pytest.raises(ValueError, match="malformed"):
         _fit_ref([0.9, 0.5, 0.6])
+
+
+# --- V1-5: screen sample, exhaustive local ablation, demo features ------------------------
+
+from inspector import runtime as rt  # noqa: E402
+
+
+def test_screen_population_and_order_are_registered_and_deterministic():
+    pop = rt.screen_population()
+    assert len(pop) == 2048 and pop[0] == 4506 and pop[1023] == 5529 and pop[1024] == 57754 and pop[-1] == 58777
+    order = rt.screen_order(pop)
+    assert order == rt.screen_order(list(reversed(pop)))          # ascending before permuting
+    assert sorted(order) == pop and order != pop
+    assert order == [int(r) for r in np.random.default_rng(0).permutation(np.asarray(pop))]
+
+
+def test_random_sample_prefix_budget_and_skips():
+    costs = {1: 100.0, 2: None, 3: 200.0, 4: 300.0, 5: 50.0, 6: 10.0}
+    calls = []
+
+    def cost_of(r):
+        calls.append(r)
+        return costs[r]
+    res = rt.random_sample([1, 2, 3, 4, 5, 6], cost_of, budget_s=550.0)
+    # 100 + 200 = 300; + 300 > 550 stops the walk (5 and 6 would fit but are never reached)
+    assert [x["row"] for x in res["sample"]] == [1, 3] and res["skipped"] == [2]
+    assert res["first_excluded"] == {"row": 4, "seconds": 300.0} and res["total_seconds"] == 300.0
+    assert calls == [1, 2, 3, 4] and res["n_walked"] == 4
+    assert rt.random_sample([1, 2, 3, 4, 5, 6], lambda r: costs[r], 550.0) == res
+    all_in = rt.random_sample([1, 2, 3], lambda r: costs[r], 1e9)
+    assert all_in["first_excluded"] is None and [x["row"] for x in all_in["sample"]] == [1, 3]
+
+
+def test_ablation_cost_uses_pairs_and_tokens():
+    exp = {"input": {"n_processed_peaks": 100},
+           "layers": {"2": {"tokens": [{"l0": 3}, {"l0": 0}, {"l0": 5}]},
+                      "4": {"tokens": [{"l0": 1}, {"l0": 1}, {"l0": 0}]}}}
+    c = rt.ablation_cost(exp)
+    assert c["c_n"] == pytest.approx(0.006 + 0.068)
+    assert c["layers"]["2"] == {"pairs": 8, "tokens": 2, "rows": 10}
+    assert c["layers"]["4"] == {"pairs": 2, "tokens": 2, "rows": 4}
+    assert c["seconds"] == pytest.approx(14 * 0.074)
+
+
+def test_demo_features_are_the_union_of_active_features():
+    a = {2: torch.tensor([[0.0, 1.0, 0.0], [0.0, 0.0, 0.0]]), 4: torch.tensor([[0.5, 0.0]])}
+    b = {2: torch.tensor([[0.0, 0.0, 2.0]]), 4: torch.tensor([[0.0, 0.0]])}
+    assert rt.active_features(a[2]) == [1]
+    assert rt.demo_feature_union([a, b]) == {2: [1, 2], 4: [0]}
+
+
+def test_screen_ablation_rows_cover_singles_and_joints():
+    insp, ctx = _fake_ablation_setup()
+    reports = rt.exhaustive_local(insp, ctx, 2)
+    assert [r.position for r in reports] == [0, 1, 2]                 # token 3 has L0 0
+    rows = rt.screen_ablation_rows(7, 2, reports)
+    singles = [r for r in rows if r["kind"] == "single"]
+    joints = [r for r in rows if r["kind"] == "joint"]
+    assert len(singles) == int((ctx.features[2] > 0).sum()) and len(joints) == 3
+    assert {(r["feature"], r["token"]) for r in singles} == {(1, 0), (0, 1), (0, 2), (1, 2)}
+    assert all(r["peak"] == r["token"] - 1 and r["row"] == 7 for r in rows)
+    j2 = next(r for r in joints if r["token"] == 2)
+    assert j2["l0"] == 2 and j2["activation"] == pytest.approx(3.5) and j2["delta_total"] == -14.0
+
+
+class _FakeScreenInspector:
+    """explain / ablation_context / ablate_token over the toy features."""
+
+    def __init__(self, saved_exp):
+        self.inner, self.ctx = _fake_ablation_setup()
+        self.layers = (2,)
+        self.saved = saved_exp
+        self.provenance = {"sae": {"2": {"sha256_16": "x" * 16}}}
+        self.explained = []
+
+    def explain(self, spec):
+        self.explained.append(spec)
+        return types.SimpleNamespace(prediction=self.saved["prediction"], layers=self.saved["layers"])
+
+    def ablation_context(self, spec, exp):
+        return self.ctx
+
+    def ablate_token(self, ctx, layer, pos, with_summaries=False):
+        return self.inner.ablate_token(ctx, layer, pos, with_summaries=with_summaries)
+
+
+def _screen_tree(tmp_path, hours: float):
+    tokens = [{"l0": 1}, {"l0": 1}, {"l0": 2}, {"l0": 0}]
+    saved = {"prediction": {"peptide": "PEK", "tokens": ["P", "E", "K"],
+                            "residues": [{"log_prob_tf": -0.1}] * 3, "eos_log_prob_tf": -0.2},
+             "layers": {"2": {"tokens": tokens}}}
+    v15 = tmp_path / "v1_5"
+    (v15 / "screen" / "explanations").mkdir(parents=True)
+    rows = []
+    for row in (11, 12):
+        (v15 / "screen" / "explanations" / f"row_{row}.json").write_text(json.dumps(saved))
+        rows.append({"row": row, "spectrum_id": str(row), "c_n": 0.1, "predicted_seconds": 1.0,
+                     "layers": {"2": {"pairs": 4, "tokens": 3, "rows": 7}}})
+    (v15 / "screen" / "screen_sample.json").write_text(json.dumps({
+        "rows": rows, "sample_rows": [11, 12], "total_predicted_seconds": hours * 3600,
+        "total_predicted_hours": hours}))
+    return v15, saved
+
+
+def test_screen_ablate_resumes_and_writes_atomically(tmp_path):
+    v15, saved = _screen_tree(tmp_path, 1.0)
+    insp = _FakeScreenInspector(saved)
+    first = rt.screen_ablation_path(v15, 11, 2)
+    first.parent.mkdir(parents=True)
+    first.write_bytes(b"already written")
+    (first.parent / "row_12_L2.parquet.tmp").write_bytes(b"stale")
+    res = rt.screen_ablate(insp, Path("unused"), v15, 9.0, log=lambda *_: None, read_spectrum=lambda r: r)
+    assert res["skipped_existing"] == [11] and res["done"] == [12] and insp.explained == [12]
+    assert first.read_bytes() == b"already written"
+    table = pq.read_table(rt.screen_ablation_path(v15, 12, 2))
+    meta = {k.decode(): v.decode() for k, v in table.schema.metadata.items()}
+    assert meta["schema_version"] == "1" and "error-preserving" in meta["provenance"]
+    assert table.num_rows == 4 + 3 and not list(first.parent.glob("*.tmp"))
+    again = rt.screen_ablate(insp, Path("unused"), v15, 9.0, log=lambda *_: None, read_spectrum=lambda r: r)
+    assert again["done"] == [] and again["skipped_existing"] == [11, 12]
+
+
+def test_screen_ablate_budget_and_mismatch_refuse(tmp_path):
+    v15, saved = _screen_tree(tmp_path, 9.5)
+    with pytest.raises(RuntimeError, match="exceeds the budget"):
+        rt.screen_ablate(_FakeScreenInspector(saved), Path("unused"), v15, 9.0, log=lambda *_: None,
+                         read_spectrum=lambda r: r)
+    other = json.loads(json.dumps(saved))
+    other["layers"]["2"]["tokens"][0]["l0"] = 2
+    with pytest.raises(RuntimeError, match="does not match step 2"):
+        rt.screen_ablate(_FakeScreenInspector(other), Path("unused"), v15, 9.0, force=True,
+                         log=lambda *_: None, read_spectrum=lambda r: r)
+
+
+@needs_data
+def test_exhaustive_local_equals_ablate_token(inspector, ctx0):
+    reports = rt.exhaustive_local(inspector, ctx0, 8)
+    feats = ctx0.features[8]
+    assert [r.position for r in reports] == (feats > 0).any(dim=1).nonzero().flatten().tolist()
+    for t in (reports[0].position, reports[len(reports) // 2].position):
+        direct = inspector.ablate_token(ctx0, 8, t, with_summaries=False)
+        got = next(r for r in reports if r.position == t)
+        assert [r["feature"] for r in got.results] == [r["feature"] for r in direct.results]
+        for a, b in zip(got.results, direct.results, strict=True):
+            assert a["delta_total"] == pytest.approx(b["delta_total"], abs=1e-6)
+        assert got.joint_delta_total == pytest.approx(direct.joint_delta_total, abs=1e-6)

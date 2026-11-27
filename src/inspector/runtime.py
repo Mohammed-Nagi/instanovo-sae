@@ -54,6 +54,12 @@ CLI (from the repo root)::
     PYTHONPATH=src uv run python -m inspector.runtime audit-part-b \\
         --parquet <HF test parquet>                     # V1-4c part B, the registered tests
 
+V1-5 (outputs in analysis/v1_5/; the demo set from `python -m analysis --demo-set`)::
+
+    PYTHONPATH=src uv run python -m inspector.runtime demo-explain --parquet <HF test parquet>
+    PYTHONPATH=src uv run python -m inspector.runtime screen-sample --parquet <HF test parquet>
+    PYTHONPATH=src uv run python -m inspector.runtime screen-ablate --parquet <HF test parquet>
+
 --checkpoint defaults to checkpoints/instanovo_v1.1.0.ckpt and --outputs-root
 to sae_pipeline_outputs/, both under the repo root.
 """
@@ -603,6 +609,7 @@ class Inspector:
         )
 
         root = Path(outputs_root)
+        self.outputs_root = root
         self.saes, sae_provenance = {}, {}
         for L in self.layers:
             path = root / "sae" / f"layer_{L}" / f"seed_{seed}" / "checkpoint.pt"
@@ -2426,11 +2433,482 @@ def _cmd_audit_cases(args, inspector: Inspector) -> int:
     return 0
 
 
+# --- V1-5: demo explanations, screen sample, exhaustive local ablation ------------------
+#
+# Registered in STATUS (V1-5 pre-registration): the demo set comes from
+# `analysis --demo-set`; the screen sample is the longest prefix of a seeded
+# random order of the 2,048 local test rows whose predicted exhaustive-ablation
+# cost fits the budget under a frozen cost model; screen-ablate runs every
+# single-feature local ablation (plus the per-token joint) at every token with
+# L0 > 0, one parquet per (row, layer), resumable.
+
+V1_5_DIR = DEFAULT_OUTPUTS_ROOT / "analysis" / "v1_5"
+HF_TEST_OFFSET = 527_974                 # merged row of HF test row 0 (train 499,402 + validation 28,572)
+CHUNK_SIZE = 1024
+SCREEN_CHUNKS = (520, 572)
+SCREEN_SEED = 0
+SCREEN_BUDGET_HOURS = 9.0
+COST_INTERCEPT_S, COST_SLOPE_S = 0.006, 0.00068   # frozen c(n) = 0.006 + 0.00068 n s per ablated row
+SCREEN_RULE = (
+    "population: the 2,048 HF test rows in chunks 520/572, ascending; order: "
+    "np.random.default_rng(0).permutation; walk the order, skipping (and counting) rows whose beam "
+    "does not complete; the sample is the longest prefix whose predicted local-ablation cost is <= the "
+    "budget (9 h). Cost per spectrum = sum over layers 2/4/6/8 of (active pairs + tokens with L0 > 0) "
+    "x c(n), c(n) = 0.006 + 0.00068 n s per ablated row (batched 32 + 1), n = processed peaks; pairs "
+    "exact from explain(). Frozen, never recalibrated; measured timing is reported only.")
+FINDING7_SCREEN_NOTE = "every sample spectrum was SAE training data (Finding 7)"
+SCREEN_PROVENANCE = ("exact ablation, error-preserving (SAE error kept), local (one token), teacher-forced "
+                     "on the predicted peptide, n = 1 spectrum per row, no CI; every active (feature, token) "
+                     "pair at every token with L0 > 0 (latent included) plus the per-token joint")
+
+
+def hf_test_row_location(row: int) -> tuple[int, int]:
+    """(chunk, index within the chunk) of an HF test row in the merged corpus."""
+    merged = HF_TEST_OFFSET + int(row)
+    return merged // CHUNK_SIZE, merged % CHUNK_SIZE
+
+
+def screen_population(chunks: tuple[int, ...] = SCREEN_CHUNKS) -> list[int]:
+    """HF test rows held by the given local chunks, ascending."""
+    rows = []
+    for c in chunks:
+        rows += [c * CHUNK_SIZE + i - HF_TEST_OFFSET for i in range(CHUNK_SIZE)]
+    if min(rows) < 0:
+        raise ValueError(f"chunks {chunks} reach before the test split")
+    return sorted(rows)
+
+
+def screen_order(population: list[int], seed: int = SCREEN_SEED) -> list[int]:
+    """The registered walk order: default_rng(seed).permutation of the ascending rows."""
+    return [int(r) for r in np.random.default_rng(seed).permutation(np.asarray(sorted(population)))]
+
+
+def active_features(features: torch.Tensor) -> list[int]:
+    """Features active (> 0) at any token, ascending."""
+    return sorted((features > 0).any(dim=0).nonzero().flatten().tolist())
+
+
+def demo_feature_union(per_row: list[dict[int, torch.Tensor]]) -> dict[int, list[int]]:
+    """Per layer, the union over spectra of the features active at any token."""
+    out: dict[int, set[int]] = {}
+    for feats in per_row:
+        for L, f in feats.items():
+            out.setdefault(int(L), set()).update(active_features(f))
+    return {L: sorted(v) for L, v in sorted(out.items())}
+
+
+def cost_per_ablated_row(n_peaks: int) -> float:
+    return COST_INTERCEPT_S + COST_SLOPE_S * n_peaks
+
+
+def ablation_cost(explanation: dict) -> dict:
+    """Predicted exhaustive local-ablation cost of one explained spectrum (an
+    Explanation dict): per layer the active pairs (sum of token L0), the tokens
+    with L0 > 0 (one joint each) and their ablated rows, and the total seconds."""
+    n = int(explanation["input"]["n_processed_peaks"])
+    c = cost_per_ablated_row(n)
+    layers, total = {}, 0.0
+    for L, block in explanation["layers"].items():
+        l0 = [int(t["l0"]) for t in block["tokens"]]
+        pairs, tokens = sum(l0), sum(v > 0 for v in l0)
+        layers[str(L)] = {"pairs": pairs, "tokens": tokens, "rows": pairs + tokens}
+        total += (pairs + tokens) * c
+    return {"n_peaks": n, "c_n": c, "layers": layers, "seconds": total}
+
+
+def random_sample(order: list[int], cost_of, budget_s: float) -> dict:
+    """Walk `order`; cost_of(row) gives the predicted seconds, or None when the
+    beam does not complete (skipped, counted). The sample is the longest prefix
+    (over completed rows) whose total stays <= budget_s; the walk stops at the
+    first row that would exceed it. cost_of is called lazily, in order."""
+    sample, skipped, total, walked = [], [], 0.0, 0
+    first_excluded = None
+    for row in order:
+        walked += 1
+        cost = cost_of(row)
+        if cost is None:
+            skipped.append(int(row))
+            continue
+        if total + cost > budget_s:
+            first_excluded = {"row": int(row), "seconds": float(cost)}
+            break
+        sample.append({"row": int(row), "seconds": float(cost)})
+        total += cost
+    return {"sample": sample, "skipped": skipped, "n_walked": walked,
+            "first_excluded": first_excluded, "total_seconds": total}
+
+
+def exhaustive_local(inspector: Inspector, ctx: AblationContext, layer: int) -> list[AblationReport]:
+    """ablate_token at every token with L0 > 0 (latent included), in token order:
+    every active feature alone, then all of them jointly."""
+    feats = ctx.features[layer]
+    tokens = (feats > 0).any(dim=1).nonzero().flatten().tolist()
+    return [inspector.ablate_token(ctx, layer, int(t), with_summaries=False) for t in tokens]
+
+
+_SCREEN_COLUMNS = ("row", "layer", "token", "peak", "kind", "feature", "activation", "l0", "delta_total",
+                   "delta_eos", "delta_log_prob", "argmax_changed", "eos_argmax_changed")
+
+
+def screen_ablation_rows(row: int, layer: int, reports: list[AblationReport]) -> list[dict]:
+    """Flat rows for one (row, layer): each single ablation (kind 'single') and
+    each token's joint (kind 'joint', feature -1, activation = sum of the token's
+    activations)."""
+    out = []
+    for rep in reports:
+        t = int(rep.position)
+        l0 = len(rep.results)
+        for r in rep.results:
+            out.append({"row": row, "layer": layer, "token": t, "peak": t - 1, "kind": "single",
+                        "feature": int(r["feature"]), "activation": float(r["activation"]), "l0": l0,
+                        "delta_total": float(r["delta_total"]), "delta_eos": float(r["delta_eos"]),
+                        "delta_log_prob": [float(v) for v in r["delta_log_prob"]],
+                        "argmax_changed": [bool(v) for v in r["argmax_changed"]],
+                        "eos_argmax_changed": bool(r["eos_argmax_changed"])})
+        if rep.joint is not None:
+            j = rep.joint
+            out.append({"row": row, "layer": layer, "token": t, "peak": t - 1, "kind": "joint", "feature": -1,
+                        "activation": float(sum(r["activation"] for r in rep.results)), "l0": l0,
+                        "delta_total": float(j["delta_total"]), "delta_eos": float(j["delta_eos"]),
+                        "delta_log_prob": [float(v) for v in j["delta_log_prob"]],
+                        "argmax_changed": [bool(v) for v in j["argmax_changed"]],
+                        "eos_argmax_changed": bool(j["eos_argmax_changed"])})
+    return out
+
+
+def _screen_schema():
+    import pyarrow as pa
+    return pa.schema([("row", pa.int64()), ("layer", pa.int64()), ("token", pa.int64()), ("peak", pa.int64()),
+                      ("kind", pa.string()), ("feature", pa.int64()), ("activation", pa.float64()),
+                      ("l0", pa.int64()), ("delta_total", pa.float64()), ("delta_eos", pa.float64()),
+                      ("delta_log_prob", pa.list_(pa.float64())), ("argmax_changed", pa.list_(pa.bool_())),
+                      ("eos_argmax_changed", pa.bool_())])
+
+
+def screen_ablation_path(v15_dir: Path, row: int, layer: int) -> Path:
+    return Path(v15_dir) / "screen" / "ablation" / f"row_{row}_L{layer}.parquet"
+
+
+def _write_parquet_atomic(rows: list[dict], path: Path, metadata: dict[str, str]) -> None:
+    import os
+    import pyarrow as pa
+    path.parent.mkdir(parents=True, exist_ok=True)
+    table = pa.Table.from_pylist(rows, schema=_screen_schema()).replace_schema_metadata(metadata)
+    tmp = path.with_name(path.name + ".tmp")
+    pq.write_table(table, tmp)
+    os.replace(tmp, path)
+
+
+def explanation_matches(exp: Explanation, saved: dict, tol: float = 1e-5) -> str | None:
+    """None if a fresh explanation reproduces a saved one (prediction tokens,
+    teacher-forced log p to tol, every token's L0 at every layer), else why not."""
+    p, s = exp.prediction, saved.get("prediction")
+    if (p is None) != (s is None):
+        return "beam completion differs"
+    if p is not None:
+        if p["tokens"] != s["tokens"]:
+            return f"prediction {p['peptide']} != saved {s['peptide']}"
+        a = [r["log_prob_tf"] for r in p["residues"]] + [p["eos_log_prob_tf"]]
+        b = [r["log_prob_tf"] for r in s["residues"]] + [s["eos_log_prob_tf"]]
+        gap = max(abs(x - y) for x, y in zip(a, b, strict=True))
+        if gap > tol:
+            return f"teacher-forced log p differs by {gap:.2e}"
+    for L, block in exp.layers.items():
+        if [t["l0"] for t in block["tokens"]] != [t["l0"] for t in saved["layers"][L]["tokens"]]:
+            return f"layer {L}: token L0 differ"
+    return None
+
+
+def _write_json_atomic(obj: Any, path: Path) -> None:
+    import os
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, allow_nan=False, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _stamp() -> str:
+    return time.strftime("%H:%M:%S")
+
+
+def demo_explain(inspector: Inspector, parquet_path: Path, v15_dir: Path,
+                 v1_4c_dir: Path = DEFAULT_OUTPUTS_ROOT / "analysis" / "v1_4c", log=print) -> dict:
+    """Step 2a: a fresh explain() per demo row; H1/H5/H7 must reproduce the saved
+    V1-4c prediction and log p, and the local rows (groups B/C) the stored
+    activations (V1-4a tolerance). Writes explanations/row_{r}.json and
+    demo_features.json (per layer, the union of features active at any token)."""
+    v15 = Path(v15_dir)
+    demo = json.loads((v15 / "demo_set.json").read_text(encoding="utf-8"))
+    root = inspector.outputs_root
+    per_row, rows_out, stored_cache = [], [], {}
+    for d in demo["rows"]:
+        row = int(d["row"])
+        spec = read_raw_spectra(parquet_path, [row])[0]
+        t0 = time.perf_counter()
+        exp = inspector.explain(spec)
+        if exp.prediction is None:
+            raise RuntimeError(f"demo row {row}: no beam completed")
+        check = {"prediction": exp.prediction["peptide"]}
+        if d["group"] == "A":
+            saved = saved_prediction(Path(v1_4c_dir) / "explanations" / f"row_{row}.json")
+            fresh = [r["log_prob_tf"] for r in exp.prediction["residues"]] + [exp.prediction["eos_log_prob_tf"]]
+            if exp.prediction["tokens"] != saved["tokens"]:
+                raise RuntimeError(f"row {row}: fresh prediction {exp.prediction['peptide']} != saved "
+                                   f"{''.join(saved['tokens'])}")
+            gap = max(abs(a - b) for a, b in zip(fresh, saved["log_prob_tf"] + [saved["eos_log_prob_tf"]],
+                                                 strict=True))
+            if gap > 1e-5:
+                raise RuntimeError(f"row {row}: fresh log p differs from V1-4c by {gap:.2e}")
+            check["v1_4c_max_abs_log_p_gap"] = gap
+        else:
+            chunk, s = hf_test_row_location(row)
+            fwd = inspector.forward(spec, None)
+            if chunk not in stored_cache:
+                stored_cache[chunk] = torch.load(root / "extract" / "chunks" / f"meta_{chunk:05d}.pt",
+                                                 map_location="cpu", weights_only=False)
+            meta = stored_cache[chunk]
+            if meta["spectrum_ids"][s] != str(HF_TEST_OFFSET + row):
+                raise RuntimeError(f"row {row}: chunk {chunk} index {s} holds spectrum {meta['spectrum_ids'][s]}")
+            if not (torch.equal(fwd.peaks_mz, meta["mz_arrays"][s])
+                    and torch.equal(fwd.peaks_intensity, meta["intensity_arrays"][s])):
+                raise RuntimeError(f"row {row}: processed peaks differ from chunk {chunk}")
+            rows_t = (meta["token_to_spectrum"] == s).nonzero().flatten()
+            worst = {}
+            for L in inspector.layers:
+                stored = torch.load(root / "extract" / "chunks" / f"acts_L{L}_{chunk:05d}.pt", map_location="cpu",
+                                    weights_only=False)["activations"][rows_t].float()
+                ours = fwd.activations[L]
+                rms = float(stored.pow(2).mean().sqrt())
+                torch.testing.assert_close(ours, stored, rtol=2 ** -7, atol=2 ** -7 * rms)
+                worst[str(L)] = float(((ours - stored).abs() / (stored.abs() + rms)).max())
+            check["stored_activation_max_rel_err"] = worst
+        ctx = inspector.ablation_context(spec, exp)
+        per_row.append(ctx.features)
+        _write_json_atomic(json.loads(exp.to_json()), v15 / "explanations" / f"row_{row}.json")
+        n_active = {str(L): len(active_features(ctx.features[L])) for L in inspector.layers}
+        rows_out.append({"row": row, "group": d["group"], "n_peaks": exp.input["n_processed_peaks"],
+                         "n_active_features": n_active, **check})
+        log(f"[{_stamp()}] row {row} ({d['group']}): {exp.prediction['peptide']}, "
+            f"{exp.input['n_processed_peaks']} peaks, active {n_active}, {time.perf_counter() - t0:.1f} s")
+    union = demo_feature_union(per_row)
+    out = {"rule": "per layer, the union over the demo spectra of the features active (> 0) at any token "
+                   "(not only the top 8), from a fresh explain() + ablation_context on the prediction",
+           "demo_set_sha256_16": _sha256_prefix(v15 / "demo_set.json"),
+           "rows": rows_out, "n_features": {str(L): len(v) for L, v in union.items()},
+           "features": {str(L): v for L, v in union.items()}, "provenance": inspector.provenance}
+    _write_json_atomic(_finalise(out), v15 / "demo_features.json")
+    log(f"demo_features.json: {out['n_features']}")
+    return out
+
+
+def screen_sample(inspector: Inspector, parquet_path: Path, v15_dir: Path, budget_hours: float,
+                  force: bool = False, log=print) -> dict:
+    """Step 2b: apply the registered random-sample rule; write
+    screen/screen_sample.json and screen/explanations/; time one batch."""
+    v15 = Path(v15_dir)
+    out_path = v15 / "screen" / "screen_sample.json"
+    if out_path.exists() and not force:
+        raise RuntimeError(f"{out_path} exists; the sample is deterministic, pass --force to recompute it")
+    population = screen_population()
+    if max(population) >= parquet_num_rows(parquet_path):
+        raise ValueError(f"{parquet_path} has fewer rows than the screen population needs")
+    order = screen_order(population)
+    rs = inspector.residue_set
+    info, explanations = {}, {}
+    t_walk = time.perf_counter()
+
+    def cost_of(row: int):
+        t0 = time.perf_counter()
+        spec = read_raw_spectra(parquet_path, [row])[0]
+        exp = inspector.explain(spec)
+        rec = read_raw_records(parquet_path, [row], ["modified_sequence"])[0]
+        truth = [rs.residue_remapping.get(t, t) for t in rs.tokenize(rec["modified_sequence"])]
+        if exp.prediction is None:
+            info[row] = {"row": row, "beam_completed": False, "label": "".join(truth)}
+            log(f"[{_stamp()}] row {row}: no beam completed (skipped)")
+            return None
+        d = json.loads(exp.to_json())
+        cost = ablation_cost(d)
+        pred = exp.prediction["tokens"]
+        chunk, s = hf_test_row_location(row)
+        info[row] = {"row": row, "chunk": chunk, "spectrum_index": s, "spectrum_id": str(HF_TEST_OFFSET + row),
+                     "n_peaks": cost["n_peaks"], "c_n": cost["c_n"], "layers": cost["layers"],
+                     "predicted_seconds": cost["seconds"], "prediction": exp.prediction["peptide"],
+                     "label": "".join(truth), "exact": normalise_peptide(pred) == normalise_peptide(truth),
+                     "explain_seconds": time.perf_counter() - t0}
+        explanations[row] = d
+        log(f"[{_stamp()}] row {row}: {cost['n_peaks']} peaks, pairs "
+            f"{ {L: v['pairs'] for L, v in cost['layers'].items()} }, predicted {cost['seconds'] / 60:.1f} min")
+        return cost["seconds"]
+
+    res = random_sample(order, cost_of, budget_hours * 3600.0)
+    sample_rows = [x["row"] for x in res["sample"]]
+    if not sample_rows:
+        raise RuntimeError("the screen sample is empty")
+    for row in sample_rows:
+        _write_json_atomic(explanations[row], v15 / "screen" / "explanations" / f"row_{row}.json")
+
+    # one-batch calibration (reported only): MAX_ABLATION_BATCH single deltas of the
+    # first sample row at layer 2, after one untimed warm-up pass
+    first = sample_rows[0]
+    spec = read_raw_spectra(parquet_path, [first])[0]
+    exp = Explanation.from_dict(explanations[first])
+    ctx = inspector.ablation_context(spec, exp)
+    L = inspector.layers[0]
+    feats = ctx.features[L]
+    w_dec = inspector.saes[L].W_dec.detach().cpu()
+    pairs = [(int(f), int(t)) for t in range(feats.size(0)) for f in (feats[t] > 0).nonzero().flatten().tolist()]
+    deltas = [ablation_delta(feats, w_dec, [(f, [t])]) for f, t in pairs[:MAX_ABLATION_BATCH]]
+    inspector._run_ablations(ctx, L, deltas)
+    t0 = time.perf_counter()
+    inspector._run_ablations(ctx, L, deltas)
+    t_batch = time.perf_counter() - t0
+    n_peaks = info[first]["n_peaks"]
+    timing = {"row": first, "layer": L, "n_peaks": n_peaks, "n_deltas": len(deltas),
+              "batch_seconds": t_batch, "measured_per_row_s": t_batch / len(deltas),
+              "model_per_row_s": cost_per_ablated_row(n_peaks),
+              "ratio_measured_to_model": (t_batch / len(deltas)) / cost_per_ablated_row(n_peaks),
+              "note": "one pass of 32 single ablations + the in-batch baseline after one untimed warm-up "
+                      "pass; reported only, the cost model is frozen"}
+
+    demo_path = v15 / "demo_set.json"
+    demo = json.loads(demo_path.read_text(encoding="utf-8")) if demo_path.is_file() else None
+    demo_rows = {int(d["row"]): d["group"] for d in demo["rows"]} if demo else {}
+    overlap = [{"row": r, "group": demo_rows[r]} for r in sample_rows if r in demo_rows]
+    out = {
+        "rule": SCREEN_RULE, "seed": SCREEN_SEED, "chunks": list(SCREEN_CHUNKS), "budget_hours": budget_hours,
+        "cost_model": {"intercept_s": COST_INTERCEPT_S, "slope_s": COST_SLOPE_S, "batch": MAX_ABLATION_BATCH},
+        "population_size": len(population), "order_head": order[:res["n_walked"]],
+        "n_walked": res["n_walked"], "n_sample": len(sample_rows), "sample_rows": sample_rows,
+        "rows": [info[r] for r in sample_rows],
+        "skipped_no_beam": [info[r] for r in res["skipped"]],
+        "first_excluded": None if res["first_excluded"] is None else {
+            **res["first_excluded"], "n_peaks": info[res["first_excluded"]["row"]]["n_peaks"]},
+        "total_predicted_seconds": res["total_seconds"], "total_predicted_hours": res["total_seconds"] / 3600,
+        "n_exact": sum(info[r]["exact"] for r in sample_rows),
+        "overlap_with_demo_set": overlap, "demo_set_sha256_16": _sha256_prefix(demo_path) if demo else None,
+        "measured_one_batch": timing, "walk_seconds": time.perf_counter() - t_walk,
+        "finding_7_note": FINDING7_SCREEN_NOTE, "provenance": inspector.provenance,
+    }
+    _write_json_atomic(_finalise(out), out_path)
+    return out
+
+
+def screen_ablate(inspector: Inspector, parquet_path: Path, v15_dir: Path, budget_hours: float,
+                  force: bool = False, log=print, read_spectrum=None) -> dict:
+    """Step 4: exhaustive local ablation of every screen-sample row at every
+    layer. Each (row, layer) is one parquet written atomically; existing files
+    are skipped (resume). Refuses if the predicted total exceeds the budget
+    unless force."""
+    from schema import SCREEN_ABLATION_SCHEMA_VERSION
+    v15 = Path(v15_dir)
+    sample = json.loads((v15 / "screen" / "screen_sample.json").read_text(encoding="utf-8"))
+    if sample["total_predicted_hours"] > budget_hours and not force:
+        raise RuntimeError(f"predicted {sample['total_predicted_hours']:.2f} h exceeds the budget of "
+                           f"{budget_hours} h; pass --force to run anyway")
+    read_spectrum = read_spectrum or (lambda row: read_raw_spectra(parquet_path, [row])[0])
+    for stale in (v15 / "screen" / "ablation").glob("*.tmp"):
+        stale.unlink()
+    sample_sha = _sha256_prefix(v15 / "screen" / "screen_sample.json")
+    t_start, predicted_done, done, skipped = time.perf_counter(), 0.0, [], []
+    total_pred = sample["total_predicted_seconds"]
+    n_files = len(sample["rows"]) * len(inspector.layers)
+
+    def layer_pred(info: dict, L: int) -> float:
+        return info["layers"][str(L)]["rows"] * info["c_n"]
+
+    remaining_pred = sum(layer_pred(info, L) for info in sample["rows"] for L in inspector.layers
+                         if not screen_ablation_path(v15, int(info["row"]), L).is_file())
+    n_existing = sum(screen_ablation_path(v15, int(info["row"]), L).is_file()
+                     for info in sample["rows"] for L in inspector.layers)
+    pred_this_run, files_done = 0.0, n_existing
+    log(f"[{_stamp()}] screen-ablate start: {n_existing}/{n_files} (row, layer) files already written; "
+        f"predicted remaining work {remaining_pred / 3600:.2f} h (cost model)")
+    for i, info in enumerate(sample["rows"], 1):
+        row = int(info["row"])
+        todo = [L for L in inspector.layers if not screen_ablation_path(v15, row, L).is_file()]
+        if not todo:
+            skipped.append(row)
+            predicted_done += info["predicted_seconds"]
+            continue
+        t0 = time.perf_counter()
+        spec = read_spectrum(row)
+        exp = inspector.explain(spec)
+        saved = json.loads((v15 / "screen" / "explanations" / f"row_{row}.json").read_text(encoding="utf-8"))
+        why = explanation_matches(exp, saved)
+        if why is not None:
+            raise RuntimeError(f"row {row}: fresh explain() does not match step 2 ({why})")
+        ctx = inspector.ablation_context(spec, exp)
+        for L in todo:
+            t_layer = time.perf_counter()
+            reports = exhaustive_local(inspector, ctx, L)
+            rows = screen_ablation_rows(row, L, reports)
+            n_single = sum(r["kind"] == "single" for r in rows)
+            expected = info["layers"][str(L)]
+            if n_single != expected["pairs"] or len(reports) != expected["tokens"]:
+                raise RuntimeError(f"row {row} L{L}: {n_single} pairs / {len(reports)} tokens, step 2 recorded "
+                                   f"{expected['pairs']} / {expected['tokens']}")
+            seconds = time.perf_counter() - t_layer
+            meta = {"schema_version": str(SCREEN_ABLATION_SCHEMA_VERSION), "row": str(row), "layer": str(L),
+                    "spectrum_id": info["spectrum_id"], "prediction": exp.prediction["peptide"],
+                    "target": json.dumps(ctx.target), "provenance": SCREEN_PROVENANCE,
+                    "finding_7_note": FINDING7_SCREEN_NOTE, "caveat": ABLATION_NOTE,
+                    "sae_sha256_16": inspector.provenance["sae"][str(L)]["sha256_16"],
+                    "screen_sample_sha256_16": sample_sha, "seconds": f"{seconds:.3f}",
+                    "predicted_seconds": f"{expected['rows'] * info['c_n']:.3f}"}
+            _write_parquet_atomic(rows, screen_ablation_path(v15, row, L), meta)
+            files_done += 1
+            pred_this_run += layer_pred(info, L)
+            elapsed = time.perf_counter() - t_start
+            left = max(remaining_pred - pred_this_run, 0.0) * elapsed / pred_this_run
+            finish = time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() + left))
+            log(f"[{_stamp()}] row {row} L{L}: {n_single} pairs + {len(reports)} joints in {seconds:.0f} s "
+                f"(predicted {expected['rows'] * info['c_n']:.0f} s); files {files_done}/{n_files}; "
+                f"elapsed {elapsed / 3600:.2f} h; projected finish {finish} (measured/model "
+                f"{elapsed / pred_this_run:.2f})")
+        predicted_done += info["predicted_seconds"]
+        done.append(row)
+        elapsed = time.perf_counter() - t_start
+        log(f"[{_stamp()}] row {row} done ({i}/{len(sample['rows'])}) in {(time.perf_counter() - t0) / 60:.1f} min; "
+            f"elapsed {elapsed / 3600:.2f} h; predicted work done {predicted_done / total_pred:.0%}")
+    return {"done": done, "skipped_existing": skipped, "seconds": time.perf_counter() - t_start}
+
+
+def _cmd_demo_explain(args, inspector: Inspector) -> int:
+    demo_explain(inspector, args.parquet, args.v1_5_dir)
+    return 0
+
+
+def _cmd_screen_sample(args, inspector: Inspector) -> int:
+    out = screen_sample(inspector, args.parquet, args.v1_5_dir, args.budget_hours, force=args.force)
+    t = out["measured_one_batch"]
+    print(f"screen sample: {out['n_sample']} rows (walked {out['n_walked']}, skipped {len(out['skipped_no_beam'])} "
+          f"without a completed beam); predicted {out['total_predicted_hours']:.2f} h of {out['budget_hours']} h; "
+          f"first excluded {out['first_excluded']}")
+    print(f"overlap with the demo set: {out['overlap_with_demo_set']}; exact vs label {out['n_exact']}/{out['n_sample']}")
+    print(f"one batch: {t['n_deltas']} ablations in {t['batch_seconds']:.2f} s = {t['measured_per_row_s']:.4f} s/row "
+          f"vs model c({t['n_peaks']}) = {t['model_per_row_s']:.4f} s/row (ratio {t['ratio_measured_to_model']:.2f})")
+    return 0
+
+
+def _cmd_screen_ablate(args, inspector: Inspector) -> int:
+    res = screen_ablate(inspector, args.parquet, args.v1_5_dir, args.budget_hours, force=args.force)
+    print(f"screen-ablate: {len(res['done'])} rows ablated, {len(res['skipped_existing'])} already complete, "
+          f"{res['seconds'] / 3600:.2f} h")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("command", choices=["time", "compare-preprocessing", "accuracy", "audit-cases",
                                        "audit-checks", "audit-notation", "audit-evidence-by",
-                                       "audit-part-b"])
+                                       "audit-part-b", "demo-explain", "screen-sample", "screen-ablate"])
+    p.add_argument("--v1-5-dir", type=Path, default=V1_5_DIR,
+                   help="demo-explain / screen-sample / screen-ablate: V1-5 output directory")
+    p.add_argument("--budget-hours", type=float, default=SCREEN_BUDGET_HOURS,
+                   help="screen-sample / screen-ablate: predicted-cost budget (registered: 9)")
+    p.add_argument("--force", action="store_true",
+                   help="screen-sample: recompute an existing sample; screen-ablate: run over budget")
     p.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     p.add_argument("--outputs-root", type=Path, default=DEFAULT_OUTPUTS_ROOT)
     p.add_argument("--parquet", type=Path,
@@ -2457,12 +2935,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.parquet is None:
         p.error(f"{args.command} needs --parquet")
     if args.command not in ("accuracy", "audit-cases", "audit-checks", "audit-notation",
-                            "audit-part-b") and not args.rows:
+                            "audit-part-b", "demo-explain", "screen-sample", "screen-ablate") and not args.rows:
         p.error(f"{args.command} needs --rows")
     inspector = Inspector(args.checkpoint, args.outputs_root, top_k=args.top_k)
     rc = {"time": _cmd_time, "compare-preprocessing": _cmd_compare, "accuracy": _cmd_accuracy,
           "audit-cases": _cmd_audit_cases, "audit-checks": _cmd_audit_checks,
-          "audit-notation": _cmd_audit_notation, "audit-part-b": _cmd_audit_part_b}[args.command](args, inspector)
+          "audit-notation": _cmd_audit_notation, "audit-part-b": _cmd_audit_part_b,
+          "demo-explain": _cmd_demo_explain, "screen-sample": _cmd_screen_sample,
+          "screen-ablate": _cmd_screen_ablate}[args.command](args, inspector)
     return rc or 0
 
 

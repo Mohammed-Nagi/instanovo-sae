@@ -27,6 +27,7 @@ src/                       one source root (run with PYTHONPATH=src)
 ├── schema.py              on-disk schema versions
 ├── analysis.py            post-hoc analysis over eval outputs           (v1, new)
 ├── build_dictionary.py    builds the feature dictionary                  (v1, new)
+├── detached.py            runs a long command without a console window, logs exit code
 └── inspector/             the tool                                       (v1, new)
     ├── runtime.py         explain(spectrum) (V1-4a), exact ablation (V1-4b)
     ├── dictionary.py      loads the feature dictionary; per-feature summaries
@@ -60,8 +61,14 @@ sae_pipeline_outputs/
 ├── interpret/layer_{L}/archive/      superseded runs (unblinded_v1), provenance only;
 │                                      nothing reads it (schema.check_run_tag)
 ├── analysis/                          outputs of analysis.py
+│   └── v1_5/                          demo set, explanations, screen sample,
+│                                      screen/ablation/row_{r}_L{L}.parquet, screen results
 ├── logs/                              pipeline run logs
-└── dictionary/layer_{L}.parquet       the contract between pipeline and tool
+└── dictionary/
+    ├── layer_{L}.parquet              the contract between pipeline and tool
+    ├── examples/                      layer_{L}.parquet (top-20 spectra per demo feature),
+    │                                  spectra.parquet (context), fit_{L}.parquet
+    └── fit_reference.{json,csv}       per-spectrum centred FVE quantiles per layer
 ```
 
 Anything needing the full corpus (Phase 4, full Phase 8) waits for the cluster.

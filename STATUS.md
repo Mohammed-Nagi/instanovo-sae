@@ -1011,8 +1011,8 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-3b, V1-4a, V
         N[UNIMOD:7]) with a clear measured effect, not as a model error.
       - Not suited: H2 and H3 (possible label errors, ¹³C artefact), H4 and H6
         (undetermined, no spectrum evidence).
-- [ ] **V1-5 Data for the tool** — pre-registration and spec (2026-11-26;
-      approved plan, nothing implemented or run yet). Two separate parts:
+- [x] **V1-5 Data for the tool** — pre-registration and spec (2026-11-26);
+      implemented and run 2026-11-27 (results at the end of this entry). Two separate parts:
       (1) data for a small demo in V1-6: explanations, feature examples for the
       features active in the demo set, and a calibrated per-spectrum SAE-fit
       indicator. The demo set gets no precomputed ablation; the dashboard
@@ -1291,6 +1291,152 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-3b, V1-4a, V
         |Δ|/(|a| + rms) 0.0030–0.0032, as the other rows). The demo rule,
         rows and every other row are unchanged; the other six local demo
         rows match exactly.
+
+      Results (2026-11-27, steps 1–5; code `c3ab241`, `7a0af40`, `b101794`):
+
+      Demo set (step 1, 263 s): every registered pick reproduced. Group B
+      5398, 5406, 58409; group C (best reliable F1dom feature per layer)
+      L2 F7522 → row 58193, L4 F11376 → 58255, L6 F9282 → 5378, L8 F5107 →
+      57755; group A H7/H1/H5 as registered. Demo features (union of features
+      active at any token): L2 2,623, L4 2,781, L6 2,814, L8 3,227.
+      Verification 1: H1/H5/H7 reproduce their V1-4c log p (gap 0.0); the
+      seven local demo rows reproduce the stored activations at the V1-4a
+      tolerance (max |Δ|/(|a| + rms) ≈ 0.003), with Dev 1 for row 58193's
+      peak intensities.
+
+      Screen sample (step 2): 16 rows (17 walked, 0 skipped without a
+      completed beam); first excluded row 58247 (200 peaks, 4,286 s
+      predicted). Predicted cost 7.95 h. No overlap with the demo set. Exact
+      match against the label: 9 of 16. One-batch timing: 3.53 s for 32 + 1
+      ablations at 145 peaks, 0.110 s per row vs the model's 0.105 s (1.06×).
+      Rows: 57828, 58107, 58630, 57865, 5173, 58750, 5363, 58263, 58398,
+      58455, 57870, 58426, 5124, 4856, 57905, 5447.
+
+      Exhaustive local ablation (step 4): 64 (row, layer) files, 258,886
+      single-feature ablations + 8,252 per-token joints. Ablation time 8.02 h
+      vs 7.95 h predicted (1.009×); per file 0.99–1.14× the model. Wall clock
+      14:07–22:20 with one interruption:
+      - At 21:31:35 the process died with `forrtl: error (200): program
+        aborting due to window-CLOSE event` (the console window it was
+        attached to was closed; no Python traceback, no reboot or crash event
+        in the system log). 57 of 64 files were complete; the only work lost
+        was row 57905 L4, about 6 min into a ~10 min file (written
+        atomically, so nothing partial was left on disk).
+      - Relaunched at 21:34 with the same command, detached without a
+        console window. The resume logged `57/64 (row, layer) files already
+        written`, recomputed only the 7 missing files (row 57905 L4/L6/L8,
+        row 5447 L2–L8; the fresh explain() matched step 2 for both rows) and
+        finished at 22:20 (0.76 h).
+      - RAM 1.6–2.4 GB (plan: < 2 GB).
+      Verification 3 (`python -m inspector.runtime screen-verify`, output
+      `screen/screen_verify.json`): three pairs drawn with `default_rng(0)`
+      from the 258,886 single rows (row 58263 L6 token 165 F5326; row 57905 L8 token 143
+      F10759, a post-resume file; row 58630 L2 token 162 F6661), recomputed
+      with `Inspector.ablate` (local): Δ = 0 on delta_total, delta_eos, every
+      per-residue delta and the activation; argmax flags equal.
+
+      Feature examples and fit reference (step 3): 28.4 min (four layers
+      5.7–6.3 min each, re-annotation of 13,305 referenced spectra 296 s).
+      Example rows: L2 52,435, L4 55,596, L6 56,268, L8 64,524. Fit reference
+      medians (per-spectrum centred FVE): L2 0.9847 (n 13,312), L4 0.9695
+      (13,312), L6 0.9426 (12,288), L8 0.9187 (12,288).
+      - The first attempt (22:21) was stopped by Claude Code after ~1 min
+        (layer 2, chunk 2) because the system was critically low on memory
+        while it ran as a session background job; it wrote nothing.
+      - Restarted at 23:03, detached, with a memory guard
+        (`--max-rss-gb 4`: RSS logged after every chunk, loud stop above the
+        limit). RSS rose over the first six chunks (2.64 → 3.29 GB), then
+        stayed at 3.28–3.41 GB for the remaining ~40 chunks across all four
+        layers (no growth per chunk, so no leak). Measured peak 3.90 GB
+        (Windows peak working set), reached at the end during re-annotation
+        and the fit-reference write: plan said < 2 GB, and the peak is close
+        to the 4 GB guard, which is checked only after chunks and layers.
+      - Exit code not captured: the ad-hoc launcher's exit-code echo was
+        mis-quoted and logged `exit %0%`. Evidence the run completed: the
+        log's final line from the run is `fit reference -> fit_reference.json,
+        fit_reference.csv; ... total 28.4 min; RSS 3.90 GB (peak 3.90 GB)`,
+        written after every other output; all four `layer_{L}.parquet`, all
+        four `fit_{L}.parquet`, `spectra.parquet` and `fit_reference.{json,csv}`
+        exist and load (`FitReference.load` and `FeatureExamples.load` with
+        their schema checks), with no `.tmp` files left. The launcher is now
+        `python -m detached` (`37c1c9f`), which appends `exit code N`.
+      Verification 2 (`screen-verify`, same output): explain()'s
+      fve_centred (fresh forward pass) vs the
+      reference's per-spectrum value (stored bf16 extraction) for the 23
+      local spectra (7 demo + 16 screen): max |Δ| L2 3.6e-05, L4 1.2e-04,
+      L6 1.2e-04, L8 2.1e-04; mean Δ within ±1.8e-05; the percentile the UI
+      would show moves by at most 0.66 points. (explain() rounds fve_centred
+      to 6 decimals.)
+
+      Screen statistics (step 5, 7 s): 16 spectra, bootstrap over spectra,
+      10,000 resamples, `default_rng(0)`, percentile 95% CIs.
+
+      | layer | (a) mean ρ [CI] (median; peaks) | (b) recall [CI] | chance [CI] | mass recall [CI] | (b) peaks (L0 ≤ 8 excl.) | (c) between share [CI] | null | (c) on log10 [CI] |
+      |---|---|---|---|---|---|---|---|---|
+      | L2 | 0.689 [0.680, 0.696] (0.705; 2,047) | 0.895 [0.886, 0.903] | 0.283 [0.275, 0.291] | 0.913 [0.905, 0.921] | 2,046 (1) | 0.143 [0.095, 0.179] | 0.031 | 0.241 [0.215, 0.267] |
+      | L4 | 0.633 [0.619, 0.646] (0.653; 2,047) | 0.870 [0.861, 0.878] | 0.275 [0.269, 0.281] | 0.892 [0.884, 0.899] | 1,929 (118) | 0.150 [0.102, 0.200] | 0.032 | 0.290 [0.264, 0.315] |
+      | L6 | 0.577 [0.567, 0.588] (0.581; 2,005) | 0.848 [0.836, 0.860] | 0.276 [0.268, 0.285] | 0.875 [0.863, 0.886] | 1,889 (158) | 0.183 [0.114, 0.242] | 0.032 | 0.364 [0.334, 0.394] |
+      | L8 | 0.534 [0.522, 0.546] (0.537; 1,891) | 0.839 [0.822, 0.853] | 0.255 [0.248, 0.262] | 0.869 [0.854, 0.881] | 1,826 (221) | 0.260 [0.237, 0.292] | 0.031 | 0.442 [0.407, 0.474] |
+
+      Null CIs are ±0.001. Mass recall is aggregated as the per-peak ratio,
+      mean over peaks (an interpretation of the definition; recorded in the
+      output). Effects: exact, error-preserving, local, single-feature
+      ablation teacher-forced on the prediction, n = 1 spectrum per row.
+      Interpretation:
+      - Screening: explain()'s top 8 by activation holds 84–90% of each
+        peak's three largest single-feature effects (mass recall 87–91%),
+        against a chance level of 26–28%. The screen weakens with depth:
+        recall 0.895 at L2 to 0.839 at L8, and the within-peak rank
+        correlation (a) 0.69 to 0.53. About one in ten at L2 to one in six at
+        L8 of a peak's three largest effects lies outside the top 8.
+      - Magnitude only: every statistic here uses |e|. Activation says
+        nothing about an effect's direction (whether removing the feature
+        raises or lowers log p of the prediction), and V1-4c showed that
+        concept labels get the direction wrong (H1 and H7: wrong sign). A
+        high-activation feature is a candidate for a large effect, not
+        evidence of which way it pushes; the ablation panel shows that.
+      - Peaks: between-peak share of |e| 0.14–0.26 against an
+        exchangeable-pair null of 0.03 (0.24–0.44 on log10 |e|), larger with
+        depth. Some peaks carry larger effects throughout, so effect size is
+        partly a property of the peak, not only of the feature.
+      - V1-4c exploratory, recomputed from `part_b_token_sweep.csv`
+        (verification 5): 8 of H7's 20 largest effects lie outside the top 8
+        by activation, the 3 largest rank 4, 5 and 6. Different metric (effect
+        on M across two contexts), 13 peaks, L8, one spectrum: not comparable
+        to (b).
+      - The latent token, ablated but excluded from (a)–(c), is in the output
+        per spectrum (L0 5–21 across layers, 5–10 at L8).
+      - Caveats: 16 spectra from two chunks (520/572), all SAE training
+        data (Finding 7); single-feature effects understate features that are
+        redundant with others (V1-4b); the CIs resample these 16 spectra and
+        do not cover generalisation beyond these chunks (other chunks,
+        unseen spectra, other datasets). 9 of 16 predictions match the label
+        exactly.
+
+      Storage (vs the plan's table): screen ablations 29.3 MB (30–40 MB);
+      explanations 31 MB (10.7 demo + 20.3 screen; plan ~20 MB);
+      dictionary/examples 30.6 MB (layer files 3.4 MB, spectra.parquet
+      26.1 MB, fit_{L} 0.8 MB; plan ≤ 39 MB); fit_reference 0.2 MB (~1 MB);
+      screen results 0.9 MB (< 1 MB).
+
+      Output sha256 (first 16 hex):
+
+      | file (under `sae_pipeline_outputs/`) | sha256_16 |
+      |---|---|
+      | analysis/v1_5/demo_set.json | 3f7a497946cfe6a9 |
+      | analysis/v1_5/demo_features.json | c98e945a7d3dec2c |
+      | analysis/v1_5/screen/screen_sample.json | fa83b86e42efc63b |
+      | analysis/v1_5/screen/ablation/ (sha256 of the sorted `sha256sum` list of the 64 files) | 7555f694481fd2b3 |
+      | analysis/v1_5/screen/activation_screen.json | e17c4ca01bd0f85f |
+      | analysis/v1_5/screen/activation_screen_peaks.csv | 24bc231a03897139 |
+      | dictionary/examples/layer_{2,4,6,8}.parquet | d8cf88b347cea1de, c56b5ad194659a6a, 1751cf2649b6e71c, 447a6141d1f72068 |
+      | dictionary/examples/spectra.parquet | 65012732ee49cbc4 |
+      | dictionary/fit_reference.json / .csv | dbf7b9bd2726a81f / 4100d0f70eb563a1 |
+
+      Verification 4: runtime and storage above. Verification 6: full suite,
+      262 tests pass. Verifications 2 and 3 were first run by one-off
+      scripts, then by `screen-verify` (`37c1c9f`), which reproduced every
+      number; the numbers above are its output.
 - [ ] **V1-6 Dashboard** — `src/inspector/app.py`, Streamlit.
       Spectrum plot with peaks coloured by annotation, layer selector, per-peak
       feature panel, feature card. The card leads with the feature's examples
@@ -1585,6 +1731,24 @@ stated, with the tests that show it (V1-4a's in `tests/test_inspector_runtime.py
   `test_ablate_set_full_token_equals_ablate_token_joint`,
   `test_ablate_set_is_error_preserving_at_the_named_tokens_only` and nine
   more.
+- V1-5 (`c3ab241`, `7a0af40`, `37c1c9f`), additive:
+  `evaluate.TopKAccumulator(aux=None)` gathers an optional provenance tensor
+  beside the top-k (default output identical; `test_chunk_stream.py`);
+  `build_dictionary --examples` (with `--example-features`, `--batch-tokens`,
+  `--with-predictions`, and `--max-rss-gb`, which logs the process RSS after
+  every chunk and stops loudly above the limit; added after the step-3 stop,
+  `test_memory_check_logs_and_guards`); the normal dictionary build is
+  unchanged. `inspector/runtime.py`: `Inspector.outputs_root`, the
+  `demo-explain` / `screen-sample` / `screen-ablate` subcommands and their
+  helpers; `ablate_token` is unchanged (`test_exhaustive_local_equals_ablate_token`).
+  `inspector/dictionary.py`: `FitReference`, `FeatureExamples`. `analysis.py`:
+  `--demo-set`, `--activation-screen`. Schema versions in `schema.py`:
+  examples, fit reference, screen ablation = 1. `37c1c9f`: the
+  `screen-verify` subcommand (verifications 2 and 3; `compare_ablation_row`,
+  `fit_comparison`, `pick_verify_pairs`; `test_screen_verify_*`) and the new
+  module `src/detached.py`, a launcher that runs a long command with no
+  console window and appends its output and exit code to a log
+  (`tests/test_detached.py`).
 
 ## Backlog (after v1; do not start early)
 
@@ -2007,3 +2171,4 @@ secondary evidence, shown with their F1dom and chance fraction.
 - 2026-11-25 — V1-4c part B done. Amendment 2 committed before any ablation on the selected cases (`16ec5a2`): H7's peak-matched secondary control, the sampling rule (rejection, at most 10,000 attempts), "distinct control draws" = possible sets, ties at 1e-6; H8 and the noise-peak check dropped. Code (`800558a`): `ablate_set` / `ablate_sets` (joint ablation of arbitrary (feature, token) sets), the part B helpers and `audit-part-b`; 215 tests pass (12 new). Run 272 s, every reproduction check held. Outcomes: H5 supported (a notation choice, D vs N[UNIMOD:7]), H1, H2 and H7 not supported, H3, H4 and H6 undetermined by construction; ~0.19 false "supported" expected across the 4 decidable tests. Step (c), the H7 exploratory sweep and the V1-5 demo picks (H7, H1, H5 with labels) recorded under V1-4c. No API, GPU or cluster.
 - 2026-11-25 — V1-4c exploratory H7 sweep recorded in full under V1-4c (two top-10 tables, per-peak joints, interpretation, activation as a screen: 8 of the 20 largest effects lie outside the top 8 by activation, limits). Backlog: pre-registered H7 peak-shift test (y10–y15 shifted by ±0.036 Da, no SAE), high priority after V1-6. No code or runs.
 - 2026-11-26 — V1-5 pre-registration and spec committed under V1-5 (no code, no runs): decisions D1–D4 (10-row demo set incl. H5 labelled a notation choice; K = 20 examples, one per spectrum; label-peptide context; outputs in `analysis/v1_5/` and `dictionary/`), the seeded random-sample rule for the screen (chunks 520/572, `default_rng(0)`, longest prefix ≤ 9 h under a frozen cost model), screen definitions (a)–(c) with bootstrap over spectra, steps 1–5, files, tests, commits. Demo ablations are live in the dashboard; no global exhaustive scope. Four backlog items added.
+- 2026-11-27 — V1-5 done. Code in `c3ab241`, `7a0af40`, `b101794` (Dev 1: float32 tolerance for intensities in the peak check) and `37c1c9f` (memory guard, `screen-verify`, `detached` launcher with exit-code logging). Steps 1–5 run as pre-registered: demo set reproduced; screen sample 16 rows (7.95 h predicted, 8.02 h measured); 64 exhaustive local-ablation files; feature examples and fit reference; screen statistics with bootstrap CIs (results under V1-5). Step 4 was interrupted once by a window-CLOSE event (one partial file lost) and resumed, recomputing only the 7 missing files. Step 3 was stopped once for low system memory, then rerun detached with the new `--max-rss-gb` guard (peak RSS 3.90 GB vs the plan's < 2 GB). Step 3's exit code was not captured (completion shown by its final log line and output checks). Verifications 1–6 pass; 2 and 3 by `screen-verify`. 262 tests pass.

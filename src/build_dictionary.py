@@ -636,11 +636,29 @@ def _stream(root: Path, layer: int, sae):
                        dtype=torch.float32)
 
 
+class MemoryGuardError(RuntimeError):
+    """The process exceeded --max-rss-gb."""
+
+
+def memory_check(max_rss_gb: float | None) -> str:
+    """The process's resident set size now and its peak so far (Windows peak
+    working set; elsewhere the current value), as a log fragment. Raises
+    MemoryGuardError if the current RSS exceeds max_rss_gb (None = no limit)."""
+    import psutil
+    mi = psutil.Process().memory_info()
+    rss, peak = mi.rss / 2**30, getattr(mi, "peak_wset", mi.rss) / 2**30
+    if max_rss_gb is not None and rss > max_rss_gb:
+        raise MemoryGuardError(f"RSS {rss:.2f} GB exceeds --max-rss-gb {max_rss_gb:g}; stopping (peak {peak:.2f} GB)")
+    return f"RSS {rss:.2f} GB (peak {peak:.2f} GB)"
+
+
 def stream_layer_examples(stream, sae, features: list[int], k: int = EXAMPLES_K,
-                          batch_tokens: int = EXAMPLE_BATCH_TOKENS, log=print) -> dict:
+                          batch_tokens: int = EXAMPLE_BATCH_TOKENS, log=print,
+                          max_rss_gb: float | None = None) -> dict:
     """One pass over a ChunkStream's chunks: per-spectrum centred FVE for every
     spectrum and the top-k spectra per feature (TopKAccumulator with aux = argmax
-    token). Never holds more than one batch of full-width SAE features."""
+    token). Never holds more than one batch of full-width SAE features. After
+    each chunk the process RSS is logged and checked against max_rss_gb."""
     import time
     import torch
     from evaluate import TopKAccumulator
@@ -677,10 +695,12 @@ def stream_layer_examples(stream, sae, features: list[int], k: int = EXAMPLES_K,
             fve_rows.append((ci, s, str(meta["spectrum_ids"][s]), float(fve[s])))
         spectra[ci] = n_spec
         dt = time.perf_counter() - t0
+        mem = memory_check(max_rss_gb)
         if i == 0:
-            log(f"  chunk {ci}: {dt:.0f} s; {len(chunks)} chunks -> ~{dt * len(chunks) / 60:.0f} min for this layer")
+            log(f"  chunk {ci}: {dt:.0f} s; {len(chunks)} chunks -> ~{dt * len(chunks) / 60:.0f} min for this layer; "
+                f"{mem}")
         else:
-            log(f"  chunk {ci}: {dt:.0f} s (layer elapsed {(time.perf_counter() - t_start) / 60:.1f} min)")
+            log(f"  chunk {ci}: {dt:.0f} s (layer elapsed {(time.perf_counter() - t_start) / 60:.1f} min); {mem}")
     return {"topk": acc, "fve": fve_rows, "chunks": chunks, "n_spectra_by_chunk": spectra}
 
 
@@ -776,7 +796,7 @@ def _write_text_atomic(text: str, path: Path) -> None:
 
 
 def build_examples(root: Path, layers: list[int], features_path: Path, seed: int = DEFAULT_SEED,
-                   batch_tokens: int = EXAMPLE_BATCH_TOKENS, log=print) -> dict:
+                   batch_tokens: int = EXAMPLE_BATCH_TOKENS, log=print, max_rss_gb: float | None = None) -> dict:
     """The --examples pass: examples/layer_L.parquet per layer, examples/spectra.parquet,
     fit_reference.{json,csv}. Layers already written are not recomputed unless
     their file is removed (the pass is resumable per layer); the fit values of a
@@ -804,7 +824,8 @@ def build_examples(root: Path, layers: list[int], features_path: Path, seed: int
             stream = _stream(root, layer, sae)
             log(f"layer {layer}: {len(feats_by_layer[layer])} features, chunks {list(stream._chunk_indices)}")
             t0 = time.perf_counter()
-            res = stream_layer_examples(stream, sae, feats_by_layer[layer], batch_tokens=batch_tokens, log=log)
+            res = stream_layer_examples(stream, sae, feats_by_layer[layer], batch_tokens=batch_tokens, log=log,
+                                        max_rss_gb=max_rss_gb)
             ids = {(c, s): sid for c, s, sid, _f in res["fve"]}
             rows = example_rows(layer, feats_by_layer[layer], res["topk"], ids)
             meta = _examples_metadata(layer, {
@@ -821,7 +842,8 @@ def build_examples(root: Path, layers: list[int], features_path: Path, seed: int
             write_atomic(fit_table, fit_out)
             write_atomic(table, out)
             del sae, stream, res
-            log(f"layer {layer}: {len(rows)} example rows -> {out} ({(time.perf_counter() - t0) / 60:.1f} min)")
+            log(f"layer {layer}: {len(rows)} example rows -> {out} ({(time.perf_counter() - t0) / 60:.1f} min); "
+                f"{memory_check(max_rss_gb)}")
         table = pq.read_table(out)
         for c, s in zip(table["chunk"].to_pylist(), table["spectrum_index"].to_pylist(), strict=True):
             referenced.setdefault(c, set()).add(s)
@@ -854,7 +876,7 @@ def build_examples(root: Path, layers: list[int], features_path: Path, seed: int
     _write_text_atomic("\n".join(lines) + "\n", csv_path)
     log(f"fit reference -> {json_path.name}, {csv_path.name}; "
         + "; ".join(f"L{L}: n {v['fve'].size}, median {np.median(v['fve']):.4f}" for L, v in fit_by_layer.items())
-        + f"; total {(time.perf_counter() - t_all) / 60:.1f} min")
+        + f"; total {(time.perf_counter() - t_all) / 60:.1f} min; {memory_check(max_rss_gb)}")
     return {"referenced": n_ref, "fit": {L: int(v["fve"].size) for L, v in fit_by_layer.items()}}
 
 
@@ -987,6 +1009,8 @@ def main(argv: list[str] | None = None) -> None:
                         help="--examples: also beam predictions for the referenced spectra (resumable)")
     parser.add_argument("--hf-data-dir", type=Path, default=None,
                         help="--with-predictions: directory holding the HF nine-species parquets")
+    parser.add_argument("--max-rss-gb", type=float, default=None,
+                        help="--examples: stop with an error if the process RSS exceeds this after a chunk")
     parser.add_argument("--checkpoint", type=Path, default=Path("checkpoints") / "instanovo_v1.1.0.ckpt",
                         help="--with-predictions: InstaNovo checkpoint")
     args = parser.parse_args(argv)
@@ -994,7 +1018,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.examples:
         if args.example_features is None:
             parser.error("--examples needs --example-features")
-        build_examples(args.root, args.layers, args.example_features, args.seed, args.batch_tokens)
+        build_examples(args.root, args.layers, args.example_features, args.seed, args.batch_tokens,
+                       max_rss_gb=args.max_rss_gb)
         if args.with_predictions:
             if args.hf_data_dir is None:
                 parser.error("--with-predictions needs --hf-data-dir")
@@ -1017,5 +1042,5 @@ def main(argv: list[str] | None = None) -> None:
 if __name__ == "__main__":
     try:
         main()
-    except (ValueError, FileNotFoundError) as exc:
+    except (ValueError, FileNotFoundError, MemoryGuardError) as exc:
         sys.exit(f"error: {exc}")

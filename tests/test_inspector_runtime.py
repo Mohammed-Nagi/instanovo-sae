@@ -1320,7 +1320,7 @@ class _FakeScreenInspector:
         return self.inner.ablate_token(ctx, layer, pos, with_summaries=with_summaries)
 
 
-def _screen_tree(tmp_path, hours: float):
+def _screen_tree(tmp_path, hours: float, sample_rows=(11, 12)):
     tokens = [{"l0": 1}, {"l0": 1}, {"l0": 2}, {"l0": 0}]
     saved = {"prediction": {"peptide": "PEK", "tokens": ["P", "E", "K"],
                             "residues": [{"log_prob_tf": -0.1}] * 3, "eos_log_prob_tf": -0.2},
@@ -1328,12 +1328,12 @@ def _screen_tree(tmp_path, hours: float):
     v15 = tmp_path / "v1_5"
     (v15 / "screen" / "explanations").mkdir(parents=True)
     rows = []
-    for row in (11, 12):
+    for row in sample_rows:
         (v15 / "screen" / "explanations" / f"row_{row}.json").write_text(json.dumps(saved))
         rows.append({"row": row, "spectrum_id": str(row), "c_n": 0.1, "predicted_seconds": 1.0,
                      "layers": {"2": {"pairs": 4, "tokens": 3, "rows": 7}}})
     (v15 / "screen" / "screen_sample.json").write_text(json.dumps({
-        "rows": rows, "sample_rows": [11, 12], "total_predicted_seconds": hours * 3600,
+        "rows": rows, "sample_rows": list(sample_rows), "total_predicted_seconds": hours * 3600,
         "total_predicted_hours": hours}))
     return v15, saved
 
@@ -1380,3 +1380,81 @@ def test_exhaustive_local_equals_ablate_token(inspector, ctx0):
         for a, b in zip(got.results, direct.results, strict=True):
             assert a["delta_total"] == pytest.approx(b["delta_total"], abs=1e-6)
         assert got.joint_delta_total == pytest.approx(direct.joint_delta_total, abs=1e-6)
+
+
+# --- V1-5: screen-verify (verifications 2 and 3) ------------------------------------------
+
+def _stored_row(**kw):
+    row = {"row": 1, "layer": 2, "token": 3, "feature": 4, "activation": 0.5, "delta_total": -0.25,
+           "delta_eos": -0.05, "delta_log_prob": [-0.1, -0.1], "argmax_changed": [False, True],
+           "eos_argmax_changed": False}
+    row.update(kw)
+    return row
+
+
+def test_compare_ablation_row_tolerance_and_flags():
+    stored = _stored_row()
+    same = {k: stored[k] for k in ("activation", "delta_total", "delta_eos", "delta_log_prob",
+                                   "argmax_changed", "eos_argmax_changed")}
+    assert rt.compare_ablation_row(stored, same)["pass"]
+    near = {**same, "delta_log_prob": [-0.1 + 5e-7, -0.1]}
+    assert rt.compare_ablation_row(stored, near)["pass"]
+    far = {**same, "delta_log_prob": [-0.1 + 2e-6, -0.1]}
+    r = rt.compare_ablation_row(stored, far)
+    assert not r["pass"] and r["max_abs_delta_diff"] == pytest.approx(2e-6)
+    assert not rt.compare_ablation_row(stored, {**same, "argmax_changed": [False, False]})["pass"]
+    with pytest.raises(ValueError):
+        rt.compare_ablation_row(stored, {**same, "delta_log_prob": [-0.1]})
+
+
+def _verify_tree(tmp_path):
+    """Screen tree on two local rows (chunk 520), ablated by screen_ablate, plus
+    a layer-2 fit reference and per-spectrum fit values."""
+    rows = (4506, 4507)
+    v15, saved = _screen_tree(tmp_path, 1.0, rows)
+    for i, row in enumerate(rows):
+        exp = dict(saved, input={"spectrum_id": f"test.parquet:{row}"},
+                   layers={"2": dict(saved["layers"]["2"], fit={"fve_centred": 0.9 + 0.01 * i})})
+        (v15 / "screen" / "explanations" / f"row_{row}.json").write_text(json.dumps(exp))
+    insp = _FakeScreenInspector(saved)
+    insp.ablate = insp.inner.ablate
+    insp.outputs_root = tmp_path / "root"
+    rt.screen_ablate(insp, Path("unused"), v15, 9.0, log=lambda *_: None, read_spectrum=lambda r: r)
+    ex = insp.outputs_root / "dictionary" / "examples"
+    ex.mkdir(parents=True)
+    pq.write_table(pa.table({"chunk": [520, 520], "spectrum_index": [0, 1],
+                             "spectrum_id": [str(rt.HF_TEST_OFFSET + r) for r in rows],
+                             "fve_centred": [0.9 - 1e-4, 0.91]}), ex / "fit_2.parquet")
+    ref = _fit_ref([0.5, 0.6, 0.8, 0.9, 0.95])
+    (insp.outputs_root / "dictionary" / "fit_reference.json").write_text(json.dumps(ref.data))
+    return v15, insp
+
+
+def test_screen_verify_recomputes_pairs_and_compares_fit(tmp_path):
+    v15, insp = _verify_tree(tmp_path)
+    out = rt.screen_verify(insp, Path("unused"), v15, log=lambda *_: None, read_spectrum=lambda r: r)
+    v3 = out["verification_3"]
+    assert v3["all_pass"] and v3["n_pairs"] == 3 and v3["pool_single_rows"] == 8
+    assert all(p["max_abs_delta_diff"] == 0.0 for p in v3["pairs"])
+    v2 = out["verification_2"]["layers"]["2"]
+    assert v2["n"] == 2 and v2["max_abs_delta"] == pytest.approx(1e-4) and v2["at_row"] == 4506
+    assert json.loads((v15 / "screen" / "screen_verify.json").read_text()) == json.loads(json.dumps(out))
+    files = sorted((v15 / "screen" / "ablation").glob("*.parquet"))
+    assert rt.pick_verify_pairs(files) == rt.pick_verify_pairs(list(reversed(files)))
+
+
+def test_screen_verify_fails_loudly(tmp_path):
+    v15, insp = _verify_tree(tmp_path)
+    real = insp.ablate
+
+    def off(*a, **k):
+        rep = real(*a, **k)
+        rep.results[0]["delta_total"] += 1e-3
+        return rep
+    insp.ablate = off
+    with pytest.raises(RuntimeError, match="verification 3 failed"):
+        rt.screen_verify(insp, Path("unused"), v15, log=lambda *_: None, read_spectrum=lambda r: r)
+    assert not json.loads((v15 / "screen" / "screen_verify.json").read_text())["verification_3"]["all_pass"]
+    rt.screen_ablation_path(v15, 4506, 2).unlink()
+    with pytest.raises(RuntimeError, match="finish screen-ablate"):
+        rt.screen_verify(insp, Path("unused"), v15, log=lambda *_: None, read_spectrum=lambda r: r)

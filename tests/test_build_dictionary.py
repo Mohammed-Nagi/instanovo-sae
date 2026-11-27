@@ -730,3 +730,11 @@ def test_feature_examples_reject_other_schema(tmp_path):
         FeatureExamples.load(tmp_path, 2)
     with pytest.raises(FileNotFoundError):
         FeatureExamples.load(tmp_path, 4)
+
+
+def test_memory_check_logs_and_guards():
+    from build_dictionary import MemoryGuardError, memory_check
+    assert memory_check(None).startswith("RSS ")
+    assert "peak" in memory_check(1000.0)
+    with pytest.raises(MemoryGuardError, match="exceeds --max-rss-gb"):
+        memory_check(1e-6)

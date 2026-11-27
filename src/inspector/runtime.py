@@ -59,6 +59,7 @@ V1-5 (outputs in analysis/v1_5/; the demo set from `python -m analysis --demo-se
     PYTHONPATH=src uv run python -m inspector.runtime demo-explain --parquet <HF test parquet>
     PYTHONPATH=src uv run python -m inspector.runtime screen-sample --parquet <HF test parquet>
     PYTHONPATH=src uv run python -m inspector.runtime screen-ablate --parquet <HF test parquet>
+    PYTHONPATH=src uv run python -m inspector.runtime screen-verify --parquet <HF test parquet>
 
 --checkpoint defaults to checkpoints/instanovo_v1.1.0.ckpt and --outputs-root
 to sae_pipeline_outputs/, both under the repo root.
@@ -2892,6 +2893,130 @@ def _cmd_demo_explain(args, inspector: Inspector) -> int:
     return 0
 
 
+# --- V1-5 verifications 2 and 3 (screen-verify) -------------------------------------------
+
+VERIFY_N_PAIRS = 3
+VERIFY_ABLATION_TOL = 1e-6
+
+
+def pick_verify_pairs(files: list[Path], n: int = VERIFY_N_PAIRS,
+                      seed: int = SCREEN_SEED) -> tuple[list[tuple[Path, int]], int]:
+    """n distinct single-ablation rows drawn with default_rng(seed) from all
+    'single' rows of the screen files (sorted-file then row order), and the
+    pool size."""
+    pool = []
+    for f in sorted(files):
+        kinds = pq.read_table(f, columns=["kind"]).column("kind").to_pylist()
+        pool += [(f, i) for i, k in enumerate(kinds) if k == "single"]
+    if len(pool) < n:
+        raise ValueError(f"only {len(pool)} single rows to draw {n} from")
+    return [pool[int(i)] for i in np.random.default_rng(seed).choice(len(pool), size=n, replace=False)], len(pool)
+
+
+def compare_ablation_row(stored: dict, result: dict, tol: float = VERIFY_ABLATION_TOL) -> dict:
+    """Recomputed single ablation vs its stored screen row: max |Δ| over
+    delta_total, delta_eos and every per-residue delta; activation |Δ|; flags."""
+    if len(result["delta_log_prob"]) != len(stored["delta_log_prob"]):
+        raise ValueError("per-residue delta length differs from the stored row")
+    d = max([abs(result["delta_total"] - stored["delta_total"]), abs(result["delta_eos"] - stored["delta_eos"])]
+            + [abs(a - b) for a, b in zip(result["delta_log_prob"], stored["delta_log_prob"])])
+    act = abs(float(result["activation"]) - stored["activation"])
+    flags = ([bool(v) for v in result["argmax_changed"]] == list(stored["argmax_changed"])
+             and bool(result["eos_argmax_changed"]) == bool(stored["eos_argmax_changed"]))
+    return {"row": stored["row"], "layer": stored["layer"], "token": stored["token"], "feature": stored["feature"],
+            "stored_delta_total": stored["delta_total"], "max_abs_delta_diff": d, "activation_diff": act,
+            "flags_equal": flags, "pass": d <= tol and act <= tol and flags}
+
+
+def fit_comparison(explanations: dict[int, dict], fit_rows: dict[int, list[dict]], ref) -> dict:
+    """explain()'s fve_centred vs the reference's per-spectrum value (fit_{L}
+    rows: chunk, spectrum_index, spectrum_id, fve_centred) per layer, matched by
+    HF row location; spectrum ids are checked. ref: a FitReference."""
+    out = {}
+    for L, rows in sorted(fit_rows.items()):
+        by = {(r["chunk"], r["spectrum_index"]): r for r in rows}
+        per = []
+        for row, e in sorted(explanations.items()):
+            r = by.get(hf_test_row_location(row))
+            if r is None:
+                raise ValueError(f"row {row}: not in the layer {L} fit reference")
+            if str(r["spectrum_id"]) != str(row + HF_TEST_OFFSET) or not str(e["input"]["spectrum_id"]).endswith(f":{row}"):
+                raise ValueError(f"row {row}: spectrum ids {r['spectrum_id']!r} / {e['input']['spectrum_id']!r} "
+                                 f"do not identify HF test row {row}")
+            a, b = float(e["layers"][str(L)]["fit"]["fve_centred"]), float(r["fve_centred"])
+            per.append({"row": row, "explain": a, "reference": b, "delta": a - b,
+                        "percentile_shift": ref.percentile(L, a) - ref.percentile(L, b)})
+        worst = max(per, key=lambda x: abs(x["delta"]))
+        out[str(L)] = {"n": len(per), "max_abs_delta": abs(worst["delta"]), "at_row": worst["row"],
+                       "mean_delta": float(np.mean([x["delta"] for x in per])),
+                       "max_abs_percentile_shift": max(abs(x["percentile_shift"]) for x in per), "per_row": per}
+    return out
+
+
+def local_explanations(v15_dir: Path) -> dict[int, dict]:
+    """Saved demo and screen explanations of rows in the local chunks 520/572."""
+    out = {}
+    for d in (Path(v15_dir) / "explanations", Path(v15_dir) / "screen" / "explanations"):
+        for f in sorted(d.glob("row_*.json")):
+            row = int(f.stem.split("_")[1])
+            if hf_test_row_location(row)[0] in SCREEN_CHUNKS:
+                out[row] = json.loads(f.read_text(encoding="utf-8"))
+    return out
+
+
+def screen_verify(inspector, parquet_path: Path, v15_dir: Path = V1_5_DIR, log=print,
+                  read_spectrum=None) -> dict:
+    """V1-5 verification 3 (VERIFY_N_PAIRS random screen pairs recomputed with
+    `ablate`, scope local, must match to 1e-6) and verification 2 (explain()'s
+    fve_centred vs the fit reference for the local demo and screen spectra,
+    max |Δ| reported). Writes screen/screen_verify.json; raises after writing
+    if a pair fails."""
+    from inspector.dictionary import FitReference
+    v15 = Path(v15_dir)
+    read_spectrum = read_spectrum or (lambda row: read_raw_spectra(parquet_path, [row])[0])
+    files = sorted((v15 / "screen" / "ablation").glob("row_*_L*.parquet"))
+    sample = json.loads((v15 / "screen" / "screen_sample.json").read_text(encoding="utf-8"))
+    n_expected = len(sample["sample_rows"]) * len(inspector.layers)
+    if len(files) != n_expected:
+        raise RuntimeError(f"{len(files)} screen ablation files, expected {n_expected}; finish screen-ablate first")
+    picks, pool = pick_verify_pairs(files)
+    pairs = []
+    for f, i in picks:
+        stored = pq.read_table(f).slice(i, 1).to_pylist()[0]
+        spec = read_spectrum(stored["row"])
+        ctx = inspector.ablation_context(spec, inspector.explain(spec))
+        res = inspector.ablate(ctx, stored["layer"], [stored["feature"]], "local", position=stored["token"],
+                               with_summaries=False).results[0]
+        rec = compare_ablation_row(stored, res)
+        log(f"verification 3: row {rec['row']} L{rec['layer']} token {rec['token']} F{rec['feature']}: "
+            f"max |delta diff| {rec['max_abs_delta_diff']:.2e}, activation diff {rec['activation_diff']:.2e}, "
+            f"flags equal {rec['flags_equal']} -> {'pass' if rec['pass'] else 'FAIL'}")
+        pairs.append(rec)
+    root = inspector.outputs_root
+    fit_rows = {L: pq.read_table(Path(root) / "dictionary" / "examples" / f"fit_{L}.parquet").to_pylist()
+                for L in inspector.layers}
+    fit = fit_comparison(local_explanations(v15), fit_rows, FitReference.load(root))
+    for L, v in fit.items():
+        log(f"verification 2: L{L}: n {v['n']}, max |delta| {v['max_abs_delta']:.2e} (row {v['at_row']}), "
+            f"mean delta {v['mean_delta']:+.2e}, max percentile shift {v['max_abs_percentile_shift']:.2f}")
+    out = {"verification_3": {"n_pairs": len(pairs), "pool_single_rows": pool, "seed": SCREEN_SEED,
+                              "tolerance": VERIFY_ABLATION_TOL, "pairs": pairs,
+                              "all_pass": all(p["pass"] for p in pairs)},
+           "verification_2": {"layers": fit, "note": "explain() JSON rounds fve_centred to 6 decimals; "
+                              "the reference is from the stored bf16 extraction, explain() from a fresh "
+                              "float32 forward pass"}}
+    _write_json_atomic(out, v15 / "screen" / "screen_verify.json")
+    if not out["verification_3"]["all_pass"]:
+        raise RuntimeError("verification 3 failed: a recomputed pair differs from its stored row beyond 1e-6")
+    return out
+
+
+def _cmd_screen_verify(args, inspector: Inspector) -> int:
+    screen_verify(inspector, args.parquet, args.v1_5_dir)
+    print(f"screen-verify: all pairs pass -> {args.v1_5_dir / 'screen' / 'screen_verify.json'}")
+    return 0
+
+
 def _cmd_screen_sample(args, inspector: Inspector) -> int:
     out = screen_sample(inspector, args.parquet, args.v1_5_dir, args.budget_hours, force=args.force)
     t = out["measured_one_batch"]
@@ -2915,9 +3040,10 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("command", choices=["time", "compare-preprocessing", "accuracy", "audit-cases",
                                        "audit-checks", "audit-notation", "audit-evidence-by",
-                                       "audit-part-b", "demo-explain", "screen-sample", "screen-ablate"])
+                                       "audit-part-b", "demo-explain", "screen-sample", "screen-ablate",
+                                       "screen-verify"])
     p.add_argument("--v1-5-dir", type=Path, default=V1_5_DIR,
-                   help="demo-explain / screen-sample / screen-ablate: V1-5 output directory")
+                   help="demo-explain / screen-sample / screen-ablate / screen-verify: V1-5 output directory")
     p.add_argument("--budget-hours", type=float, default=SCREEN_BUDGET_HOURS,
                    help="screen-sample / screen-ablate: predicted-cost budget (registered: 9)")
     p.add_argument("--force", action="store_true",
@@ -2948,14 +3074,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.parquet is None:
         p.error(f"{args.command} needs --parquet")
     if args.command not in ("accuracy", "audit-cases", "audit-checks", "audit-notation",
-                            "audit-part-b", "demo-explain", "screen-sample", "screen-ablate") and not args.rows:
+                            "audit-part-b", "demo-explain", "screen-sample", "screen-ablate",
+                            "screen-verify") and not args.rows:
         p.error(f"{args.command} needs --rows")
     inspector = Inspector(args.checkpoint, args.outputs_root, top_k=args.top_k)
     rc = {"time": _cmd_time, "compare-preprocessing": _cmd_compare, "accuracy": _cmd_accuracy,
           "audit-cases": _cmd_audit_cases, "audit-checks": _cmd_audit_checks,
           "audit-notation": _cmd_audit_notation, "audit-part-b": _cmd_audit_part_b,
           "demo-explain": _cmd_demo_explain, "screen-sample": _cmd_screen_sample,
-          "screen-ablate": _cmd_screen_ablate}[args.command](args, inspector)
+          "screen-ablate": _cmd_screen_ablate, "screen-verify": _cmd_screen_verify}[args.command](args, inspector)
     return rc or 0
 
 

@@ -148,3 +148,117 @@ class FeatureDictionary:
         if len(found) > 1:
             raise ValueError(f"layer {self.layer}: {len(found)} distinct causal provenance strings")
         return found.pop() if found else None
+
+
+# --- V1-5: fit reference and feature examples ---------------------------------------
+
+def fit_reference_path(root: Path) -> Path:
+    """``<root>/dictionary/fit_reference.json`` (build_dictionary --examples)."""
+    return Path(root) / "dictionary" / "fit_reference.json"
+
+
+class FitReference:
+    """Per-layer quantiles of the per-spectrum centred FVE over the local
+    chunks, to place one spectrum's fit (explain()'s fve_centred) among them."""
+
+    def __init__(self, data: dict, path: Path | None = None):
+        from schema import FIT_REFERENCE_SCHEMA_VERSION
+        if data.get("schema_version") != FIT_REFERENCE_SCHEMA_VERSION:
+            raise ValueError(f"{path}: fit reference schema {data.get('schema_version')!r}, this tool "
+                             f"reads {FIT_REFERENCE_SCHEMA_VERSION}")
+        self.path = path
+        self.data = data
+        self.probabilities = [float(p) for p in data["probabilities"]]
+        self.note = data["note"]
+        self.layers = {int(L): v for L, v in data["layers"].items()}
+        for L, v in self.layers.items():
+            q = v["quantiles"]
+            if len(q) != len(self.probabilities) or any(b < a for a, b in zip(q, q[1:])):
+                raise ValueError(f"{path}: layer {L} quantiles malformed")
+
+    @classmethod
+    def load(cls, root: Path) -> FitReference:
+        path = fit_reference_path(root)
+        if not path.is_file():
+            raise FileNotFoundError(f"No fit reference at {path}; build it with "
+                                    f"`python -m build_dictionary --examples --example-features ...`")
+        return cls(json.loads(path.read_text(encoding="utf-8")), path)
+
+    def percentile(self, layer: int, fve: float) -> float:
+        """Percentage (0-100) of reference spectra at this layer whose centred FVE
+        is at or below `fve`, interpolated on the quantile table; 0 below the
+        lowest and 100 above the highest reference value."""
+        if int(layer) not in self.layers:
+            raise KeyError(f"fit reference has no layer {layer}")
+        if not math.isfinite(float(fve)):
+            raise ValueError(f"fve must be finite, got {fve}")
+        q = self.layers[int(layer)]["quantiles"]
+        x = float(fve)
+        if x < q[0]:
+            return 0.0
+        if x >= q[-1]:
+            return 100.0
+        # last index with q[i] <= x, then linear within [q[i], q[i+1]]
+        lo, hi = 0, len(q) - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if q[mid] <= x:
+                lo = mid
+            else:
+                hi = mid
+        p0, p1 = self.probabilities[lo], self.probabilities[hi]
+        span = q[hi] - q[lo]
+        p = p1 if span <= 0 else p0 + (p1 - p0) * (x - q[lo]) / span
+        return 100.0 * p
+
+
+class FeatureExamples:
+    """examples/layer_{L}.parquet and the shared spectrum context
+    examples/spectra.parquet (build_dictionary --examples), schema-checked."""
+
+    def __init__(self, layer: int, examples: dict[int, list[dict]], spectra: dict[tuple[int, int], dict],
+                 metadata: dict[str, str]):
+        self.layer = layer
+        self._examples = examples
+        self._spectra = spectra
+        self.metadata = metadata
+
+    @staticmethod
+    def _read(path: Path) -> tuple[list[dict], dict[str, str]]:
+        from schema import EXAMPLES_SCHEMA_VERSION
+        if not path.is_file():
+            raise FileNotFoundError(f"No feature examples at {path}; build them with "
+                                    f"`python -m build_dictionary --examples --example-features ...`")
+        table = pq.read_table(path)
+        metadata = {k.decode(): v.decode() for k, v in (table.schema.metadata or {}).items()}
+        if metadata.get("schema_version") != str(EXAMPLES_SCHEMA_VERSION):
+            raise ValueError(f"{path}: examples schema {metadata.get('schema_version')!r}, this tool "
+                             f"reads {EXAMPLES_SCHEMA_VERSION}")
+        return table.to_pylist(), metadata
+
+    @classmethod
+    def load(cls, root: Path, layer: int) -> FeatureExamples:
+        base = Path(root) / "dictionary" / "examples"
+        rows, metadata = cls._read(base / f"layer_{layer}.parquet")
+        if metadata.get("layer") != str(layer):
+            raise ValueError(f"examples file says layer {metadata.get('layer')!r}, expected {layer}")
+        spectra_rows, _ = cls._read(base / "spectra.parquet")
+        spectra = {(r["chunk"], r["spectrum_index"]): r for r in spectra_rows}
+        examples: dict[int, list[dict]] = {}
+        for r in rows:
+            if (r["chunk"], r["spectrum_index"]) not in spectra:
+                raise ValueError(f"layer {layer} example of feature {r['feature_idx']} references a "
+                                 f"spectrum missing from spectra.parquet")
+            examples.setdefault(int(r["feature_idx"]), []).append(r)
+        for v in examples.values():
+            v.sort(key=lambda r: r["rank"])
+        return cls(layer, examples, spectra, metadata)
+
+    def __contains__(self, feature_idx: int) -> bool:
+        return int(feature_idx) in self._examples
+
+    def examples(self, feature_idx: int) -> list[dict]:
+        """The feature's examples, strongest first, each with its spectrum
+        context under "spectrum"; [] for a feature without examples."""
+        return [{**r, "spectrum": self._spectra[(r["chunk"], r["spectrum_index"])]}
+                for r in self._examples.get(int(feature_idx), [])]

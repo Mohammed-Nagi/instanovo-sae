@@ -56,6 +56,19 @@ DICTIONARY_SCHEMA_VERSION = 2
 # top_concept_meets_display_rule, reliable_concept and reliable_concept_f1_dom.
 EXPLAIN_SCHEMA_VERSION = 3
 
+# V1-5, build_dictionary.py --examples: dictionary/examples/layer_{L}.parquet and
+# dictionary/examples/spectra.parquet (feature examples and their spectrum context),
+# read by inspector.dictionary.FeatureExamples. Recorded in the parquet metadata.
+EXAMPLES_SCHEMA_VERSION = 1
+
+# V1-5, build_dictionary.py --examples: dictionary/fit_reference.{json,csv}, the
+# per-spectrum centred-FVE quantiles read by inspector.dictionary.FitReference.
+FIT_REFERENCE_SCHEMA_VERSION = 1
+
+# V1-5, inspector/runtime.py screen-ablate: analysis/v1_5/screen/ablation/
+# row_{r}_L{L}.parquet, exhaustive local ablation of one screen spectrum at one layer.
+SCREEN_ABLATION_SCHEMA_VERSION = 1
+
 # interpret.py: description runs live in interpret/layer_{L}/<run_tag>/. The
 # archive directory beside them keeps superseded runs as provenance; no stage
 # reads from it or writes to it, so a run tag must be one plain directory name

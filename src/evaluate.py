@@ -602,23 +602,36 @@ class ChunkStream:
 
 
 class TopKAccumulator:
-    """Running top-K activation values per feature, with (chunk, token) provenance."""
+    """Running top-K activation values per feature, with (chunk, token) provenance.
 
-    def __init__(self, n_features: int, k: int):
+    aux (V1-5): None (the default) keeps the accumulator exactly as before. A
+    dtype adds `aux_ids` [n_features, k], one extra provenance value per kept
+    entry, taken from the [n_rows, n_features] `aux` tensor add_chunk then
+    requires (e.g. rows = spectra, aux = each spectrum's argmax token).
+    """
+
+    def __init__(self, n_features: int, k: int, aux: torch.dtype | None = None):
         self.n_features = n_features
         self.k = k
         self.values = torch.full((n_features, k), -float("inf"))
         self.chunk_ids = torch.full((n_features, k), -1, dtype=torch.long)
         self.token_ids = torch.full((n_features, k), -1, dtype=torch.long)
+        self.aux_ids = None if aux is None else torch.full((n_features, k), -1, dtype=aux)
 
-    def add_chunk(self, chunk_idx: int, features: torch.Tensor) -> None:
+    def add_chunk(self, chunk_idx: int, features: torch.Tensor,
+                  aux: torch.Tensor | None = None) -> None:
         """Merge this chunk's [n_tokens, n_features] top-K into the running top-K."""
+        if (aux is None) != (self.aux_ids is None):
+            raise ValueError("aux must be given exactly when the accumulator was built with aux")
+        if aux is not None and aux.shape != features.shape:
+            raise ValueError(f"aux shape {tuple(aux.shape)} != features shape {tuple(features.shape)}")
         n_tokens = features.size(0)
         if n_tokens == 0:
             return
 
         k_use = min(self.k, n_tokens)
         chunk_top_vals, chunk_top_idx = torch.topk(features, k_use, dim=0)
+        chunk_aux = None if aux is None else torch.gather(aux, 0, chunk_top_idx).t()
         chunk_top_vals = chunk_top_vals.t()  # [n_features, k_use]
         chunk_top_idx = chunk_top_idx.t()
 
@@ -634,6 +647,9 @@ class TopKAccumulator:
         # Provenance follows the same indices.
         self.chunk_ids = torch.gather(merged_chunk_ids, 1, new_idx)
         self.token_ids = torch.gather(merged_token_ids, 1, new_idx)
+        if chunk_aux is not None:
+            merged_aux = torch.cat([self.aux_ids, chunk_aux.to(self.aux_ids.dtype)], dim=1)
+            self.aux_ids = torch.gather(merged_aux, 1, new_idx)
 
 
 def _log_chunk_progress(label: str, chunk_i: int, n_chunks: int) -> None:

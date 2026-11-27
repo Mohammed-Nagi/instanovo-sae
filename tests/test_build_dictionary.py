@@ -490,3 +490,243 @@ def test_no_run_tag_reads_from_the_archive(tree, tag):
         bd.build_layer(tree, 2, unblinded_run=tag, blinded_run=None)
     with pytest.raises(SystemExit):
         bd.main(["--root", str(tree), "--layers", "2", "--unblinded-run", tag])
+
+
+# --- V1-5: feature examples and fit reference (--examples) -----------------------------
+
+import numpy as np  # noqa: E402
+import pyarrow as pa  # noqa: E402
+import torch  # noqa: E402
+
+from evaluate import ChunkStream  # noqa: E402
+from inspector.dictionary import FeatureExamples, FitReference  # noqa: E402
+from inspector.runtime import fve as runtime_fve  # noqa: E402
+from schema import (  # noqa: E402
+    ANNOTATION_SCHEMA_VERSION,
+    EXAMPLES_SCHEMA_VERSION,
+    EXTRACT_SCHEMA_VERSION,
+    FIT_REFERENCE_SCHEMA_VERSION,
+    SAE_SCHEMA_VERSION,
+)
+from train import SparseAutoencoder  # noqa: E402
+
+TOY_D_MODEL, TOY_D_DICT = 5, 7
+TOY_SPECTRA = {0: [3, 6, 2, 5], 52: [4, 1, 7]}          # tokens per spectrum (latent + peaks)
+
+
+def _toy_sae(seed: int = 0) -> SparseAutoencoder:
+    torch.manual_seed(seed)
+    sae = SparseAutoencoder(TOY_D_MODEL, TOY_D_DICT, k=2, k_aux=0)
+    sae.b_enc.data = torch.randn(TOY_D_DICT) * 0.3
+    sae.b_dec.data = torch.randn(TOY_D_MODEL) * 0.1
+    sae.jumprelu_threshold = torch.tensor(0.2)
+    sae.eval()
+    return sae
+
+
+def _toy_tree(root: Path) -> dict[int, torch.Tensor]:
+    """A consolidated two-chunk tree (chunk ids 0 and 52 of 60) with bf16
+    activations, as on disk; returns the float32 view of each chunk's activations."""
+    (root / "extract" / "chunks").mkdir(parents=True)
+    (root / "annotation" / "labels").mkdir(parents=True)
+    gen = torch.Generator().manual_seed(1)
+    acts_by_chunk = {}
+    for ci, lengths in TOY_SPECTRA.items():
+        n_tok = sum(lengths)
+        t2s = torch.cat([torch.full((n,), s, dtype=torch.long) for s, n in enumerate(lengths)])
+        pos = torch.cat([torch.arange(n) for n in lengths])
+        acts = (torch.randn(n_tok, TOY_D_MODEL, generator=gen) + 0.5).to(torch.bfloat16)
+        acts_by_chunk[ci] = acts.float()
+        torch.save({"total_tokens": n_tok, "n_spectra": len(lengths), "token_to_spectrum": t2s,
+                    "token_to_position": pos, "spectrum_ids": [str(1000 * ci + s) for s in range(len(lengths))],
+                    "peptides": ["PEPTIDE"] * len(lengths), "proforma_strings": ["PEPTIDE"] * len(lengths),
+                    "modifications": [[] for _ in lengths], "precursor_charges": torch.full((len(lengths),), 2),
+                    "precursor_mzs": torch.full((len(lengths),), 400.0),
+                    "mz_arrays": [torch.linspace(100, 900, n - 1) for n in lengths],
+                    "intensity_arrays": [torch.ones(n - 1) for n in lengths]},
+                   root / "extract" / "chunks" / f"meta_{ci:05d}.pt")
+        torch.save({"activations": acts}, root / "extract" / "chunks" / f"acts_L2_{ci:05d}.pt")
+        torch.save({"total_tokens": n_tok, "token_labels": torch.zeros(n_tok, 2, dtype=torch.bool)},
+                   root / "annotation" / "labels" / f"chunk_{ci:05d}.pt")
+    (root / "extract" / "manifest.json").write_text(json.dumps({
+        "schema_version": EXTRACT_SCHEMA_VERSION, "n_chunks": len(TOY_SPECTRA),
+        "chunks": [{"idx": ci, "meta": f"chunks/meta_{ci:05d}.pt",
+                    "activations": {"2": f"chunks/acts_L2_{ci:05d}.pt"}} for ci in TOY_SPECTRA]}))
+    (root / "annotation" / "annotation_manifest.json").write_text(json.dumps({
+        "schema_version": ANNOTATION_SCHEMA_VERSION, "n_chunks": 60,
+        "chunks": [{"idx": i, "path": f"labels/chunk_{i:05d}.pt"} for i in range(60)],
+        "registry": {"names": ["a", "b"], "diagnostic": [], "family_of": {}}, "base_rates": {}}))
+    return acts_by_chunk
+
+
+def _toy_stream(root: Path, sae) -> ChunkStream:
+    return ChunkStream(extract_dir=root / "extract", annotation_dir=root / "annotation", target_layer=2,
+                       sae=sae, device="cpu", batch_size=4, dtype=torch.float32)
+
+
+def test_spectrum_batches_cut_at_spectrum_boundaries():
+    t2s = np.repeat([0, 1, 2, 3], [3, 6, 2, 5])
+    assert bd.spectrum_batches(t2s, 8) == [(0, 3), (3, 11), (11, 16)]
+    assert bd.spectrum_batches(t2s, 100) == [(0, 16)]
+    assert bd.spectrum_batches(t2s, 1) == [(0, 3), (3, 9), (9, 11), (11, 16)]
+    with pytest.raises(ValueError, match="contiguous"):
+        bd.spectrum_batches(np.array([0, 1, 0]), 4)
+
+
+@pytest.mark.parametrize("splits", [[16], [1] * 16, [5, 5, 6], [2, 9, 5], [4, 4, 4, 4]])
+def test_streamed_fve_equals_runtime_fve_for_any_batching(splits):
+    """Batches cut anywhere, spectra straddling them: the accumulated
+    per-spectrum FVE equals runtime.fve on the spectrum's rows."""
+    torch.manual_seed(3)
+    lengths = [3, 6, 2, 5]
+    t2s = torch.cat([torch.full((n,), s) for s, n in enumerate(lengths)])
+    x = torch.randn(16, 4) + 0.3
+    x_hat = x + 0.2 * torch.randn(16, 4)
+    acc = bd.SpectrumFitAccumulator(len(lengths), 4)
+    start = 0
+    for n in splits:
+        acc.add(x[start:start + n], x_hat[start:start + n], t2s[start:start + n])
+        start += n
+    got = acc.fve_centred()
+    for s in range(len(lengths)):
+        rows = t2s == s
+        assert got[s] == pytest.approx(runtime_fve(x[rows], x_hat[rows])[0], abs=1e-12)
+
+
+def test_fit_accumulator_rejects_a_spectrum_without_tokens():
+    acc = bd.SpectrumFitAccumulator(2, 3)
+    acc.add(torch.ones(2, 3), torch.zeros(2, 3), torch.tensor([0, 0]))
+    with pytest.raises(ValueError, match="no tokens"):
+        acc.fve_centred()
+
+
+def test_spectrum_max_and_argmax_takes_the_first_token_at_the_maximum():
+    feats = torch.tensor([[0.0, 1.0], [2.0, 1.0], [2.0, 0.5], [0.0, 0.0], [3.0, 0.0]])
+    vmax, arg = bd.spectrum_max_and_argmax(feats, torch.tensor([0, 0, 0, 1, 1]),
+                                           torch.tensor([0, 1, 2, 0, 1]), 3)
+    assert vmax[:2].tolist() == [[2.0, 1.0], [3.0, 0.0]] and arg[:2].tolist() == [[1, 0], [1, 0]]
+    assert arg[2].tolist() == [-1, -1]
+
+
+@pytest.mark.parametrize("batch_tokens", [1, 7, 4096])
+def test_examples_equal_brute_force_top_k(tmp_path, batch_tokens):
+    """Per feature: the top-K spectra by their maximum activation over every
+    chunk, one per spectrum, with the argmax token; FVE per spectrum as runtime.fve."""
+    acts = _toy_tree(tmp_path)
+    sae = _toy_sae()
+    features = [0, 2, 3, 6]
+    k = 3
+    res = bd.stream_layer_examples(_toy_stream(tmp_path, sae), sae, features, k=k,
+                                   batch_tokens=batch_tokens, log=lambda *_: None)
+    ids = {(c, s): sid for c, s, sid, _f in res["fve"]}
+    rows = bd.example_rows(2, features, res["topk"], ids)
+
+    brute, fve_expected = [], {}
+    for ci, lengths in TOY_SPECTRA.items():
+        out = sae.forward_inference(acts[ci])
+        start = 0
+        for s, n in enumerate(lengths):
+            block = out["features"][start:start + n]
+            fve_expected[(ci, s)] = runtime_fve(acts[ci][start:start + n], out["x_hat"][start:start + n])[0]
+            for f in features:
+                v = float(block[:, f].max())
+                brute.append((f, v, ci, s, int(block[:, f].argmax())))
+            start += n
+    assert {(c, s): f for c, s, _sid, f in res["fve"]} == pytest.approx(fve_expected, abs=1e-9)
+    n_with_examples = 0
+    for f in features:
+        expect = sorted([b for b in brute if b[0] == f and b[1] > 0], key=lambda b: -b[1])[:k]
+        got = [r for r in rows if r["feature_idx"] == f]
+        n_with_examples += bool(got)
+        assert [(r["chunk"], r["spectrum_index"], r["token"]) for r in got] == [(b[2], b[3], b[4]) for b in expect]
+        assert [r["activation"] for r in got] == pytest.approx([b[1] for b in expect], rel=1e-6)
+        assert [r["rank"] for r in got] == list(range(1, len(got) + 1))
+        assert len({(r["chunk"], r["spectrum_index"]) for r in got}) == len(got)          # one per spectrum
+        for r in got:
+            assert r["spectrum_id"] == str(1000 * r["chunk"] + r["spectrum_index"])
+            assert r["peak_index"] == (r["token"] - 1 if r["token"] > 0 else None)
+    assert n_with_examples >= 2                         # the toy exercises the comparison
+
+
+def test_fit_quantiles():
+    q = bd.fit_quantiles(np.arange(11.0), n=5)
+    assert q == [0.0, 2.5, 5.0, 7.5, 10.0]
+    assert len(bd.fit_quantiles(np.random.default_rng(0).random(50))) == bd.FIT_QUANTILES
+
+
+def test_load_example_features_checks_the_lists(tmp_path):
+    p = tmp_path / "f.json"
+    p.write_text(json.dumps({"features": {"2": [1, 5, 9]}}))
+    assert bd.load_example_features(p, [2]) == {2: [1, 5, 9]}
+    with pytest.raises(ValueError, match="no feature list for layer 4"):
+        bd.load_example_features(p, [2, 4])
+    p.write_text(json.dumps({"features": {"2": [5, 1]}}))
+    with pytest.raises(ValueError, match="sorted and unique"):
+        bd.load_example_features(p, [2])
+
+
+def _toy_checkpoint(root: Path, sae) -> None:
+    ckpt = root / "sae" / "layer_2" / "seed_0" / "checkpoint.pt"
+    ckpt.parent.mkdir(parents=True)
+    torch.save({"schema_version": SAE_SCHEMA_VERSION, "d_model": TOY_D_MODEL, "d_dict": TOY_D_DICT, "k": 2,
+                "k_aux": 0, "W_enc": sae.W_enc.data, "b_enc": sae.b_enc.data, "W_dec": sae.W_dec.data,
+                "b_dec": sae.b_dec.data, "jumprelu_threshold": sae.jumprelu_threshold,
+                "firing_count": torch.zeros(TOY_D_DICT, dtype=torch.long), "tokens_seen": 0}, ckpt)
+
+
+def test_build_examples_writes_schema_checked_files_and_resumes(tmp_path, monkeypatch):
+    root = tmp_path / "out"
+    _toy_tree(root)
+    _toy_checkpoint(root, _toy_sae())
+    feats_path = root / "analysis" / "v1_5" / "demo_features.json"
+    feats_path.parent.mkdir(parents=True)
+    feats_path.write_text(json.dumps({"features": {"2": [0, 3, 6]}}))
+
+    def fake_annotate(_root, referenced, log=print):
+        return [{"chunk": c, "spectrum_index": s, "spectrum_id": str(1000 * c + s), "precursor_mz": 400.0,
+                 "precursor_charge": 2, "label_peptide": "PEPTIDE", "label_proforma": "PEPTIDE", "n_peaks": 1,
+                 "mz": [100.0], "intensity": [1.0], "peak_annotations": "[]", "annotation_note": None}
+                for c in sorted(referenced) for s in sorted(referenced[c])]
+    monkeypatch.setattr(bd, "annotate_referenced", fake_annotate)
+    logs: list[str] = []
+    bd.build_examples(root, [2], feats_path, log=logs.append)
+
+    table = pq.read_table(bd.examples_path(root, 2))
+    meta = {k.decode(): v.decode() for k, v in table.schema.metadata.items()}
+    assert meta["schema_version"] == str(EXAMPLES_SCHEMA_VERSION) and meta["layer"] == "2"
+    assert meta["n_spectra"] == "7" and json.loads(meta["chunks"]) == [0, 52]
+    assert "Finding 7" in meta["finding_7_note"] and "Finding 8" in meta["label_note"]
+    assert meta["activation_note"] == bd.BF16_NOTE and len(meta["sae_sha256_16"]) == 16
+    assert any("referenced spectra" in line and " h at " in line for line in logs)
+
+    ref = json.loads(bd.fit_reference_paths(root)[0].read_text())
+    assert ref["schema_version"] == FIT_REFERENCE_SCHEMA_VERSION and "Finding 7" in ref["note"]
+    assert ref["layers"]["2"]["n_spectra"] == 7 and len(ref["layers"]["2"]["quantiles"]) == bd.FIT_QUANTILES
+    csv_lines = bd.fit_reference_paths(root)[1].read_text().splitlines()
+    assert csv_lines[0] == "probability,layer_2" and len(csv_lines) == bd.FIT_QUANTILES + 1
+
+    examples = FeatureExamples.load(root, 2)
+    assert examples.metadata["layer"] == "2"
+    for f in (0, 3, 6):
+        assert all(e["spectrum"]["spectrum_id"] == e["spectrum_id"] for e in examples.examples(f))
+    assert examples.examples(1) == [] and 1 not in examples
+    fit = FitReference.load(root)
+    assert 0.0 <= fit.percentile(2, float(np.median(ref["layers"]["2"]["quantiles"]))) <= 100.0
+
+    # resume: the layer files are reused, not recomputed
+    before = bd.examples_path(root, 2).stat().st_mtime_ns
+    logs.clear()
+    bd.build_examples(root, [2], feats_path, log=logs.append)
+    assert bd.examples_path(root, 2).stat().st_mtime_ns == before
+    assert any("reusing" in line for line in logs)
+
+
+def test_feature_examples_reject_other_schema(tmp_path):
+    base = tmp_path / "dictionary" / "examples"
+    base.mkdir(parents=True)
+    pq.write_table(pa.table({"x": [1]}).replace_schema_metadata({"schema_version": "999", "layer": "2"}),
+                   base / "layer_2.parquet")
+    with pytest.raises(ValueError, match="examples schema"):
+        FeatureExamples.load(tmp_path, 2)
+    with pytest.raises(FileNotFoundError):
+        FeatureExamples.load(tmp_path, 4)

@@ -505,6 +505,436 @@ def build_layer(root: Path, layer: int, seed: int = DEFAULT_SEED,
     return table.replace_schema_metadata(metadata)
 
 
+# --- feature examples and fit reference (V1-5, --examples) ----------------------------
+#
+# One streaming pass per layer over the local chunks: the SAE runs on the stored
+# activations in batches of whole spectra; per spectrum it accumulates the
+# centred-FVE sums and, for the demo features only, the maximum activation and
+# its token. A feature's examples are its top EXAMPLES_K spectra by that
+# maximum (one per spectrum by construction). Torch is imported lazily so the
+# normal build stays torch-free.
+
+EXAMPLES_K = 20
+EXAMPLE_BATCH_TOKENS = 4096
+FIT_QUANTILES = 1001
+BEAM_SECONDS = (2.2, 4.2)          # V1-4a/V1-4c beam cost per spectrum on this machine
+BF16_NOTE = "activations from stored bf16 extraction"
+FINDING7_NOTE = ("every local spectrum, test split included, was SAE training data (Finding 7); "
+                 "these are not held-out examples")
+LABEL_NOTE = ("database-search label, not InstaNovo's prediction; benchmark labels can be "
+              "wrong (Finding 8)")
+ANNOTATION_NOTE = ("peaks annotated against the label with annotate.annotate_spectrum (strict), "
+                   "the pipeline's annotator; Finding 9: internal-fragment matches are largely "
+                   "chance and immonium labels carry a known bug, so b/y labels are the reliable part")
+FIT_REFERENCE_NOTE = ("reference spectra were SAE training data (Finding 7); an unseen spectrum "
+                      "may sit lower")
+FIT_DEFINITION = ("per-spectrum centred FVE = 1 - SSE / (sum x^2 - sum_d (sum_t x_d)^2 / n) over "
+                  "the spectrum's tokens (latent and peaks), runtime.fve's definition")
+N_TERMINAL_NOTE = "not annotated: N-terminal modification, rejected by spectrum_utils (Finding 6)"
+
+
+def examples_dir(root: Path) -> Path:
+    return root / "dictionary" / "examples"
+
+
+def examples_path(root: Path, layer: int) -> Path:
+    return examples_dir(root) / f"layer_{layer}.parquet"
+
+
+def fit_reference_paths(root: Path) -> tuple[Path, Path]:
+    return root / "dictionary" / "fit_reference.json", root / "dictionary" / "fit_reference.csv"
+
+
+def load_example_features(path: Path, layers: list[int]) -> dict[int, list[int]]:
+    """{layer: sorted feature ids} from demo_features.json (runtime demo-explain)."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    out = {}
+    for layer in layers:
+        feats = data.get("features", {}).get(str(layer))
+        if feats is None:
+            raise ValueError(f"{path}: no feature list for layer {layer}")
+        if not feats or sorted(set(int(f) for f in feats)) != [int(f) for f in feats]:
+            raise ValueError(f"{path}: layer {layer} feature list must be non-empty, sorted and unique")
+        out[layer] = [int(f) for f in feats]
+    return out
+
+
+def spectrum_batches(token_to_spectrum, max_tokens: int) -> list[tuple[int, int]]:
+    """Token ranges [start, end) of consecutive whole spectra holding at most
+    max_tokens tokens (a longer spectrum gets a batch of its own). Tokens of a
+    spectrum must be contiguous."""
+    t2s = np.asarray(token_to_spectrum)
+    if t2s.size == 0:
+        return []
+    starts = np.flatnonzero(np.r_[True, t2s[1:] != t2s[:-1]])
+    if len(np.unique(t2s[starts])) != len(starts):
+        raise ValueError("a spectrum's tokens are not contiguous")
+    bounds = list(starts) + [t2s.size]
+    out, b0 = [], 0
+    for i in range(1, len(bounds)):
+        if bounds[i] - bounds[b0] > max_tokens and i - 1 > b0:
+            out.append((int(bounds[b0]), int(bounds[i - 1])))
+            b0 = i - 1
+    out.append((int(bounds[b0]), int(bounds[-1])))
+    return out
+
+
+class SpectrumFitAccumulator:
+    """Per-spectrum centred-FVE sums (float64), for any split of the tokens into
+    batches, spectra straddling batches included."""
+
+    def __init__(self, n_spectra: int, d_model: int):
+        import torch
+        self.sse = torch.zeros(n_spectra, dtype=torch.float64)
+        self.sq = torch.zeros(n_spectra, dtype=torch.float64)
+        self.colsum = torch.zeros(n_spectra, d_model, dtype=torch.float64)
+        self.n = torch.zeros(n_spectra, dtype=torch.float64)
+
+    def add(self, x, x_hat, spectrum_idx) -> None:
+        import torch
+        x64, xh64 = x.double(), x_hat.double()
+        idx = torch.as_tensor(spectrum_idx, dtype=torch.long)
+        self.sse.index_add_(0, idx, ((x64 - xh64) ** 2).sum(dim=1))
+        self.sq.index_add_(0, idx, (x64 ** 2).sum(dim=1))
+        self.colsum.index_add_(0, idx, x64)
+        self.n.index_add_(0, idx, torch.ones_like(idx, dtype=torch.float64))
+
+    def fve_centred(self) -> np.ndarray:
+        """1 - SSE / max(sum x^2 - sum_d (sum_t x_d)^2 / n, 1e-12), per spectrum."""
+        if bool((self.n == 0).any()):
+            raise ValueError("a spectrum received no tokens")
+        mean_energy = (self.colsum ** 2).sum(dim=1) / self.n
+        return (1.0 - self.sse / (self.sq - mean_energy).clamp_min(1e-12)).numpy()
+
+
+def spectrum_max_and_argmax(feats, token_to_spectrum, token_to_position, n_spectra: int):
+    """Per spectrum and column: the maximum over the spectrum's tokens and the
+    token position where it is reached (the first such token), as
+    ([n_spectra, F] float32, [n_spectra, F] int64). Spectra without a token stay
+    at -inf / -1. feats [T, F]; tokens of a spectrum contiguous."""
+    import torch
+    n_f = feats.size(1)
+    vmax = torch.full((n_spectra, n_f), -float("inf"))
+    arg = torch.full((n_spectra, n_f), -1, dtype=torch.long)
+    t2s = torch.as_tensor(token_to_spectrum)
+    pos = torch.as_tensor(token_to_position)
+    for start, end in spectrum_batches(t2s.numpy(), 1):            # one spectrum per range
+        s = int(t2s[start])
+        block = feats[start:end]
+        vals = block.max(dim=0).values
+        first = (block == vals).to(torch.int8).argmax(dim=0)        # first token at the maximum
+        vmax[s] = vals
+        arg[s] = pos[start:end][first]
+    return vmax, arg
+
+
+def _stream(root: Path, layer: int, sae):
+    import torch
+    from evaluate import ChunkStream
+    return ChunkStream(extract_dir=root / "extract", annotation_dir=root / "annotation",
+                       target_layer=layer, sae=sae, device="cpu", batch_size=EXAMPLE_BATCH_TOKENS,
+                       dtype=torch.float32)
+
+
+def stream_layer_examples(stream, sae, features: list[int], k: int = EXAMPLES_K,
+                          batch_tokens: int = EXAMPLE_BATCH_TOKENS, log=print) -> dict:
+    """One pass over a ChunkStream's chunks: per-spectrum centred FVE for every
+    spectrum and the top-k spectra per feature (TopKAccumulator with aux = argmax
+    token). Never holds more than one batch of full-width SAE features."""
+    import time
+    import torch
+    from evaluate import TopKAccumulator
+
+    cols = torch.as_tensor(features, dtype=torch.long)
+    acc = TopKAccumulator(len(features), k, aux=torch.long)
+    fve_rows, spectra = [], {}
+    chunks = list(stream._chunk_indices)
+    t_start = time.perf_counter()
+    for i, (ci, acts, (meta, _ann)) in enumerate(zip(chunks, stream.iter_activations(),
+                                                     stream.iter_metadata_annotations(), strict=True)):
+        t0 = time.perf_counter()
+        if acts.size(0) != meta["total_tokens"]:
+            raise ValueError(f"chunk {ci}: {acts.size(0)} activation rows, meta says {meta['total_tokens']}")
+        t2s, pos, n_spec = meta["token_to_spectrum"], meta["token_to_position"], int(meta["n_spectra"])
+        fit = SpectrumFitAccumulator(n_spec, acts.size(1))
+        vmax = torch.full((n_spec, len(features)), -float("inf"))
+        arg = torch.full((n_spec, len(features)), -1, dtype=torch.long)
+        for start, end in spectrum_batches(t2s.numpy(), batch_tokens):
+            x = acts[start:end].float()
+            with torch.inference_mode():
+                out = sae.forward_inference(x)
+            fit.add(x, out["x_hat"], t2s[start:end])
+            sub = out["features"][:, cols]
+            del out
+            v, a = spectrum_max_and_argmax(sub, t2s[start:end], pos[start:end], n_spec)
+            hit = a >= 0
+            vmax[hit], arg[hit] = v[hit], a[hit]
+        if bool((arg < 0).any()):
+            raise ValueError(f"chunk {ci}: a spectrum has no tokens")
+        acc.add_chunk(ci, vmax, aux=arg)
+        fve = fit.fve_centred()
+        for s in range(n_spec):
+            fve_rows.append((ci, s, str(meta["spectrum_ids"][s]), float(fve[s])))
+        spectra[ci] = n_spec
+        dt = time.perf_counter() - t0
+        if i == 0:
+            log(f"  chunk {ci}: {dt:.0f} s; {len(chunks)} chunks -> ~{dt * len(chunks) / 60:.0f} min for this layer")
+        else:
+            log(f"  chunk {ci}: {dt:.0f} s (layer elapsed {(time.perf_counter() - t_start) / 60:.1f} min)")
+    return {"topk": acc, "fve": fve_rows, "chunks": chunks, "n_spectra_by_chunk": spectra}
+
+
+def example_rows(layer: int, features: list[int], acc, spectrum_ids: dict[tuple[int, int], str]) -> list[dict]:
+    """Rows of examples/layer_L.parquet: per feature its kept spectra with a
+    positive maximum, rank 1 = strongest."""
+    rows = []
+    for j, f in enumerate(features):
+        rank = 0
+        for v, c, s, t in zip(acc.values[j].tolist(), acc.chunk_ids[j].tolist(),
+                              acc.token_ids[j].tolist(), acc.aux_ids[j].tolist(), strict=True):
+            if not v > 0:
+                continue
+            rank += 1
+            rows.append({"layer": layer, "feature_idx": int(f), "rank": rank, "chunk": int(c),
+                         "spectrum_index": int(s), "spectrum_id": spectrum_ids[(int(c), int(s))],
+                         "token": int(t), "peak_index": int(t) - 1 if t > 0 else None,
+                         "activation": float(v)})
+    return rows
+
+
+def fit_quantiles(fve: np.ndarray, n: int = FIT_QUANTILES) -> list[float]:
+    return np.quantile(np.asarray(fve, dtype=np.float64), np.linspace(0.0, 1.0, n)).tolist()
+
+
+_EXAMPLE_SCHEMA = pa.schema([
+    ("layer", pa.int64()), ("feature_idx", pa.int64()), ("rank", pa.int64()), ("chunk", pa.int64()),
+    ("spectrum_index", pa.int64()), ("spectrum_id", pa.string()), ("token", pa.int64()),
+    ("peak_index", pa.int64()), ("activation", pa.float64()),
+])
+_SPECTRA_SCHEMA = pa.schema([
+    ("chunk", pa.int64()), ("spectrum_index", pa.int64()), ("spectrum_id", pa.string()),
+    ("precursor_mz", pa.float64()), ("precursor_charge", pa.int64()),
+    ("label_peptide", pa.string()), ("label_proforma", pa.string()), ("n_peaks", pa.int64()),
+    ("mz", pa.list_(pa.float64())), ("intensity", pa.list_(pa.float64())),
+    ("peak_annotations", pa.string()), ("annotation_note", pa.string()),
+])
+
+
+def annotate_referenced(root: Path, referenced: dict[int, set[int]], log=print) -> list[dict]:
+    """The spectrum context of every referenced (chunk, spectrum): processed
+    peaks from the chunk metadata, precursor, label, and the peaks re-annotated
+    against the label (strict). A spectrum with an N-terminal modification is
+    kept without annotation and says why (Finding 6)."""
+    import torch
+    import annotate
+    registry = annotate.ConceptRegistry.build()
+    config = annotate.AnnotationConfig(extract_dir=Path(), output_dir=Path())
+    manifest = json.loads((root / "extract" / "manifest.json").read_text())
+    meta_paths = {int(c["idx"]): root / "extract" / c["meta"] for c in manifest["chunks"]}
+    rows = []
+    for ci in sorted(referenced):
+        meta = torch.load(meta_paths[ci], map_location="cpu", weights_only=False)
+        for s in sorted(referenced[ci]):
+            pep, prof, mods = meta["peptides"][s], meta["proforma_strings"][s], meta["modifications"][s]
+            mz, inten = meta["mz_arrays"][s], meta["intensity_arrays"][s]
+            pmz, z = float(meta["precursor_mzs"][s]), int(meta["precursor_charges"][s])
+            anns, note = None, None
+            if any(int(m["position"]) == 0 for m in mods):
+                note = N_TERMINAL_NOTE
+            else:
+                found, _tok = annotate.annotate_spectrum(pep, prof, mods, mz, inten, pmz, z, config,
+                                                         registry, strict=True)
+                anns = [{"ion_type": a["ion_type"],
+                         "ion_index": list(a["ion_index"]) if isinstance(a["ion_index"], tuple) else a["ion_index"],
+                         "charge": int(a["charge"]), "neutral_loss": a["neutral_loss"]} for a in found]
+            rows.append({"chunk": ci, "spectrum_index": s, "spectrum_id": str(meta["spectrum_ids"][s]),
+                         "precursor_mz": pmz, "precursor_charge": z, "label_peptide": pep,
+                         "label_proforma": prof, "n_peaks": int(len(mz)),
+                         "mz": [float(v) for v in mz], "intensity": [float(v) for v in inten],
+                         "peak_annotations": None if anns is None else json.dumps(anns),
+                         "annotation_note": note})
+        log(f"  annotated chunk {ci}: {len(referenced[ci])} spectra")
+    return rows
+
+
+def _examples_metadata(layer: int | None, extra: dict) -> dict[str, str]:
+    from schema import EXAMPLES_SCHEMA_VERSION
+    meta = {"schema_version": str(EXAMPLES_SCHEMA_VERSION), "k": str(EXAMPLES_K),
+            "activation_note": BF16_NOTE, "finding_7_note": FINDING7_NOTE, "label_note": LABEL_NOTE,
+            "annotation_note": ANNOTATION_NOTE}
+    if layer is not None:
+        meta["layer"] = str(layer)
+    meta.update({k: v if isinstance(v, str) else json.dumps(v) for k, v in extra.items()})
+    return meta
+
+
+def _write_text_atomic(text: str, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def build_examples(root: Path, layers: list[int], features_path: Path, seed: int = DEFAULT_SEED,
+                   batch_tokens: int = EXAMPLE_BATCH_TOKENS, log=print) -> dict:
+    """The --examples pass: examples/layer_L.parquet per layer, examples/spectra.parquet,
+    fit_reference.{json,csv}. Layers already written are not recomputed unless
+    their file is removed (the pass is resumable per layer); the fit values of a
+    finished layer are kept in examples/fit_L.parquet for that."""
+    import time
+    import torch
+    from schema import FIT_REFERENCE_SCHEMA_VERSION
+    from train import load_sae_from_checkpoint
+
+    feats_by_layer = load_example_features(features_path, layers)
+    src = {"example_features": _display_path(features_path, root),
+           "example_features_sha256_16": _sha256_16(features_path)}
+    referenced: dict[int, set[int]] = {}
+    fit_by_layer: dict[int, dict] = {}
+    t_all = time.perf_counter()
+    for layer in layers:
+        ckpt = root / "sae" / f"layer_{layer}" / f"seed_{seed}" / "checkpoint.pt"
+        out = examples_path(root, layer)
+        fit_out = examples_dir(root) / f"fit_{layer}.parquet"
+        if out.is_file() and fit_out.is_file():
+            log(f"layer {layer}: examples exist, reusing {out.name}")
+        else:
+            sae = load_sae_from_checkpoint(ckpt, device="cpu")
+            sae.eval()
+            stream = _stream(root, layer, sae)
+            log(f"layer {layer}: {len(feats_by_layer[layer])} features, chunks {list(stream._chunk_indices)}")
+            t0 = time.perf_counter()
+            res = stream_layer_examples(stream, sae, feats_by_layer[layer], batch_tokens=batch_tokens, log=log)
+            ids = {(c, s): sid for c, s, sid, _f in res["fve"]}
+            rows = example_rows(layer, feats_by_layer[layer], res["topk"], ids)
+            meta = _examples_metadata(layer, {
+                "sae_checkpoint": _display_path(ckpt, root), "sae_sha256_16": _sha256_16(ckpt),
+                "chunks": res["chunks"], "n_spectra": len(res["fve"]), "n_features": len(feats_by_layer[layer]),
+                "rule": (f"top {EXAMPLES_K} spectra per feature by the spectrum's maximum activation "
+                         f"(one per spectrum), shown at the argmax token; features active at any token "
+                         f"of the V1-5 demo spectra"), **src, "seconds": round(time.perf_counter() - t0, 1)})
+            table = pa.Table.from_pylist(rows, schema=_EXAMPLE_SCHEMA).replace_schema_metadata(meta)
+            fit_table = pa.table({"chunk": [r[0] for r in res["fve"]], "spectrum_index": [r[1] for r in res["fve"]],
+                                  "spectrum_id": [r[2] for r in res["fve"]],
+                                  "fve_centred": [r[3] for r in res["fve"]]}).replace_schema_metadata(
+                {"layer": str(layer), "chunks": json.dumps(res["chunks"]), "definition": FIT_DEFINITION})
+            write_atomic(fit_table, fit_out)
+            write_atomic(table, out)
+            del sae, stream, res
+            log(f"layer {layer}: {len(rows)} example rows -> {out} ({(time.perf_counter() - t0) / 60:.1f} min)")
+        table = pq.read_table(out)
+        for c, s in zip(table["chunk"].to_pylist(), table["spectrum_index"].to_pylist(), strict=True):
+            referenced.setdefault(c, set()).add(s)
+        fit_table = pq.read_table(fit_out)
+        fit_by_layer[layer] = {"fve": np.asarray(fit_table["fve_centred"].to_pylist()),
+                               "chunks": json.loads(fit_table.schema.metadata[b"chunks"])}
+
+    n_ref = sum(len(v) for v in referenced.values())
+    log(f"{n_ref} referenced spectra; beam predictions for them (--with-predictions) would cost "
+        f"{n_ref * BEAM_SECONDS[0] / 3600:.1f}-{n_ref * BEAM_SECONDS[1] / 3600:.1f} h "
+        f"at {BEAM_SECONDS[0]}-{BEAM_SECONDS[1]} s each")
+    t0 = time.perf_counter()
+    spectra_rows = annotate_referenced(root, referenced, log=log)
+    spectra_table = pa.Table.from_pylist(spectra_rows, schema=_SPECTRA_SCHEMA).replace_schema_metadata(
+        _examples_metadata(None, {**src, "n_spectra": len(spectra_rows)}))
+    write_atomic(spectra_table, examples_dir(root) / "spectra.parquet")
+    log(f"spectra.parquet: {len(spectra_rows)} spectra, re-annotation {time.perf_counter() - t0:.0f} s")
+
+    probs = np.linspace(0.0, 1.0, FIT_QUANTILES).tolist()
+    ref = {"schema_version": FIT_REFERENCE_SCHEMA_VERSION, "definition": FIT_DEFINITION,
+           "activation_note": BF16_NOTE, "note": FIT_REFERENCE_NOTE, "seed": seed,
+           "probabilities": probs,
+           "layers": {str(L): {"n_spectra": int(v["fve"].size), "chunks": v["chunks"],
+                               "quantiles": fit_quantiles(v["fve"])} for L, v in fit_by_layer.items()}}
+    json_path, csv_path = fit_reference_paths(root)
+    _write_text_atomic(json.dumps(ref, allow_nan=False, indent=1), json_path)
+    lines = ["probability," + ",".join(f"layer_{L}" for L in fit_by_layer)]
+    for i, p in enumerate(probs):
+        lines.append(f"{p:.3f}," + ",".join(repr(ref["layers"][str(L)]["quantiles"][i]) for L in fit_by_layer))
+    _write_text_atomic("\n".join(lines) + "\n", csv_path)
+    log(f"fit reference -> {json_path.name}, {csv_path.name}; "
+        + "; ".join(f"L{L}: n {v['fve'].size}, median {np.median(v['fve']):.4f}" for L, v in fit_by_layer.items())
+        + f"; total {(time.perf_counter() - t_all) / 60:.1f} min")
+    return {"referenced": n_ref, "fit": {L: int(v["fve"].size) for L, v in fit_by_layer.items()}}
+
+
+# Merged corpus order (STATUS V1-2 log, 2026-11-21): train, validation, test; spectrum_id = row.
+HF_SPLITS = (("train", 499_402), ("validation", 28_572), ("test", 111_312))
+
+
+def hf_row_locator(hf_data_dir: Path) -> list[tuple[Path, int, int]]:
+    """(parquet, first merged row, rows) per HF shard in merged order, checked
+    against the recorded split sizes."""
+    out, start = [], 0
+    for split, n_expected in HF_SPLITS:
+        files = sorted(Path(hf_data_dir).glob(f"{split}-*.parquet"))
+        if not files:
+            raise FileNotFoundError(f"no {split}-*.parquet in {hf_data_dir}")
+        n_split = 0
+        for f in files:
+            n = pq.ParquetFile(f).metadata.num_rows
+            out.append((f, start, n))
+            start += n
+            n_split += n
+        if n_split != n_expected:
+            raise ValueError(f"{split}: {n_split} rows in {hf_data_dir}, recorded {n_expected}")
+    return out
+
+
+def add_predictions(root: Path, hf_data_dir: Path, checkpoint: Path, save_every: int = 25, log=print) -> int:
+    """--with-predictions: beam predictions (InstaNovo, 5 beams, the config's
+    max_length, as explain()) for every spectrum in examples/spectra.parquet,
+    written to examples/predictions.parquet. Resumable: spectra already there
+    are skipped; the file is rewritten atomically every save_every spectra."""
+    import time
+    import instanovo_io
+    shards = hf_row_locator(hf_data_dir)
+    spectra = pq.read_table(examples_dir(root) / "spectra.parquet",
+                            columns=["spectrum_id", "precursor_mz", "precursor_charge"]).to_pylist()
+    out = examples_dir(root) / "predictions.parquet"
+    done = pq.read_table(out).to_pylist() if out.is_file() else []
+    have = {r["spectrum_id"] for r in done}
+    todo = [s for s in spectra if s["spectrum_id"] not in have]
+    log(f"{len(todo)} of {len(spectra)} spectra need a prediction")
+    if not todo:
+        return 0
+    model, config, residue_set = instanovo_io.load_instanovo(checkpoint, device="cpu", by_id=False)
+    processor = instanovo_io.make_processor(residue_set, annotated=False)
+    schema = pa.schema([("spectrum_id", pa.string()), ("prediction", pa.string()),
+                        ("beam_log_prob", pa.float64())])
+    meta = {"note": "InstaNovo beam search (5 beams), the prediction for the spectrum, not the label",
+            "checkpoint_bytes": str(Path(checkpoint).stat().st_size)}
+    t0 = time.perf_counter()
+    for i, s in enumerate(todo, 1):
+        row = int(s["spectrum_id"])
+        shard = next((f, r0) for f, r0, n in shards if r0 <= row < r0 + n)
+        rec = _read_parquet_row(shard[0], row - shard[1])
+        if abs(rec["precursor_mz"] - s["precursor_mz"]) > 1e-3 or rec["precursor_charge"] != s["precursor_charge"]:
+            raise ValueError(f"spectrum {row}: HF row does not match the chunk's precursor")
+        batch = instanovo_io.preprocess_spectrum(processor, rec["mz_array"], rec["intensity_array"],
+                                                 rec["precursor_mz"], rec["precursor_charge"])
+        res = instanovo_io.beam_search(model, batch, "cpu", 5, int(config["max_length"]))
+        tokens = list(res["predictions"][0])
+        done.append({"spectrum_id": s["spectrum_id"], "prediction": "".join(tokens) if tokens else None,
+                     "beam_log_prob": float(res["prediction_log_probability"][0]) if tokens else None})
+        if i % save_every == 0 or i == len(todo):
+            write_atomic(pa.Table.from_pylist(done, schema=schema).replace_schema_metadata(meta), out)
+            log(f"  {i}/{len(todo)} ({(time.perf_counter() - t0) / i:.1f} s each)")
+    return 0
+
+
+def _read_parquet_row(path: Path, row: int) -> dict:
+    pf = pq.ParquetFile(path)
+    start = 0
+    for g in range(pf.metadata.num_row_groups):
+        n = pf.metadata.row_group(g).num_rows
+        if row < start + n:
+            table = pf.read_row_group(g, columns=["mz_array", "intensity_array", "precursor_mz", "precursor_charge"])
+            return table.slice(row - start, 1).to_pylist()[0]
+        start += n
+    raise IndexError(f"row {row} outside {path}")
+
+
 def _sha256_16(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
 
@@ -546,7 +976,30 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--concept-reliability", type=Path, default=None,
                         help="concept reliability table (default <root>/analysis/label_audit/"
                              "concept_reliability.csv, written by analysis.py --label-audit)")
+    parser.add_argument("--examples", action="store_true",
+                        help="V1-5: feature examples and fit reference instead of the dictionary build "
+                             "(streams the local chunks; needs --example-features)")
+    parser.add_argument("--example-features", type=Path, default=None,
+                        help="demo_features.json (inspector.runtime demo-explain)")
+    parser.add_argument("--batch-tokens", type=int, default=EXAMPLE_BATCH_TOKENS,
+                        help="--examples: tokens per SAE batch (whole spectra)")
+    parser.add_argument("--with-predictions", action="store_true",
+                        help="--examples: also beam predictions for the referenced spectra (resumable)")
+    parser.add_argument("--hf-data-dir", type=Path, default=None,
+                        help="--with-predictions: directory holding the HF nine-species parquets")
+    parser.add_argument("--checkpoint", type=Path, default=Path("checkpoints") / "instanovo_v1.1.0.ckpt",
+                        help="--with-predictions: InstaNovo checkpoint")
     args = parser.parse_args(argv)
+
+    if args.examples:
+        if args.example_features is None:
+            parser.error("--examples needs --example-features")
+        build_examples(args.root, args.layers, args.example_features, args.seed, args.batch_tokens)
+        if args.with_predictions:
+            if args.hf_data_dir is None:
+                parser.error("--with-predictions needs --hf-data-dir")
+            add_predictions(args.root, args.hf_data_dir, args.checkpoint)
+        return
 
     for layer in args.layers:
         table = build_layer(args.root, layer, args.seed, args.unblinded_run, args.blinded_run,

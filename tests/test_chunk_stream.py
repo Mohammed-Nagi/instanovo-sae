@@ -181,3 +181,44 @@ def test_local_consolidated_manifest_opens(layer, expected):
     stream = _stream(LOCAL, layer)
     assert stream.subset_manifest
     assert stream._chunk_indices == expected
+
+
+# --- TopKAccumulator aux provenance (V1-5) ----------------------------------------------
+
+from evaluate import TopKAccumulator  # noqa: E402
+
+
+def _feed(acc, with_aux: bool) -> None:
+    gen = torch.Generator().manual_seed(0)
+    for ci in (3, 9, 4):
+        feats = torch.rand(6, 4, generator=gen)
+        if with_aux:
+            acc.add_chunk(ci, feats, aux=torch.arange(24).reshape(6, 4) + 100 * ci)
+        else:
+            acc.add_chunk(ci, feats)
+
+
+def test_topk_default_output_is_unchanged_by_aux():
+    plain, extra = TopKAccumulator(4, 3), TopKAccumulator(4, 3, aux=torch.long)
+    _feed(plain, False)
+    _feed(extra, True)
+    assert plain.aux_ids is None
+    assert torch.equal(plain.values, extra.values) and torch.equal(plain.chunk_ids, extra.chunk_ids)
+    assert torch.equal(plain.token_ids, extra.token_ids)
+
+
+def test_topk_aux_follows_the_kept_entries():
+    acc = TopKAccumulator(4, 3, aux=torch.long)
+    _feed(acc, True)
+    # aux was 100 * chunk + 4 * row + column, so it must decode to the kept provenance
+    expect = 100 * acc.chunk_ids + 4 * acc.token_ids + torch.arange(4).unsqueeze(1)
+    assert torch.equal(acc.aux_ids, expect)
+
+
+def test_topk_aux_must_match_construction():
+    with pytest.raises(ValueError, match="aux must be given"):
+        TopKAccumulator(4, 3).add_chunk(0, torch.rand(2, 4), aux=torch.zeros(2, 4, dtype=torch.long))
+    with pytest.raises(ValueError, match="aux must be given"):
+        TopKAccumulator(4, 3, aux=torch.long).add_chunk(0, torch.rand(2, 4))
+    with pytest.raises(ValueError, match="aux shape"):
+        TopKAccumulator(4, 3, aux=torch.long).add_chunk(0, torch.rand(2, 4), aux=torch.zeros(2, 3))

@@ -1199,3 +1199,38 @@ def test_saved_v1_4c_explanations_are_schema_2():
         pytest.skip("no saved V1-4c explanations")
     paths = sorted(d.glob("row_*.json"))
     assert len(paths) == 7 and all(saved_prediction(p)["tokens"] for p in paths)
+
+
+# --- V1-5: FitReference -------------------------------------------------------------------
+
+from inspector.dictionary import FitReference  # noqa: E402
+from schema import FIT_REFERENCE_SCHEMA_VERSION  # noqa: E402
+
+
+def _fit_ref(quantiles: list[float]) -> FitReference:
+    probs = np.linspace(0, 1, len(quantiles)).tolist()
+    return FitReference({"schema_version": FIT_REFERENCE_SCHEMA_VERSION, "probabilities": probs,
+                         "note": "n", "layers": {"2": {"quantiles": quantiles, "n_spectra": 5, "chunks": [0]}}})
+
+
+def test_fit_reference_percentile_bounds_and_monotone():
+    ref = _fit_ref([0.5, 0.6, 0.6, 0.8, 0.9])
+    assert ref.percentile(2, 0.1) == 0.0 and ref.percentile(2, 0.95) == 100.0
+    assert ref.percentile(2, 0.9) == 100.0
+    assert ref.percentile(2, 0.7) == pytest.approx(62.5)               # halfway between p 0.5 and 0.75
+    grid = np.linspace(0.4, 1.0, 61)
+    vals = [ref.percentile(2, float(x)) for x in grid]
+    assert all(b >= a for a, b in zip(vals, vals[1:]))
+    with pytest.raises(KeyError):
+        ref.percentile(4, 0.7)
+    with pytest.raises(ValueError):
+        ref.percentile(2, float("nan"))
+
+
+def test_fit_reference_rejects_bad_files(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        FitReference.load(tmp_path)
+    with pytest.raises(ValueError, match="schema"):
+        FitReference({"schema_version": 99, "probabilities": [0, 1], "note": "", "layers": {}})
+    with pytest.raises(ValueError, match="malformed"):
+        _fit_ref([0.9, 0.5, 0.6])

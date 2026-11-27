@@ -2448,6 +2448,7 @@ CHUNK_SIZE = 1024
 SCREEN_CHUNKS = (520, 572)
 SCREEN_SEED = 0
 SCREEN_BUDGET_HOURS = 9.0
+PEAK_INTENSITY_RTOL = 1e-6              # V1-5 deviation: float32 rounding in the peak check
 COST_INTERCEPT_S, COST_SLOPE_S = 0.006, 0.00068   # frozen c(n) = 0.006 + 0.00068 n s per ablated row
 SCREEN_RULE = (
     "population: the 2,048 HF test rows in chunks 520/572, ascending; order: "
@@ -2669,9 +2670,21 @@ def demo_explain(inspector: Inspector, parquet_path: Path, v15_dir: Path,
             meta = stored_cache[chunk]
             if meta["spectrum_ids"][s] != str(HF_TEST_OFFSET + row):
                 raise RuntimeError(f"row {row}: chunk {chunk} index {s} holds spectrum {meta['spectrum_ids'][s]}")
-            if not (torch.equal(fwd.peaks_mz, meta["mz_arrays"][s])
-                    and torch.equal(fwd.peaks_intensity, meta["intensity_arrays"][s])):
-                raise RuntimeError(f"row {row}: processed peaks differ from chunk {chunk}")
+            # V1-5 deviation (STATUS): m/z exact, intensities within 1e-6 relative
+            # (float32 rounding; row 58193 differs by up to 5.96e-08 absolute).
+            stored_int = meta["intensity_arrays"][s]
+            if not torch.equal(fwd.peaks_mz, meta["mz_arrays"][s]):
+                raise RuntimeError(f"row {row}: processed m/z differ from chunk {chunk}")
+            if fwd.peaks_intensity.shape != stored_int.shape:
+                raise RuntimeError(f"row {row}: processed peak count differs from chunk {chunk}")
+            rel = ((fwd.peaks_intensity.double() - stored_int.double()).abs()
+                   / stored_int.double().abs().clamp_min(1e-30))
+            if float(rel.max()) > PEAK_INTENSITY_RTOL:
+                raise RuntimeError(f"row {row}: processed intensities differ from chunk {chunk} by up to "
+                                   f"{float(rel.max()):.3e} relative (> {PEAK_INTENSITY_RTOL})")
+            check["peak_intensity_max_rel_diff"] = float(rel.max())
+            check["peak_intensity_max_abs_diff"] = float((fwd.peaks_intensity.double() - stored_int.double()).abs().max())
+            check["n_peaks_intensity_differ"] = int((fwd.peaks_intensity != stored_int).sum())
             rows_t = (meta["token_to_spectrum"] == s).nonzero().flatten()
             worst = {}
             for L in inspector.layers:

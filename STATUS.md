@@ -1277,6 +1277,20 @@ available), V1-7. Done: V1-1, V1-2a, V1-2b (layers 2/4/6), V1-3, V1-3b, V1-4a, V
 
       Sequence: commit 1 → code (commits 2–3) → steps 1–2 → stop for the
       step-2 estimate → step 4 overnight → steps 3 and 5 → commit 4.
+
+      Deviations (logged after commit 1):
+      - Dev 1 (2026-11-27, approved before use), verification 1, peak
+        check: demo-explain compared the recomputed processed peaks to the
+        chunk exactly (as `test_activations_match_stored_chunk` does). For
+        group C row 58193 (C-L2, chunk 572) m/z and the peak count (36) are
+        identical, but 32 of 36 intensities differ at float32 rounding: max
+        5.96e-08 absolute, 1.43e-07 relative. The check is now m/z exact,
+        intensities within 1e-6 relative (`PEAK_INTENSITY_RTOL`); the
+        activation tolerance (V1-4a: rtol 2^-7, atol 2^-7 · rms) is
+        unchanged. Row 58193 then passes it at every layer (max
+        |Δ|/(|a| + rms) 0.0030–0.0032, as the other rows). The demo rule,
+        rows and every other row are unchanged; the other six local demo
+        rows match exactly.
 - [ ] **V1-6 Dashboard** — `src/inspector/app.py`, Streamlit.
       Spectrum plot with peaks coloured by annotation, layer selector, per-peak
       feature panel, feature card. The card leads with the feature's examples
